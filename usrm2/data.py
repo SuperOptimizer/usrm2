@@ -56,6 +56,41 @@ def zscore(x):
     return (x - x.mean()) / (x.std() + 1e-3)
 
 
+VOLCOMP_CHUNK = 128  # the codec encodes 128^3 uint8 blocks only; other shapes are padded and tiled
+
+
+def volcomp_roundtrip(vol, q):
+    """Encode+decode a uint8 volume with the real volcomp codec at quality q (ported from tsm)."""
+    import volcomp_zarr as vc
+    C = VOLCOMP_CHUNK
+    pad = [(0, (-n) % C) for n in vol.shape]
+    buf = np.pad(vol, pad, mode="edge") if any(h for _, h in pad) else vol.copy()
+    for z in range(0, buf.shape[0], C):
+        for y in range(0, buf.shape[1], C):
+            for x in range(0, buf.shape[2], C):
+                blk = np.ascontiguousarray(buf[z:z + C, y:y + C, x:x + C])
+                out = np.frombuffer(bytes(vc.decode(vc.encode(blk.tobytes(), float(q)))), np.uint8)
+                buf[z:z + C, y:y + C, x:x + C] = out.reshape((C, C, C))
+    return buf[:vol.shape[0], :vol.shape[1], :vol.shape[2]]
+
+
+def raw(rng, ct, cfg):
+    """Raw-uint8 CT augs that have to happen before the z-score (see aug.py): the 8-bit export
+    window (an affine remap is a no-op after re-z-scoring -- only its clipping is real) and the
+    volcomp codec round trip (C code over bytes; skipped silently without the codec)."""
+    k = cfg.get("window")
+    if k and rng.random() < k["p"]:
+        lo, hi = rng.uniform(k["lo_lo"], k["lo_hi"]), rng.uniform(k["hi_lo"], k["hi_hi"])
+        ct = np.clip((ct.astype(np.float32) - lo) * (255.0 / max(hi - lo, 1e-6)), 0, 255).astype(np.uint8)
+    k = cfg.get("volcomp")
+    if k and rng.random() < k["p"]:
+        try:
+            ct = volcomp_roundtrip(np.ascontiguousarray(ct, np.uint8), rng.uniform(*k["q"]))
+        except Exception:
+            pass
+    return ct
+
+
 def augment(rng, x, tg):
     """Random axis permutation + flips applied to the (C,Z,Y,X) input and (Z,Y,X) target; the radial
     vector channels 1..3 of x are permuted/negated to match."""
@@ -76,10 +111,11 @@ class Patches(torch.utils.data.IterableDataset):
     """Random (ct, teacher) patches; train patches never touch the val box."""
 
     def __init__(self, patch=128, ct=CT, stores=TRAIN, exclude=VAL, seed=0, air_keep=0.1, fg_min=0.05,
-                 fg_keep=0.25, sym=True):
+                 fg_keep=0.25, sym=True, aug=None):
         super().__init__()
         self.patch, self.ct_path, self.paths, self.exclude, self.seed = patch, ct, list(stores), exclude, seed
-        self.sym = sym  # the 48 cube symmetries; everything else happens on the GPU, see aug.py
+        self.sym = sym  # the 48 cube symmetries; the GPU augs are in aug.py
+        self.aug = aug or {}  # the worker-side raw-uint8 stage: window / volcomp / blank
         self.air_keep, self.fg_min, self.fg_keep = air_keep, fg_min, fg_keep  # low-foreground patches are mostly skipped
         self.arrs = None
 
@@ -108,12 +144,17 @@ class Patches(torch.utils.data.IterableDataset):
             g = o + lo  # global corner
             if self.ex is not None and np.all(g < self.ex[0] + self.ex[1]) and np.all(g + p > self.ex[0]):
                 continue
-            ct = self.ct[g[0]:g[0] + p, g[1]:g[1] + p, g[2]:g[2] + p]
-            if (ct == 0).mean() > 0.9 and rng.random() > self.air_keep:
-                continue
-            tg = read3(self.arrs[i], lo, p).astype(np.float32) / 255.0
-            if tg.mean() < self.fg_min and rng.random() > self.fg_keep:
-                continue
+            bl = self.aug.get("blank")
+            if bl and rng.random() < bl["p"]:  # an all-air patch (CT 0 = air) with target 0
+                ct, tg = np.zeros((p, p, p), np.uint8), np.zeros((p, p, p), np.float32)
+            else:
+                ct = self.ct[g[0]:g[0] + p, g[1]:g[1] + p, g[2]:g[2] + p]
+                if (ct == 0).mean() > 0.9 and rng.random() > self.air_keep:
+                    continue
+                tg = read3(self.arrs[i], lo, p).astype(np.float32) / 255.0
+                if tg.mean() < self.fg_min and rng.random() > self.fg_keep:
+                    continue
+                ct = raw(rng, ct, self.aug)
             rejected, x = 0, inputs(ct, radial(self.ax, g, ct.shape))
             if self.sym:
                 x, tg = augment(rng, x, tg)

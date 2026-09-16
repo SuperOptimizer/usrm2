@@ -74,7 +74,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
             x[1:] = 0
     evnet = M.build(size, verbose=False).to(dev)
     dl = data.loader(patch, batch, workers, ct=kw.get("ct", data.CT), stores=kw.get("stores", data.TRAIN),
-                     exclude=kw.get("val", data.VAL), seed=step, sym=cfg.get("sym", True))
+                     exclude=kw.get("val", data.VAL), seed=step, sym=cfg.get("sym", True), aug=cfg)
 
     def save():
         torch.save({"model": net.state_dict(), "ema": ema, "opt": opt.state_dict(),

@@ -17,9 +17,13 @@ input is a z-scored CT patch, output is one recto-probability logit per voxel.
   for the vc3d tracer. `evalsurf` scores a store/checkpoint at the published tifxyz surface
   points (recall along the normal, offset bias, a precision proxy, merged-sheet runs).
 
-- Augmentation (`aug.py`): the 48 cube symmetries run in the dataloader worker, everything else
+- Augmentation (`aug.py`): the 48 cube symmetries and the raw-uint8 stage (`window`, `volcomp`,
+  `blank`; `data.raw` / `data.Patches`) run in the dataloader worker, everything else
   (rot/scale/shear/elastic + intensity) runs batched on the GPU in `train.py`; spatial augs rotate
   the radial vector channels by the same map. Pick a preset with `--aug` (see `aug.PRESETS`).
+  `all2` is `all` + the cross-scroll families: the scan-domain set ported from tsm (`scan`, ranges
+  calibrated on PHercParis4 vs PHerc1667), `tone`, `thick`, `volcomp`, `blank` and the ESRF/nabu
+  recon set (`haze`, `unsharp`, `quant`, `cor`); `all2_light` halves every `p`.
 
 ## Commands
     usrm2 train /vesuvius/usrm2/runs/p4_1m --size 1m --steps 20000 --patch 128 --batch 1
