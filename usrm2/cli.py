@@ -3,6 +3,7 @@ import argparse
 
 def main(argv=None):
     ap = argparse.ArgumentParser("usrm2")
+    ap.add_argument("--umbilicus", default=None, help="scroll axis json (default: PHerc Paris 4)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     t = sub.add_parser("train")
     t.add_argument("out_dir")
@@ -69,6 +70,8 @@ def main(argv=None):
     b.add_argument("--seed", type=int, default=0)
     a = ap.parse_args(argv)
     from usrm2 import data, model, predict as P, train as T
+    if a.umbilicus:
+        data.UMBILICUS = a.umbilicus
     if a.cmd == "train":
         T.train(a.out_dir, size=a.size, steps=a.steps, patch=a.patch, batch=a.batch, lr=a.lr,
                 workers=a.workers, eval_every=a.eval_every, val_patches=a.val_patches, resume=a.resume,
