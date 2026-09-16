@@ -80,7 +80,10 @@ def test_window_clips_on_the_raw_uint8():
 
 
 def test_volcomp_roundtrip():
-    pytest.importorskip("volcomp_zarr")
+    try:
+        import volcomp_zarr._lib  # noqa: F401  (needs a built libvolcomp.so or VOLCOMP_LIB)
+    except Exception as e:
+        pytest.skip(f"volcomp library unavailable: {e}")
     c = torch.from_numpy(np.random.default_rng(0).normal(112, 30, (8, 8, 8)).astype(np.float32))
     v = torch.nn.functional.interpolate(c[None, None], size=(128,) * 3, mode="trilinear",
                                         align_corners=False)[0, 0].numpy()
