@@ -4,7 +4,7 @@ import math
 import numpy as np
 import zarr
 
-from usrm2 import predict as P, train as T
+from usrm2 import data, predict as P, train as T
 
 
 def make(tmp_path):
@@ -22,8 +22,11 @@ def make(tmp_path):
     return str(tmp_path / "ct.zarr"), paths
 
 
-def test_train_and_predict(tmp_path):
+def test_train_and_predict(tmp_path, monkeypatch):
     ct, (tr, va) = make(tmp_path)
+    umb = tmp_path / "umb.json"  # a straight scroll axis through the middle of the synthetic volume
+    umb.write_text(json.dumps({"control_points": [{"z": 0, "y": 128, "x": 128}, {"z": 256, "y": 128, "x": 128}]}))
+    monkeypatch.setattr(data, "UMBILICUS", str(umb))
     out = tmp_path / "run"
     ckpt = T.train(out, size="1m", steps=3, patch=32, batch=1, lr=1e-3, workers=0, warmup=2,
                    eval_every=3, val_patches=4, device="cpu", ct=ct, stores=[tr], val=va)

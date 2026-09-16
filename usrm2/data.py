@@ -9,6 +9,7 @@ import torch
 CT = "/vesuvius/usrm/volcomp/PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr/0"
 TRAIN = ["/vesuvius/usrm2/teacher/a.zarr", "/vesuvius/usrm2/teacher/b.zarr"]  # made by `usrm2 teacher`
 VAL = "/vesuvius/usrm2/teacher/eval.zarr"
+UMBILICUS = "/vesuvius/usrm/umbilicus/PHercParis4/umbilicus-full-resolution.json"
 MARGIN = 16  # sliding-window predictions are worse at the teacher box edges
 
 
@@ -32,15 +33,42 @@ def read3(arr, o, p):
     return arr[(0,) + s] if arr.ndim == 4 else arr[s]
 
 
+def axis(path=UMBILICUS):
+    """(z, y, x) arrays of the scroll axis control points, sorted by z (level-0 voxels)."""
+    import json
+    pts = sorted((p["z"], p["y"], p["x"]) for p in json.load(open(path))["control_points"])
+    return np.array(pts, np.float64).T
+
+
+def radial(ax, origin, shape):
+    """Unit vectors (3,Z,Y,X) pointing away from the scroll axis in the xy plane (z component 0)."""
+    z = np.arange(shape[0]) + origin[0]
+    cy, cx = np.interp(z, ax[0], ax[1]), np.interp(z, ax[0], ax[2])
+    dy = (np.arange(shape[1]) + origin[1])[None, :, None] - cy[:, None, None]
+    dx = (np.arange(shape[2]) + origin[2])[None, None, :] - cx[:, None, None]
+    n = np.sqrt(dy * dy + dx * dx) + 1e-6
+    return np.stack([np.zeros(shape, np.float32), (dy / n).astype(np.float32), (dx / n).astype(np.float32)])
+
+
 def zscore(x):
     x = x.astype(np.float32)
     return (x - x.mean()) / (x.std() + 1e-3)
 
 
-def augment(rng, ct, tg):
+def augment(rng, x, tg):
+    """Random axis permutation + flips applied to the (C,Z,Y,X) input and (Z,Y,X) target; the radial
+    vector channels 1..3 of x are permuted/negated to match."""
     perm, flip = rng.permutation(3), rng.random(3) < 0.5
     sl = tuple(slice(None, None, -1 if f else 1) for f in flip)
-    return [np.ascontiguousarray(np.transpose(a, perm)[sl]) for a in (ct, tg)]
+    tg = np.ascontiguousarray(np.transpose(tg, perm)[sl])
+    x = np.transpose(x, (0,) + tuple(perm + 1))[(slice(None),) + sl]
+    x = np.concatenate([x[:1], x[1 + perm] * np.where(flip, -1, 1).astype(np.float32)[:, None, None, None]])
+    return np.ascontiguousarray(x), tg
+
+
+def inputs(ct, rad):
+    """Model input (4,Z,Y,X): z-scored CT + radial unit vector."""
+    return np.concatenate([zscore(ct)[None], rad])
 
 
 class Patches(torch.utils.data.IterableDataset):
@@ -59,6 +87,7 @@ class Patches(torch.utils.data.IterableDataset):
         self.w = np.array([np.prod(s) for _, s in self.boxes], np.float64)
         self.w /= self.w.sum()
         self.ex = box(open_zarr(self.exclude)) if self.exclude else None
+        self.ax = axis()
 
     def __iter__(self):
         if self.arrs is None:
@@ -79,13 +108,13 @@ class Patches(torch.utils.data.IterableDataset):
             tg = read3(self.arrs[i], lo, p).astype(np.float32) / 255.0
             if tg.mean() < self.fg_min and rng.random() > self.fg_keep:
                 continue
-            ct, tg = augment(rng, zscore(ct), tg)
-            yield torch.from_numpy(ct)[None], torch.from_numpy(tg)[None]
+            x, tg = augment(rng, inputs(ct, radial(self.ax, g, ct.shape)), tg)
+            yield torch.from_numpy(x), torch.from_numpy(tg)[None]
 
 
 def val_grid(patch=128, ct=CT, store=VAL, limit=32):
     """Deterministic non-overlapping tiling of the val box -> list of (ct, tgt)."""
-    cta, tga = open_zarr(ct), open_zarr(store)
+    cta, tga, ax = open_zarr(ct), open_zarr(store), axis()
     o, s = box(tga)
     corners = [(z, y, x) for z in range(0, s[0] - patch + 1, patch)
                for y in range(0, s[1] - patch + 1, patch)
@@ -97,7 +126,7 @@ def val_grid(patch=128, ct=CT, store=VAL, limit=32):
         g = o + np.array(lo)
         c = cta[g[0]:g[0] + patch, g[1]:g[1] + patch, g[2]:g[2] + patch]
         t = read3(tga, lo, patch).astype(np.float32) / 255.0
-        out.append((torch.from_numpy(zscore(c))[None], torch.from_numpy(t)[None]))
+        out.append((torch.from_numpy(inputs(c, radial(ax, g, c.shape))), torch.from_numpy(t)[None]))
     return out
 
 

@@ -1,4 +1,4 @@
-"""Tiny 3D U-Net: 1 input channel (z-scored CT) -> 1 recto logit."""
+"""Tiny 3D U-Net: 4 input channels (z-scored CT + radial unit vector) -> 1 recto logit."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,10 +14,10 @@ def block(cin, cout):
 
 
 class UNet(nn.Module):
-    def __init__(self, widths=PRESETS["1m"]):
+    def __init__(self, widths=PRESETS["1m"], cin=4):
         super().__init__()
         w = list(widths)
-        self.enc = nn.ModuleList([block(1 if i == 0 else w[i - 1], w[i]) for i in range(len(w))])
+        self.enc = nn.ModuleList([block(cin if i == 0 else w[i - 1], w[i]) for i in range(len(w))])
         self.down = nn.ModuleList([nn.Conv3d(c, c, 3, stride=2, padding=1) for c in w[:-1]])
         self.dec = nn.ModuleList([block(w[i] + w[i + 1], w[i]) for i in range(len(w) - 1)])
         self.head = nn.Conv3d(w[0], 1, 1)

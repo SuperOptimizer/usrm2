@@ -18,8 +18,10 @@ def starts(n, w, stride):
     return s
 
 
-def slide(fn, roi, window, halo, dev):
-    """Gaussian-blended sliding window over a uint8 ROI. fn: normalized (1,1,w,w,w) tensor -> prob (w,w,w)."""
+def slide(fn, roi, window, halo, dev, prep=None):
+    """Gaussian-blended sliding window over a uint8 ROI. fn: normalized (1,C,w,w,w) tensor -> prob (w,w,w).
+    prep(ct_window, (z,y,x) window offset) -> (C,w,w,w) float input; default is z-scored CT alone."""
+    prep = prep or (lambda c, o: data.zscore(c)[None])
     Z, Y, X = roi.shape
     acc, wsum, g = np.zeros(roi.shape, np.float32), np.zeros(roi.shape, np.float32), gauss(window)
     stride = window - 2 * halo
@@ -30,7 +32,7 @@ def slide(fn, roi, window, halo, dev):
                     c = roi[z:z + window, y:y + window, x:x + window]
                     if not c.any():
                         continue
-                    t = torch.from_numpy(data.zscore(c))[None, None].to(dev).to(memory_format=torch.channels_last_3d)
+                    t = torch.from_numpy(prep(c, (z, y, x)))[None].to(dev).to(memory_format=torch.channels_last_3d)
                     with autocast(dev):
                         p = fn(t).float().cpu().numpy()
                     acc[z:z + window, y:y + window, x:x + window] += p * g
@@ -67,7 +69,8 @@ def predict(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=
     net = M.build(st["args"]["size"], verbose=False).to(dev)
     net.load_state_dict(st["ema"])
     net.eval()
-    roi = data.open_zarr(volume)[z0:z0 + Z, y0:y0 + Y, x0:x0 + X]
-    prob = slide(lambda t: torch.sigmoid(net(t))[0, 0], roi, window, halo, dev)
+    roi, ax = data.open_zarr(volume)[z0:z0 + Z, y0:y0 + Y, x0:x0 + X], data.axis()
+    prep = lambda c, o: data.inputs(c, data.radial(ax, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape))
+    prob = slide(lambda t: torch.sigmoid(net(t))[0, 0], roi, window, halo, dev, prep)
     write(out, prob, (z0, y0, x0), volcomp=volcomp)
     return out
