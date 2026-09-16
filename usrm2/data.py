@@ -1,0 +1,107 @@
+"""CT + teacher patch sampling. All boxes are (z, y, x) level-0 voxels.
+
+Teacher stores: uint8 = recto probability * 255, shape (1,Z,Y,X) (or (Z,Y,X)),
+attrs origin_zyx = the level-0 index of element 0. CT: uint8, 0 = air/masked.
+"""
+import numpy as np
+import torch
+
+CT = "/vesuvius/usrm/volcomp/PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr/0"
+TRAIN = ["/vesuvius/tsm/output/slab_tta/teachers/recto.zarr",
+         "/vesuvius/tsm/output/paris4b_salvage/teachers/recto.zarr"]
+VAL = "/vesuvius/tsm/output/eval/teachers/recto.zarr"
+MARGIN = 16  # sliding-window predictions are worse at the teacher box edges
+
+
+def open_zarr(path):
+    import zarr
+    try:
+        import volcomp_zarr  # noqa: F401  (registers the "volcomp" codec)
+    except Exception:
+        pass
+    return zarr.open(path, mode="r")
+
+
+def box(arr):
+    """(origin_zyx, shape_zyx) of a teacher store."""
+    return np.array(arr.attrs["origin_zyx"], np.int64), np.array(arr.shape[-3:], np.int64)
+
+
+def read3(arr, o, p):
+    """Read a p^3 patch at store-local offset o, tolerating (1,Z,Y,X) stores."""
+    s = tuple(slice(int(a), int(a) + p) for a in o)
+    return arr[(0,) + s] if arr.ndim == 4 else arr[s]
+
+
+def zscore(x):
+    x = x.astype(np.float32)
+    return (x - x.mean()) / (x.std() + 1e-3)
+
+
+def augment(rng, ct, tg):
+    perm, flip = rng.permutation(3), rng.random(3) < 0.5
+    sl = tuple(slice(None, None, -1 if f else 1) for f in flip)
+    return [np.ascontiguousarray(np.transpose(a, perm)[sl]) for a in (ct, tg)]
+
+
+class Patches(torch.utils.data.IterableDataset):
+    """Random (ct, teacher) patches; train patches never touch the val box."""
+
+    def __init__(self, patch=128, ct=CT, stores=TRAIN, exclude=VAL, seed=0, air_keep=0.1):
+        super().__init__()
+        self.patch, self.ct_path, self.paths, self.exclude, self.seed, self.air_keep = \
+            patch, ct, list(stores), exclude, seed, air_keep
+        self.arrs = None
+
+    def _open(self):
+        self.ct = open_zarr(self.ct_path)
+        self.arrs = [open_zarr(p) for p in self.paths]
+        self.boxes = [box(a) for a in self.arrs]
+        self.w = np.array([np.prod(s) for _, s in self.boxes], np.float64)
+        self.w /= self.w.sum()
+        self.ex = box(open_zarr(self.exclude)) if self.exclude else None
+
+    def __iter__(self):
+        if self.arrs is None:
+            self._open()
+        info = torch.utils.data.get_worker_info()
+        rng = np.random.default_rng(self.seed + 1000 * (info.id if info else 0))
+        p = self.patch
+        while True:
+            i = rng.choice(len(self.arrs), p=self.w)
+            o, s = self.boxes[i]
+            lo = rng.integers(MARGIN, s - MARGIN - p + 1)  # store-local corner
+            g = o + lo  # global corner
+            if self.ex is not None and np.all(g < self.ex[0] + self.ex[1]) and np.all(g + p > self.ex[0]):
+                continue
+            ct = self.ct[g[0]:g[0] + p, g[1]:g[1] + p, g[2]:g[2] + p]
+            if (ct == 0).mean() > 0.9 and rng.random() > self.air_keep:
+                continue
+            tg = read3(self.arrs[i], lo, p).astype(np.float32) / 255.0
+            ct, tg = augment(rng, zscore(ct), tg)
+            yield torch.from_numpy(ct)[None], torch.from_numpy(tg)[None]
+
+
+def val_grid(patch=128, ct=CT, store=VAL, limit=32):
+    """Deterministic non-overlapping tiling of the val box -> list of (ct, tgt)."""
+    cta, tga = open_zarr(ct), open_zarr(store)
+    o, s = box(tga)
+    corners = [(z, y, x) for z in range(0, s[0] - patch + 1, patch)
+               for y in range(0, s[1] - patch + 1, patch)
+               for x in range(0, s[2] - patch + 1, patch)]
+    if limit and len(corners) > limit:  # deterministic even subsample
+        corners = [corners[i] for i in np.linspace(0, len(corners) - 1, limit).astype(int)]
+    out = []
+    for lo in corners:
+        g = o + np.array(lo)
+        c = cta[g[0]:g[0] + patch, g[1]:g[1] + patch, g[2]:g[2] + patch]
+        t = read3(tga, lo, patch).astype(np.float32) / 255.0
+        out.append((torch.from_numpy(zscore(c))[None], torch.from_numpy(t)[None]))
+    return out
+
+
+def loader(patch, batch, workers, **kw):
+    ds = Patches(patch=patch, **kw)
+    return torch.utils.data.DataLoader(ds, batch_size=batch, num_workers=workers,
+                                       pin_memory=True, persistent_workers=workers > 0,
+                                       prefetch_factor=2 if workers else None)

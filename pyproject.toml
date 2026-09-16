@@ -1,0 +1,38 @@
+[project]
+name = "usrm2"
+version = "0.1.0"
+description = "Ultra Small Recto Model 2: a tiny 3D U-Net distilled from the upstream recto teacher"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "torch>=2.4",
+    "numpy>=2",
+    "zarr>=3",
+    "scipy>=1.13",
+    "volcomp-zarr @ git+https://github.com/SuperOptimizer/volume-compressor#subdirectory=python",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-timeout>=2.3"]
+
+[project.scripts]
+usrm2 = "usrm2.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["usrm2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.uv]
+index-url = "https://download.pytorch.org/whl/cu130"
+extra-index-url = ["https://pypi.org/simple"]
+index-strategy = "unsafe-best-match"
