@@ -151,7 +151,7 @@ class Patches(torch.utils.data.IterableDataset):
                 ct = self.ct[g[0]:g[0] + p, g[1]:g[1] + p, g[2]:g[2] + p]
                 if (ct == 0).mean() > 0.9 and rng.random() > self.air_keep:
                     continue
-                tg = read3(self.arrs[i], lo, p).astype(np.float32) / 255.0
+                tg = read3(self.arrs[i], lo, p).astype(np.float32) / 255.0 * (ct > 0)  # masked CT -> no surface
                 if tg.mean() < self.fg_min and rng.random() > self.fg_keep:
                     continue
                 ct = raw(rng, ct, self.aug)
@@ -174,7 +174,7 @@ def val_grid(patch=128, ct=CT, store=VAL, limit=32):
     for lo in corners:
         g = o + np.array(lo)
         c = cta[g[0]:g[0] + patch, g[1]:g[1] + patch, g[2]:g[2] + patch]
-        t = read3(tga, lo, patch).astype(np.float32) / 255.0
+        t = read3(tga, lo, patch).astype(np.float32) / 255.0 * (c > 0)
         out.append((torch.from_numpy(inputs(c, radial(ax, g, c.shape))), torch.from_numpy(t)[None]))
     return out
 

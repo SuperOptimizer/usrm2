@@ -37,7 +37,7 @@ def slide(fn, roi, window, halo, dev, prep=None):
                         p = fn(t).float().cpu().numpy()
                     acc[z:z + window, y:y + window, x:x + window] += p * g
                     wsum[z:z + window, y:y + window, x:x + window] += g
-    return np.where(wsum > 0, acc / np.maximum(wsum, 1e-6), 0)
+    return np.where((wsum > 0) & (roi > 0), acc / np.maximum(wsum, 1e-6), 0)  # masked CT (0) -> no surface
 
 
 def out_array(path, shape, origin, volcomp=True):
