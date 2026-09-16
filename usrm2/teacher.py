@@ -38,3 +38,26 @@ def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=256, halo=32, tile=1536
             arr[:, y:y + prob.shape[1], x:x + prob.shape[2]] = np.clip(np.rint(prob * 255), 0, 255).astype(np.uint8)
             print(f"tile y={y} x={x} done", flush=True)
     return out
+
+
+def boxes(out_dir, n=50, size=(384, 2048, 2048), seed=0, volume=data.CT, exclude=data.VAL, min_mean=30, **kw):
+    """Run the teacher over `n` random non-air boxes spread over the scroll -> out_dir/box_Z_Y_X.zarr each.
+    Air test uses level 2 of the volume (1/4 pitch); boxes touching the val box are skipped."""
+    from pathlib import Path
+    rng = np.random.default_rng(seed)
+    ct, lo = data.open_zarr(volume), data.open_zarr(volume.replace("/0", "/2"))
+    ex = data.box(data.open_zarr(exclude)) if exclude else None
+    size, shape, done = np.array(size), np.array(ct.shape), 0
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    while done < n:
+        o = (rng.integers(0, shape - size) // 128) * 128
+        if ex is not None and np.all(o < ex[0] + ex[1]) and np.all(o + size > ex[0]):
+            continue
+        s = lo[o[0] // 4:(o[0] + size[0]) // 4, o[1] // 4:(o[1] + size[1]) // 4, o[2] // 4:(o[2] + size[2]) // 4]
+        if s.mean() < min_mean or (s > 0).mean() < 0.7:
+            continue
+        out = f"{out_dir}/box_{o[0]}_{o[1]}_{o[2]}.zarr"
+        if not Path(out).exists():
+            run(out, *o, *size, volume=volume, **kw)
+        done += 1
+        print(f"box {done}/{n} {out}", flush=True)

@@ -35,6 +35,11 @@ def main(argv=None):
     t.add_argument("--origin", type=int, nargs=3, required=True, metavar=("Z0", "Y0", "X0"))
     t.add_argument("--size", type=int, nargs=3, required=True, metavar=("Z", "Y", "X"))
     t.add_argument("--volume", default=None)
+    b = sub.add_parser("teacher-boxes", help="run the teacher over many random non-air boxes")
+    b.add_argument("out_dir")
+    b.add_argument("--n", type=int, default=50)
+    b.add_argument("--size", type=int, nargs=3, default=(384, 2048, 2048), metavar=("Z", "Y", "X"))
+    b.add_argument("--seed", type=int, default=0)
     a = ap.parse_args(argv)
     from usrm2 import data, model, predict as P, train as T
     if a.cmd == "train":
@@ -48,6 +53,9 @@ def main(argv=None):
         net = model.build(st["args"]["size"]).to(dev)
         net.load_state_dict({k: v.to(dev) for k, v in st["ema"].items()})
         print(st["step"], T.evaluate(net, data.val_grid(patch=a.patch, limit=a.val_patches), dev))
+    elif a.cmd == "teacher-boxes":
+        from usrm2 import teacher
+        teacher.boxes(a.out_dir, n=a.n, size=tuple(a.size), seed=a.seed)
     elif a.cmd == "teacher":
         from usrm2 import teacher
         teacher.run(a.out, *a.origin, *a.size, volume=a.volume or data.CT)

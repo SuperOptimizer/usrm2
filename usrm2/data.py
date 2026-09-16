@@ -7,7 +7,8 @@ import numpy as np
 import torch
 
 CT = "/vesuvius/usrm/volcomp/PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr/0"
-TRAIN = ["/vesuvius/usrm2/teacher/a.zarr", "/vesuvius/usrm2/teacher/b.zarr"]  # made by `usrm2 teacher`
+TRAIN = ["/vesuvius/usrm2/teacher/a.zarr", "/vesuvius/usrm2/teacher/b.zarr"]  # made by `usrm2 teacher`; plus
+TRAIN += sorted(__import__("glob").glob("/vesuvius/usrm2/teacher/boxes/box_*.zarr"))  # `usrm2 teacher-boxes` output
 VAL = "/vesuvius/usrm2/teacher/eval.zarr"
 UMBILICUS = "/vesuvius/usrm/umbilicus/PHercParis4/umbilicus-full-resolution.json"
 MARGIN = 16  # sliding-window predictions are worse at the teacher box edges
@@ -74,9 +75,11 @@ def inputs(ct, rad):
 class Patches(torch.utils.data.IterableDataset):
     """Random (ct, teacher) patches; train patches never touch the val box."""
 
-    def __init__(self, patch=128, ct=CT, stores=TRAIN, exclude=VAL, seed=0, air_keep=0.1, fg_min=0.05, fg_keep=0.25):
+    def __init__(self, patch=128, ct=CT, stores=TRAIN, exclude=VAL, seed=0, air_keep=0.1, fg_min=0.05,
+                 fg_keep=0.25, sym=True):
         super().__init__()
         self.patch, self.ct_path, self.paths, self.exclude, self.seed = patch, ct, list(stores), exclude, seed
+        self.sym = sym  # the 48 cube symmetries; everything else happens on the GPU, see aug.py
         self.air_keep, self.fg_min, self.fg_keep = air_keep, fg_min, fg_keep  # low-foreground patches are mostly skipped
         self.arrs = None
 
@@ -108,7 +111,9 @@ class Patches(torch.utils.data.IterableDataset):
             tg = read3(self.arrs[i], lo, p).astype(np.float32) / 255.0
             if tg.mean() < self.fg_min and rng.random() > self.fg_keep:
                 continue
-            x, tg = augment(rng, inputs(ct, radial(self.ax, g, ct.shape)), tg)
+            x = inputs(ct, radial(self.ax, g, ct.shape))
+            if self.sym:
+                x, tg = augment(rng, x, tg)
             yield torch.from_numpy(x), torch.from_numpy(tg)[None]
 
 
