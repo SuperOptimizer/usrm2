@@ -57,13 +57,51 @@ def out_array(path, shape, origin, volcomp=True):
     return z
 
 
+def u8(prob):
+    return np.clip(np.rint(prob * 255), 0, 255).astype(np.uint8)
+
+
 def write(path, prob, origin, volcomp=True):
     a = out_array(path, prob.shape, origin, volcomp=volcomp)
-    u8 = np.clip(np.rint(prob * 255), 0, 255).astype(np.uint8)
-    a[:] = u8[None] if a.ndim == 4 else u8
+    p = u8(prob)
+    a[:] = p[None] if a.ndim == 4 else p
 
 
-def predict(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=None, volcomp=True):
+def write_ome(path, prob_u8, origin, levels=3, full_shape=None, meta=None):
+    """Zarr v2 OME group, a positional drop-in for the vc3d tracer: level 0 has the FULL volume
+    shape but only the box's chunks are written (sparse, fill 0). Values are probability * 255,
+    no threshold. The origin is rounded down to the 256 chunk grid and the box zero-padded."""
+    import json
+
+    import zarr
+    from numcodecs import Blosc
+    o = np.asarray(origin, np.int64)
+    pad = o % 256
+    o, prob_u8 = o - pad, np.pad(prob_u8, [(int(p), 0) for p in pad]) if pad.any() else prob_u8
+    assert not (o % 256).any()
+    full = tuple(int(v) for v in (full_shape or data.open_zarr(data.CT).shape[-3:]))
+    g, a = zarr.open_group(path, mode="w", zarr_format=2), prob_u8
+    for l in range(levels):
+        z = g.create_array(str(l), shape=tuple(-(-s >> l) for s in full), chunks=(256, 256, 256),
+                           dtype="uint8", fill_value=0, compressors=Blosc(cname="zstd", clevel=1, shuffle=1),
+                           chunk_key_encoding={"name": "v2", "separator": "/"})
+        c = o >> l
+        z[c[0]:c[0] + a.shape[0], c[1]:c[1] + a.shape[1], c[2]:c[2] + a.shape[2]] = a
+        a = a[::2, ::2, ::2]  # nearest 2x downsample, box only
+    g.attrs.update({
+        "multiscales": [{"version": "0.4", "name": "recto",
+                         "axes": [{"name": n, "type": "space", "unit": "micrometer"} for n in "zyx"],
+                         "datasets": [{"path": str(l), "coordinateTransformations":
+                                       [{"type": "scale", "scale": [float(1 << l)] * 3}]} for l in range(levels)]}],
+        "channels": ["recto"], "voxel_um": 2.4, "origin_zyx": [int(v) for v in o], "scale": 1.0})
+    json.dump({**(meta or {}), "threshold": None, "origin_zyx": [int(v) for v in o],
+               "shape_zyx": [int(v) for v in prob_u8.shape], "levels": levels, "voxel_um": 2.4},
+              open(f"{path}/metadata.json", "w"), indent=1)
+    return path
+
+
+def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None):
+    """Sliding-window recto probability (float32) over a box; returns (prob, checkpoint state)."""
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     st = torch.load(ckpt, map_location=dev)
     net = M.build(st["args"]["size"], verbose=False).to(dev)
@@ -72,6 +110,13 @@ def predict(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=
     roi, ax = data.open_zarr(volume)[z0:z0 + Z, y0:y0 + Y, x0:x0 + X], data.axis()
     r = 0.0 if st["args"].get("no_radial") else 1.0  # training zeroed the radial channels
     prep = lambda c, o: data.inputs(c, data.radial(ax, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape) * r)
-    prob = slide(lambda t: torch.sigmoid(net(t))[0, 0], roi, window, halo, dev, prep)
-    write(out, prob, (z0, y0, x0), volcomp=volcomp)
+    return slide(lambda t: torch.sigmoid(net(t))[0, 0], roi, window, halo, dev, prep), st
+
+
+def predict(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=None, volcomp=True, ome=False):
+    prob, st = probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=window, halo=halo, device=device)
+    if ome:
+        write_ome(out, u8(prob), (z0, y0, x0), meta={"checkpoint": str(ckpt), "step": int(st.get("step", 0))})
+    else:
+        write(out, prob, (z0, y0, x0), volcomp=volcomp)
     return out

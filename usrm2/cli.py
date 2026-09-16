@@ -45,6 +45,18 @@ def main(argv=None):
     p.add_argument("--window", type=int, default=128)
     p.add_argument("--halo", type=int, default=16)
     p.add_argument("--plain", action="store_true", help="plain zarr (1,Z,Y,X) instead of volcomp")
+    p.add_argument("--ome", action="store_true", help="zarr v2 OME group at full volume shape (tracer drop-in)")
+    s = sub.add_parser("evalsurf", help="score a checkpoint or store against the published surfaces")
+    s.add_argument("--box", type=int, nargs=6, default=None, metavar=("Z0", "Y0", "X0", "Z", "Y", "X"))
+    s.add_argument("--ckpt")
+    s.add_argument("--store")
+    s.add_argument("--teacher", help="a second store, scored on the same points")
+    s.add_argument("--tifxyz", default=None)
+    s.add_argument("--volume", default=None)
+    s.add_argument("--png", default=None)
+    s.add_argument("--window", type=int, default=128)
+    s.add_argument("--halo", type=int, default=16)
+    s.add_argument("--device", default=None)
     t = sub.add_parser("teacher", help="run the upstream teacher over a box")
     t.add_argument("out")
     t.add_argument("--origin", type=int, nargs=3, required=True, metavar=("Z0", "Y0", "X0"))
@@ -79,6 +91,12 @@ def main(argv=None):
             for x, _ in grid:
                 x[1:] = 0
         print(st["step"], T.evaluate(net, grid, dev))
+    elif a.cmd == "evalsurf":
+        from usrm2 import evalsurf as E
+        assert a.ckpt or a.store, "need --ckpt or --store"
+        b = a.box or (*E.VAL_BOX[0], *E.VAL_BOX[1])
+        E.run(b[:3], b[3:], ckpt=a.ckpt, store=a.store, teacher=a.teacher, tifxyz=a.tifxyz or E.TIFXYZ,
+              volume=a.volume, window=a.window, halo=a.halo, device=a.device, png_path=a.png)
     elif a.cmd == "teacher-boxes":
         from usrm2 import teacher
         teacher.boxes(a.out_dir, n=a.n, size=tuple(a.size), seed=a.seed)
@@ -87,7 +105,7 @@ def main(argv=None):
         teacher.run(a.out, *a.origin, *a.size, volume=a.volume or data.CT)
     else:
         P.predict(a.ckpt, a.volume or data.CT, *a.origin, *a.size, a.out,
-                  window=a.window, halo=a.halo, volcomp=not a.plain)
+                  window=a.window, halo=a.halo, volcomp=not a.plain, ome=a.ome)
 
 
 if __name__ == "__main__":
