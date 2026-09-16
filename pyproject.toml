@@ -11,6 +11,7 @@ dependencies = [
     "zarr>=3",
     "scipy>=1.13",
     "pillow>=10",
+    "tifffile>=2024",  # the published tifxyz surfaces (evalsurf)
     "volcomp-zarr @ git+https://github.com/SuperOptimizer/volume-compressor#subdirectory=python",
 ]
 
