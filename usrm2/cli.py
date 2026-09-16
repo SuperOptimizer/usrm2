@@ -74,7 +74,11 @@ def main(argv=None):
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         net = model.build(st["args"]["size"]).to(dev)
         net.load_state_dict({k: v.to(dev) for k, v in st["ema"].items()})
-        print(st["step"], T.evaluate(net, data.val_grid(patch=a.patch, limit=a.val_patches), dev))
+        grid = data.val_grid(patch=a.patch, limit=a.val_patches)
+        if st["args"].get("no_radial"):
+            for x, _ in grid:
+                x[1:] = 0
+        print(st["step"], T.evaluate(net, grid, dev))
     elif a.cmd == "teacher-boxes":
         from usrm2 import teacher
         teacher.boxes(a.out_dir, n=a.n, size=tuple(a.size), seed=a.seed)
