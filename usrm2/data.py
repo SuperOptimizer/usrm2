@@ -47,10 +47,10 @@ def augment(rng, ct, tg):
 class Patches(torch.utils.data.IterableDataset):
     """Random (ct, teacher) patches; train patches never touch the val box."""
 
-    def __init__(self, patch=128, ct=CT, stores=TRAIN, exclude=VAL, seed=0, air_keep=0.1):
+    def __init__(self, patch=128, ct=CT, stores=TRAIN, exclude=VAL, seed=0, air_keep=0.1, fg_min=0.05, fg_keep=0.25):
         super().__init__()
-        self.patch, self.ct_path, self.paths, self.exclude, self.seed, self.air_keep = \
-            patch, ct, list(stores), exclude, seed, air_keep
+        self.patch, self.ct_path, self.paths, self.exclude, self.seed = patch, ct, list(stores), exclude, seed
+        self.air_keep, self.fg_min, self.fg_keep = air_keep, fg_min, fg_keep  # low-foreground patches are mostly skipped
         self.arrs = None
 
     def _open(self):
@@ -78,6 +78,8 @@ class Patches(torch.utils.data.IterableDataset):
             if (ct == 0).mean() > 0.9 and rng.random() > self.air_keep:
                 continue
             tg = read3(self.arrs[i], lo, p).astype(np.float32) / 255.0
+            if tg.mean() < self.fg_min and rng.random() > self.fg_keep:
+                continue
             ct, tg = augment(rng, zscore(ct), tg)
             yield torch.from_numpy(ct)[None], torch.from_numpy(tg)[None]
 
