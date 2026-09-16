@@ -120,13 +120,17 @@ class Patches(torch.utils.data.IterableDataset):
         self.arrs = None
 
     def _open(self):
-        self.ct = open_zarr(self.ct_path)
+        """Each teacher store names its CT volume and scroll axis (attrs), so stores from several scrolls can mix."""
         self.arrs = [open_zarr(p) for p in self.paths]
+        self.vols = [a.attrs.get("volume", self.ct_path) for a in self.arrs]
+        cts = {v: open_zarr(v) for v in set(self.vols)}
+        self.cts = [cts[v] for v in self.vols]
+        self.axes = [axis(a.attrs.get("umbilicus", UMBILICUS)) for a in self.arrs]
         self.boxes = [box(a) for a in self.arrs]
         self.w = np.array([np.prod(s) for _, s in self.boxes], np.float64)
         self.w /= self.w.sum()
-        self.ex = box(open_zarr(self.exclude)) if self.exclude else None
-        self.ax = axis()
+        ex = open_zarr(self.exclude) if self.exclude else None
+        self.ex, self.ex_vol = (box(ex), ex.attrs.get("volume", self.ct_path)) if ex is not None else (None, None)
 
     def __iter__(self):
         if self.arrs is None:
@@ -142,20 +146,20 @@ class Patches(torch.utils.data.IterableDataset):
             o, s = self.boxes[i]
             lo = rng.integers(MARGIN, s - MARGIN - p + 1)  # store-local corner
             g = o + lo  # global corner
-            if self.ex is not None and np.all(g < self.ex[0] + self.ex[1]) and np.all(g + p > self.ex[0]):
+            if self.ex is not None and self.vols[i] == self.ex_vol and np.all(g < self.ex[0] + self.ex[1]) and np.all(g + p > self.ex[0]):
                 continue
             bl = self.aug.get("blank")
             if bl and rng.random() < bl["p"]:  # an all-air patch (CT 0 = air) with target 0
                 ct, tg = np.zeros((p, p, p), np.uint8), np.zeros((p, p, p), np.float32)
             else:
-                ct = self.ct[g[0]:g[0] + p, g[1]:g[1] + p, g[2]:g[2] + p]
+                ct = self.cts[i][g[0]:g[0] + p, g[1]:g[1] + p, g[2]:g[2] + p]
                 if (ct == 0).mean() > 0.9 and rng.random() > self.air_keep:
                     continue
                 tg = read3(self.arrs[i], lo, p).astype(np.float32) / 255.0 * (ct > 0)  # masked CT -> no surface
                 if tg.mean() < self.fg_min and rng.random() > self.fg_keep:
                     continue
                 ct = raw(rng, ct, self.aug)
-            rejected, x = 0, inputs(ct, radial(self.ax, g, ct.shape))
+            rejected, x = 0, inputs(ct, radial(self.axes[i], g, ct.shape))
             if self.sym:
                 x, tg = augment(rng, x, tg)
             yield torch.from_numpy(x), torch.from_numpy(tg)[None]
@@ -163,7 +167,8 @@ class Patches(torch.utils.data.IterableDataset):
 
 def val_grid(patch=128, ct=CT, store=VAL, limit=32):
     """Deterministic non-overlapping tiling of the val box -> list of (ct, tgt)."""
-    cta, tga, ax = open_zarr(ct), open_zarr(store), axis()
+    tga = open_zarr(store)
+    cta, ax = open_zarr(tga.attrs.get("volume", ct)), axis(tga.attrs.get("umbilicus", UMBILICUS))
     o, s = box(tga)
     corners = [(z, y, x) for z in range(0, s[0] - patch + 1, patch)
                for y in range(0, s[1] - patch + 1, patch)

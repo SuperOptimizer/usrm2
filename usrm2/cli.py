@@ -68,6 +68,8 @@ def main(argv=None):
     b.add_argument("--n", type=int, default=50)
     b.add_argument("--size", type=int, nargs=3, default=(384, 2048, 2048), metavar=("Z", "Y", "X"))
     b.add_argument("--seed", type=int, default=0)
+    b.add_argument("--volume", default=None, help="CT zarr array (default Paris 4); pair with --umbilicus")
+    b.add_argument("--exclude", default="default", help="val store to avoid (default: data.VAL; 'none' for other scrolls)")
     a = ap.parse_args(argv)
     from usrm2 import data, model, predict as P, train as T
     if a.umbilicus:
@@ -102,7 +104,8 @@ def main(argv=None):
               volume=a.volume, window=a.window, halo=a.halo, device=a.device, png_path=a.png)
     elif a.cmd == "teacher-boxes":
         from usrm2 import teacher
-        teacher.boxes(a.out_dir, n=a.n, size=tuple(a.size), seed=a.seed)
+        ex = data.VAL if a.exclude == "default" else (None if a.exclude == "none" else a.exclude)
+        teacher.boxes(a.out_dir, n=a.n, size=tuple(a.size), seed=a.seed, volume=a.volume or data.CT, exclude=ex)
     elif a.cmd == "teacher":
         from usrm2 import teacher
         teacher.run(a.out, *a.origin, *a.size, volume=a.volume or data.CT)

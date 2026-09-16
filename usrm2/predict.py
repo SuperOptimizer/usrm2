@@ -40,7 +40,7 @@ def slide(fn, roi, window, halo, dev, prep=None):
     return np.where((wsum > 0) & (roi > 0), acc / np.maximum(wsum, 1e-6), 0)  # masked CT (0) -> no surface
 
 
-def out_array(path, shape, origin, volcomp=True):
+def out_array(path, shape, origin, volcomp=True, volume=None, umbilicus=None):
     import zarr
     try:
         from volcomp_zarr import VolcompCodec
@@ -53,7 +53,8 @@ def out_array(path, shape, origin, volcomp=True):
     else:
         kw["shape"], kw["chunks"] = (1,) + tuple(shape), (1, 128, 128, 128)
         z = zarr.create_array(path, **kw)
-    z.attrs.update({"channels": ["recto"], "voxel_um": 2.4, "origin_zyx": [int(v) for v in origin], "scale": 1.0})
+    z.attrs.update({"channels": ["recto"], "voxel_um": 2.4, "origin_zyx": [int(v) for v in origin], "scale": 1.0,
+                    "volume": volume or data.CT, "umbilicus": umbilicus or data.UMBILICUS})  # so loaders know the scroll
     return z
 
 

@@ -28,7 +28,7 @@ def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=256, halo=32, tile=1536
     dev = torch.device(device or "cuda")
     net = load(ckpt, dev)
     fn = lambda t: torch.softmax(net(t)["surface"].float(), 1)[0, 1]
-    ct, arr = data.open_zarr(volume), out_array(out, (Z, Y, X), (z0, y0, x0))
+    ct, arr = data.open_zarr(volume), out_array(out, (Z, Y, X), (z0, y0, x0), volume=volume)
     for y in range(0, Y, tile):
         for x in range(0, X, tile):
             ya, yb, xa, xb = max(y - margin, 0), min(y + tile + margin, Y), max(x - margin, 0), min(x + tile + margin, X)
