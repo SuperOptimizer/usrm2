@@ -98,7 +98,10 @@ class Patches(torch.utils.data.IterableDataset):
         info = torch.utils.data.get_worker_info()
         rng = np.random.default_rng(self.seed + 1000 * (info.id if info else 0))
         p = self.patch
+        rejected = 0
         while True:
+            assert rejected < 10000, "no acceptable patch in 10000 draws (stores all air, or all inside the val box?)"
+            rejected += 1
             i = rng.choice(len(self.arrs), p=self.w)
             o, s = self.boxes[i]
             lo = rng.integers(MARGIN, s - MARGIN - p + 1)  # store-local corner
@@ -111,7 +114,7 @@ class Patches(torch.utils.data.IterableDataset):
             tg = read3(self.arrs[i], lo, p).astype(np.float32) / 255.0
             if tg.mean() < self.fg_min and rng.random() > self.fg_keep:
                 continue
-            x = inputs(ct, radial(self.ax, g, ct.shape))
+            rejected, x = 0, inputs(ct, radial(self.ax, g, ct.shape))
             if self.sym:
                 x, tg = augment(rng, x, tg)
             yield torch.from_numpy(x), torch.from_numpy(tg)[None]
