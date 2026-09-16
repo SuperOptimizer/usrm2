@@ -15,6 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-timeout>=2.3"]
+teacher = ["vesuvius", "einops", "timm"]  # villa network builder for the upstream teacher
 
 [project.scripts]
 usrm2 = "usrm2.cli:main"

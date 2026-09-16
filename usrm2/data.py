@@ -1,15 +1,14 @@
 """CT + teacher patch sampling. All boxes are (z, y, x) level-0 voxels.
 
-Teacher stores: uint8 = recto probability * 255, shape (1,Z,Y,X) (or (Z,Y,X)),
+Teacher stores: uint8 = recto probability * 255, shape (Z,Y,X) (or (1,Z,Y,X)),
 attrs origin_zyx = the level-0 index of element 0. CT: uint8, 0 = air/masked.
 """
 import numpy as np
 import torch
 
 CT = "/vesuvius/usrm/volcomp/PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr/0"
-TRAIN = ["/vesuvius/tsm/output/slab_tta/teachers/recto.zarr",
-         "/vesuvius/tsm/output/paris4b_salvage/teachers/recto.zarr"]
-VAL = "/vesuvius/tsm/output/eval/teachers/recto.zarr"
+TRAIN = ["/vesuvius/usrm2/teacher/a.zarr", "/vesuvius/usrm2/teacher/b.zarr"]  # made by `usrm2 teacher`
+VAL = "/vesuvius/usrm2/teacher/eval.zarr"
 MARGIN = 16  # sliding-window predictions are worse at the teacher box edges
 
 
