@@ -17,6 +17,21 @@ def main(argv=None):
     t.add_argument("--resume", action="store_true")
     t.add_argument("--stores", nargs="+", default=None, help="teacher stores to train on (default: data.TRAIN)")
     t.add_argument("--val", default=None, help="teacher store for validation (default: data.VAL)")
+    t.add_argument("--aug", default="geo", help="augmentation preset (see aug.PRESETS)")
+    t.add_argument("--no-radial", action="store_true", help="zero the radial channels 1..3")
+    b = sub.add_parser("ablate", help="train one run per augmentation preset, sequentially")
+    b.add_argument("out_dir")
+    b.add_argument("--presets", default="geo,all")
+    b.add_argument("--size", default="1m", choices=["1m", "3m", "5m"])
+    b.add_argument("--steps", type=int, default=3000)
+    b.add_argument("--patch", type=int, default=96)
+    b.add_argument("--batch", type=int, default=4)
+    b.add_argument("--lr", type=float, default=3e-4)
+    b.add_argument("--workers", type=int, default=4)
+    b.add_argument("--eval-every", type=int, default=500)
+    b.add_argument("--val-patches", type=int, default=32)
+    b.add_argument("--stores", nargs="+", default=None)
+    b.add_argument("--val", default=None)
     e = sub.add_parser("eval")
     e.add_argument("ckpt")
     e.add_argument("--patch", type=int, default=128)
@@ -45,7 +60,14 @@ def main(argv=None):
     if a.cmd == "train":
         T.train(a.out_dir, size=a.size, steps=a.steps, patch=a.patch, batch=a.batch, lr=a.lr,
                 workers=a.workers, eval_every=a.eval_every, val_patches=a.val_patches, resume=a.resume,
+                aug=a.aug, no_radial=a.no_radial,
                 **{k: v for k, v in dict(stores=a.stores, val=a.val).items() if v})
+    elif a.cmd == "ablate":
+        from usrm2 import ablate
+        ablate.sweep(a.out_dir, a.presets.split(","), size=a.size, steps=a.steps, patch=a.patch,
+                     batch=a.batch, lr=a.lr, workers=a.workers, eval_every=a.eval_every,
+                     val_patches=a.val_patches,
+                     **{k: v for k, v in dict(stores=a.stores, val=a.val).items() if v})
     elif a.cmd == "eval":
         import torch
         st = torch.load(a.ckpt, map_location="cpu")

@@ -10,6 +10,7 @@ dependencies = [
     "numpy>=2",
     "zarr>=3",
     "scipy>=1.13",
+    "pillow>=10",
     "volcomp-zarr @ git+https://github.com/SuperOptimizer/volume-compressor#subdirectory=python",
 ]
 

@@ -12,7 +12,12 @@ input is a z-scored CT patch, output is one recto-probability logit per voxel.
 - Teacher stores are `(1, Z, Y, X)`; predictions written with the volcomp codec are `(Z, Y, X)`
   (the codec only accepts 128^3 chunks); `--plain` writes `(1, Z, Y, X)` plain zarr instead.
 
+- Augmentation (`aug.py`): the 48 cube symmetries run in the dataloader worker, everything else
+  (rot/scale/shear/elastic + intensity) runs batched on the GPU in `train.py`; spatial augs rotate
+  the radial vector channels by the same map. Pick a preset with `--aug` (see `aug.PRESETS`).
+
 ## Commands
     usrm2 train /vesuvius/usrm2/runs/p4_1m --size 1m --steps 20000 --patch 128 --batch 1
     usrm2 eval  /vesuvius/usrm2/runs/p4_1m/ckpt.pt
     usrm2 predict RUN/ckpt.pt out.zarr --origin 34432 15104 18432 --size 256 256 256
+    usrm2 ablate /vesuvius/usrm2/runs/ablate1 --presets geo,all --steps 3000 --patch 96 --batch 4

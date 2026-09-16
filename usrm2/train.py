@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from usrm2 import data, model as M
+from usrm2 import aug as A, data, model as M
 
 
 def losses(logit, tgt):
@@ -47,10 +47,13 @@ def evaluate(net, grid, dev):
 
 
 def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=4, warmup=200,
-          eval_every=500, val_patches=32, resume=False, device=None, **kw):
+          eval_every=500, val_patches=32, resume=False, device=None, aug="geo", no_radial=False, **kw):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    args = dict(size=size, steps=steps, patch=patch, batch=batch, lr=lr, **kw)
+    cfg = dict(A.get(aug), **({"norad": True} if no_radial else {}))
+    no_radial = bool(cfg.get("norad"))
+    args = dict(size=size, steps=steps, patch=patch, batch=batch, lr=lr, aug=aug, aug_cfg=cfg,
+                no_radial=no_radial, **kw)
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     net = M.build(size).to(dev)
     opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=0.01)
@@ -66,9 +69,12 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         for _ in range(step):
             sched.step()
     grid = data.val_grid(patch=patch, ct=kw.get("ct", data.CT), store=kw.get("val", data.VAL), limit=val_patches)
+    if no_radial:
+        for x, _ in grid:
+            x[1:] = 0
     evnet = M.build(size, verbose=False).to(dev)
     dl = data.loader(patch, batch, workers, ct=kw.get("ct", data.CT), stores=kw.get("stores", data.TRAIN),
-                     exclude=kw.get("val", data.VAL), seed=step)
+                     exclude=kw.get("val", data.VAL), seed=step, sym=cfg.get("sym", True))
 
     def save():
         torch.save({"model": net.state_dict(), "ema": ema, "opt": opt.state_dict(),
@@ -79,12 +85,13 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
             f.write(json.dumps(rec) + "\n")
         print(name, rec, flush=True)
 
+    log("train.jsonl", {"step": step, "aug": aug, "cfg": cfg, "size": size, "patch": patch, "batch": batch})
     t0 = time.time()
     for ct, tg in dl:
         if step >= steps:
             break
-        ct = ct.to(dev, non_blocking=True).to(memory_format=torch.channels_last_3d)
-        tg = tg.to(dev, non_blocking=True)
+        ct, tg = A.apply(ct.to(dev, non_blocking=True), tg.to(dev, non_blocking=True), cfg)
+        ct = ct.to(memory_format=torch.channels_last_3d)
         with autocast(dev):
             bce, dice = losses(net(ct).float(), tg)
         loss = bce + dice

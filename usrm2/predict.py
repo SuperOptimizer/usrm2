@@ -70,7 +70,8 @@ def predict(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=
     net.load_state_dict(st["ema"])
     net.eval()
     roi, ax = data.open_zarr(volume)[z0:z0 + Z, y0:y0 + Y, x0:x0 + X], data.axis()
-    prep = lambda c, o: data.inputs(c, data.radial(ax, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape))
+    r = 0.0 if st["args"].get("no_radial") else 1.0  # training zeroed the radial channels
+    prep = lambda c, o: data.inputs(c, data.radial(ax, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape) * r)
     prob = slide(lambda t: torch.sigmoid(net(t))[0, 0], roi, window, halo, dev, prep)
     write(out, prob, (z0, y0, x0), volcomp=volcomp)
     return out

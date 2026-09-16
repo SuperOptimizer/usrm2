@@ -136,7 +136,7 @@ def _bias(c, k):  # low-frequency multiplicative gain (beam hardening / cupping)
 
 
 def _clip(c, k):
-    m, s = c.mean((2, 3, 4), True), c.std((2, 3, 4), True)
+    m, s = c.mean((2, 3, 4), True), c.std(dim=(2, 3, 4), keepdim=True)
     a = _p(c, k["lo"], k["hi"]) * s
     return torch.maximum(torch.minimum(c, m + a), m - a)
 
