@@ -128,7 +128,10 @@ def run(origin=VAL_BOX[0], size=VAL_BOX[1], ckpt=None, store=None, teacher=None,
         volume=None, window=128, halo=16, device=None, png_path=None, cache=None):
     o, s = tuple(origin), tuple(size)
     pts, nrm, counts = sites(o, s, tifxyz, cache=cache or (store and store.rstrip("/") + f".sites_{o[0]}_{o[1]}_{o[2]}.npz"))
-    print(json.dumps({"box": [*o, *s], "surfaces": counts}))
+    ct = data.open_zarr(volume or data.CT)[o[0]:o[0] + s[0], o[1]:o[1] + s[1], o[2]:o[2] + s[2]]
+    keep = ct[tuple(np.clip(np.rint(pts - o).astype(int), 0, np.array(s) - 1).T)] > 0  # points in masked CT can't be predicted
+    pts, nrm = pts[keep], nrm[keep]
+    print(json.dumps({"box": [*o, *s], "surfaces": counts, "masked_points_dropped": int((~keep).sum())}))
     if ckpt:
         prob, st = P.probs(ckpt, volume or data.CT, *o, *s, window=window, halo=halo, device=device)
         p_u8, name = P.u8(prob), f"{ckpt}@{st.get('step')}"
@@ -138,5 +141,4 @@ def run(origin=VAL_BOX[0], size=VAL_BOX[1], ckpt=None, store=None, teacher=None,
     if teacher:
         print(json.dumps({"source": teacher, **metrics(read_box(teacher, o, s), o, pts, nrm)}))
     if png_path:
-        ct = data.open_zarr(volume or data.CT)[o[0]:o[0] + s[0], o[1]:o[1] + s[1], o[2]:o[2] + s[2]]
         print(json.dumps({"png": png(png_path, ct, p_u8, o, pts)[0]}))
