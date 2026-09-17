@@ -74,7 +74,11 @@ def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=256, halo=32, tile=2048
             prob = sum(sl(fn, roi, window, halo, dev, pr) for pr in preps) / len(preps) if roi.any() else np.zeros(roi.shape, np.float32)
             prob = prob[:, y - ya:y - ya + tile, x - xa:x - xa + tile]
             t2 = time.time()
-            arr[:, y:y + prob.shape[1], x:x + prob.shape[2]] = np.clip(np.rint(prob * 255), 0, 255).astype(np.uint8)
+            u8 = np.empty(prob.shape, np.uint8)
+            for z in range(0, prob.shape[0], 32):  # slab-wise: no full-size float temporaries (a box is 1.6 G voxels)
+                u8[z:z + 32] = np.clip(np.rint(prob[z:z + 32] * 255), 0, 255)
+            del prob
+            arr[:, y:y + u8.shape[1], x:x + u8.shape[2]] = u8
             print(f"tile y={y} x={x} done: read {t1 - t0:.0f}s slide {t2 - t1:.0f}s write {time.time() - t2:.0f}s", flush=True)
     return out
 

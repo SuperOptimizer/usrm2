@@ -8,6 +8,7 @@ x = torch.from_numpy(data.zscore(ct)[None, None]).cuda()
 net = teacher.load(teacher.CKPT, "cuda")
 with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
     ref = torch.softmax(net(x)["surface"].float(), 1)[0, 1].cpu().numpy()
+    t = time.time(); [net(x) for _ in range(10)]; torch.cuda.synchronize(); print("recto torch", round((time.time() - t) / 10, 3), "s/window", flush=True)
 del net; torch.cuda.empty_cache()
 eng = trt.Engine(trt.plan("recto", 256), "cuda")
 out = torch.softmax(eng(x), 1)[0, 1].cpu().numpy()
@@ -18,6 +19,7 @@ x = torch.from_numpy(((np.clip(lo.astype(np.float32), a, b) - mean) / std)[None,
 n = m7.load(m7.CKPT, "cuda")
 with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
     ref = torch.softmax(n(x).float(), 1)[0, 1].cpu().numpy()
+    t = time.time(); [n(x) for _ in range(10)]; torch.cuda.synchronize(); print("m7 torch", round((time.time() - t) / 10, 3), "s/window", flush=True)
 del n; torch.cuda.empty_cache()
 eng = trt.Engine(trt.plan("m7", 192), "cuda")
 out = torch.softmax(eng(x), 1)[0, 1].cpu().numpy()
