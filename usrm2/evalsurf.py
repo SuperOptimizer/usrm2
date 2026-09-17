@@ -113,7 +113,7 @@ def read_box(path, origin, size):
 def png(path, ct, p_u8, origin, pts, thr=0.5):
     """CT z-slice (the one with most surface points) + published points (green) + P>=thr (red)."""
     from PIL import Image
-    zi = np.bincount(np.rint(pts[:, 0] - origin[0]).astype(int), minlength=ct.shape[0]).argmax()
+    zi = np.bincount(np.clip(np.rint(pts[:, 0] - origin[0]).astype(int), 0, ct.shape[0] - 1), minlength=ct.shape[0]).argmax()
     g = np.repeat(np.asarray(ct[zi], np.uint8)[..., None], 3, -1)
     g[..., 0] = np.where(p_u8[zi] >= thr * 255, 255, g[..., 0])
     k = np.abs(pts[:, 0] - origin[0] - zi) <= 2  # a thin slab, the grid is 20 voxels coarse
@@ -127,7 +127,9 @@ def png(path, ct, p_u8, origin, pts, thr=0.5):
 def run(origin=VAL_BOX[0], size=VAL_BOX[1], ckpt=None, store=None, teacher=None, tifxyz=TIFXYZ,
         volume=None, window=128, halo=16, device=None, png_path=None, cache=None, tta=0, luts=(), head=0):
     o, s = tuple(origin), tuple(size)
-    pts, nrm, counts = sites(o, s, tifxyz, cache=cache or (store and store.rstrip("/") + f".sites_{o[0]}_{o[1]}_{o[2]}.npz"))
+    import hashlib
+    key = hashlib.md5(f"{s}|{tifxyz}|{data.UMBILICUS}".encode()).hexdigest()[:8]
+    pts, nrm, counts = sites(o, s, tifxyz, cache=cache or (store and store.rstrip("/") + f".sites_{o[0]}_{o[1]}_{o[2]}_{key}.npz"))
     ct = data.open_zarr(volume or data.CT)[o[0]:o[0] + s[0], o[1]:o[1] + s[1], o[2]:o[2] + s[2]]
     keep = ct[tuple(np.clip(np.rint(pts - o).astype(int), 0, np.array(s) - 1).T)] > 0  # points in masked CT can't be predicted
     pts, nrm = pts[keep], nrm[keep]

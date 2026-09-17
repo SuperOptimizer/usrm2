@@ -50,3 +50,20 @@ def test_slide_gpu_matches_slide():
     a = P.slide(fn, roi, 32, 4, torch.device("cpu"))
     b = P.slide_gpu(fn, roi, 32, 4, torch.device("cpu"), lambda c, o: P.zscore_t(c)[None])
     assert a.shape == b.shape and np.abs(a - b).max() < 2e-2 and np.abs(a - b).mean() < 1e-3 and (b[:, :8] == 0).all()  # fp16 accumulators
+
+
+def test_slide_pads_rois_thinner_than_the_window():
+    import numpy as np, torch
+    from usrm2 import predict as P
+    roi = np.full((8, 16, 16), 100, np.uint8)
+    out = P.slide(lambda t: torch.ones(t.shape[2:]), roi, 16, 4, torch.device("cpu"))
+    assert out.shape == roi.shape and np.allclose(out, 1.0)
+
+
+def test_axis_default_follows_the_global(tmp_path, monkeypatch):
+    import json
+    from usrm2 import data
+    p = tmp_path / "u.json"
+    p.write_text(json.dumps({"control_points": [{"z": 0, "y": 5, "x": 7}, {"z": 10, "y": 5, "x": 7}]}))
+    monkeypatch.setattr(data, "UMBILICUS", str(p))
+    assert data.axis()[1][0] == 5

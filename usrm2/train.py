@@ -25,7 +25,8 @@ def ema_update(ema, model, decay=0.999):
 
 
 def autocast(dev):
-    return torch.autocast("cuda", torch.bfloat16) if dev.type == "cuda" else torch.autocast("cpu", torch.bfloat16)
+    import contextlib
+    return torch.autocast("cuda", torch.bfloat16) if dev.type == "cuda" else contextlib.nullcontext()
 
 
 @torch.no_grad()

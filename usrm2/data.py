@@ -54,10 +54,11 @@ def read3(arr, o, p):
     return arr[(0,) + s] if arr.ndim == 4 else arr[s]
 
 
-def axis(path=UMBILICUS):
-    """(z, y, x) arrays of the scroll axis control points, sorted by z (level-0 voxels)."""
+def axis(path=None):
+    """(z, y, x) arrays of the scroll axis control points, sorted by z (level-0 voxels).
+    The default is read at call time, so `--umbilicus` (which rebinds UMBILICUS) is honoured."""
     import json
-    pts = sorted((p["z"], p["y"], p["x"]) for p in json.load(open(path))["control_points"])
+    pts = sorted((p["z"], p["y"], p["x"]) for p in json.load(open(path or UMBILICUS))["control_points"])
     return np.array(pts, np.float64).T
 
 
@@ -142,6 +143,10 @@ class Patches(torch.utils.data.IterableDataset):
     def _open(self):
         """Each teacher store names its CT volume and scroll axis (attrs), so stores from several scrolls can mix."""
         self.heads = [[open_zarr(q) for q in ps] for ps in self.paths]  # target channels
+        for ps, h in zip(self.paths, self.heads):
+            for q, a in zip(ps[1:], h[1:]):
+                assert box(a)[0].tolist() == box(h[0])[0].tolist() and a.shape[-3:] == h[0].shape[-3:] \
+                    and a.attrs.get("volume", self.ct_path) == h[0].attrs.get("volume", self.ct_path), f"{q} is not the same box as {ps[0]}"
         self.arrs = [h[0] for h in self.heads]
         self.vols = [a.attrs.get("volume", self.ct_path) for a in self.arrs]
         cts = {v: open_zarr(v) for v in set(self.vols)}

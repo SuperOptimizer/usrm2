@@ -22,6 +22,10 @@ def slide(fn, roi, window, halo, dev, prep=None):
     """Gaussian-blended sliding window over a uint8 ROI. fn: normalized (1,C,w,w,w) tensor -> prob (w,w,w).
     prep(ct_window, (z,y,x) window offset) -> (C,w,w,w) float input; default is z-scored CT alone."""
     prep = prep or (lambda c, o: data.zscore(c)[None])
+    if any(s < window for s in roi.shape):  # thinner than a window: pad with air, crop the result
+        S = roi.shape
+        roi = np.pad(roi, [(0, max(window - s, 0)) for s in S])
+        return slide(fn, roi, window, halo, dev, prep)[:S[0], :S[1], :S[2]]
     Z, Y, X = roi.shape
     acc, wsum, g = np.zeros(roi.shape, np.float32), np.zeros(roi.shape, np.float32), gauss(window)
     stride = window - 2 * halo
@@ -97,8 +101,8 @@ def u8(prob):
     return np.clip(np.rint(prob * 255), 0, 255).astype(np.uint8)
 
 
-def write(path, prob, origin, volcomp=True):
-    a = out_array(path, prob.shape, origin, volcomp=volcomp)
+def write(path, prob, origin, volcomp=True, volume=None):
+    a = out_array(path, prob.shape, origin, volcomp=volcomp, volume=volume)
     p = u8(prob)
     a[:] = p[None] if a.ndim == 4 else p
 
@@ -177,7 +181,8 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
 def predict(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=None, volcomp=True, ome=False, tta=0, luts=(), head=0):
     prob, st = probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=window, halo=halo, device=device, tta=tta, luts=luts, head=head)
     if ome:
-        write_ome(out, u8(prob), (z0, y0, x0), meta={"checkpoint": str(ckpt), "step": int(st.get("step", 0))})
+        write_ome(out, u8(prob), (z0, y0, x0), full_shape=data.open_zarr(volume).shape[-3:],
+                  meta={"checkpoint": str(ckpt), "step": int(st.get("step", 0)), "volume": volume})
     else:
-        write(out, prob, (z0, y0, x0), volcomp=volcomp)
+        write(out, prob, (z0, y0, x0), volcomp=volcomp, volume=volume)
     return out

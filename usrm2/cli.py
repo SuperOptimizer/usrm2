@@ -38,6 +38,8 @@ def main(argv=None):
     e.add_argument("ckpt")
     e.add_argument("--patch", type=int, default=128)
     e.add_argument("--val-patches", type=int, default=32)
+    e.add_argument("--val", default=None, help="teacher store to score (default: the checkpoint's own)")
+    e.add_argument("--ct", default=None)
     p = sub.add_parser("predict")
     p.add_argument("ckpt")
     p.add_argument("out")
@@ -105,9 +107,11 @@ def main(argv=None):
         import torch
         st = torch.load(a.ckpt, map_location="cpu")
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        net = model.build(st["args"]["size"]).to(dev)
+        net = model.build(st["args"]["size"], cout=st["args"].get("cout", 1)).to(dev)
         net.load_state_dict({k: v.to(dev) for k, v in st["ema"].items()})
-        grid = data.val_grid(patch=a.patch, limit=a.val_patches)
+        sa = st["args"]  # the run's own validation set unless overridden
+        grid = data.val_grid(patch=a.patch, limit=a.val_patches, ct=a.ct or sa.get("ct", data.CT), store=a.val or sa.get("val", data.VAL))
+        print("val", a.val or sa.get("val", data.VAL))
         if st["args"].get("no_radial"):
             for x, _ in grid:
                 x[1:] = 0

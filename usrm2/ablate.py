@@ -15,7 +15,7 @@ def preview(ckpt, png, patch, ct, val, no_radial=False):
     from PIL import Image
     st = torch.load(ckpt, map_location="cpu")
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net = M.build(st["args"]["size"], verbose=False).to(dev)
+    net = M.build(st["args"]["size"], verbose=False, cout=st["args"].get("cout", 1)).to(dev)
     net.load_state_dict({k: v.to(dev) for k, v in st["ema"].items()})
     net.eval()
     x, t = data.val_grid(patch=patch, ct=ct, store=val, limit=1)[0]
@@ -40,7 +40,7 @@ def sweep(out_dir, presets, **kw):
         tr = [json.loads(l) for l in (d / "train.jsonl").read_text().splitlines() if "vox_s" in l]
         r = {"preset": name, **{k: round(ev[-1][k], 4) for k in ("bce", "dice", "mae")},
              "best_dice": round(max(e["dice"] for e in ev), 4),
-             "vox_s": round(statistics.median(t["vox_s"] for t in tr))}
+             "vox_s": round(statistics.median(t["vox_s"] for t in tr)) if tr else None}
         try:
             preview(ck, d / "preview.png", kw.get("patch", 128), kw.get("ct", data.CT),
                     kw.get("val", data.VAL), no_radial="norad" in name)

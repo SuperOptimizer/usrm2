@@ -286,7 +286,9 @@ def _pool(c, k):  # a coarser voxel grid, by a pooling op: avg/gauss = detector 
     ks = [r, r, r]
     if torch.rand(1) < k["aniso"]:
         ks[int(torch.randint(3, (1,)))] = 1
-    S, x = c.shape[2:], c[:, :, :c.shape[2] // ks[0] * ks[0], :c.shape[3] // ks[1] * ks[1], :c.shape[4] // ks[2] * ks[2]]
+    S = c.shape[2:]
+    pad = [(-n) % q for n, q in zip(S, ks)]
+    x = F.pad(c, [0, pad[2], 0, pad[1], 0, pad[0]], mode="replicate") if any(pad) else c
     if op == "avg":
         d = F.avg_pool3d(x, ks, ks)
     elif op == "max":
@@ -300,7 +302,8 @@ def _pool(c, k):  # a coarser voxel grid, by a pooling op: avg/gauss = detector 
     else:  # stride
         d = x[:, :, ::ks[0], ::ks[1], ::ks[2]]
     up = "nearest" if torch.rand(1) < k["nearest"] else "trilinear"
-    return F.interpolate(d, size=S, mode=up, **({} if up == "nearest" else {"align_corners": False}))
+    P = [n + p for n, p in zip(S, pad)]
+    return F.interpolate(d, size=P, mode=up, **({} if up == "nearest" else {"align_corners": False}))[:, :, :S[0], :S[1], :S[2]]
 
 
 def _zjit(c, k):  # the z-score itself is uncalibrated: jitter its scale and offset (speculative)
@@ -320,7 +323,7 @@ def _sheetcomp(x, tg, k, m):
     dis = _blur1(dis, tuple(0.0 if i == d else k["smooth"] for i in range(3)))
     g = F.affine_grid(torch.cat([_eye(b, dev), torch.zeros(b, 3, 1, device=dev)], 2), (b, 1, *S),
                       align_corners=False).clone()
-    g[..., 2 - d] = g[..., 2 - d] - dis[:, 0] * (2.0 / S[d])
+    g[..., 2 - d] = g[..., 2 - d] + dis[:, 0] * (2.0 / S[d])  # out->in: advance faster through air = gaps shrink
     gs = dict(mode="bilinear", padding_mode="border", align_corners=False)
     o, tg = F.grid_sample(x, g, **gs), F.grid_sample(tg, g, **gs)
     n = o[:, 1:].norm(dim=1, keepdim=True)

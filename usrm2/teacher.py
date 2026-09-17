@@ -31,8 +31,10 @@ def flips(fn, n=8):
 def lut_to(volume, ref=data.CT, n=30, seed=0):
     """uint8 LUT that histogram-matches `volume` to `ref` (non-air voxels of n random 128^3 patches each)."""
     def hist(v):
-        a, rng, h, k = data.open_zarr(v), np.random.default_rng(seed), np.zeros(256), 0
+        a, rng, h, k, t = data.open_zarr(v), np.random.default_rng(seed), np.zeros(256), 0, 0
         while k < n:
+            t += 1
+            assert t < 100 * n, f"{v}: too few bright non-air patches for a histogram"
             o = rng.integers(0, np.array(a.shape) - 128); c = a[o[0]:o[0] + 128, o[1]:o[1] + 128, o[2]:o[2] + 128]
             if (c > 0).mean() >= 0.7 and c.mean() >= 30:
                 h += np.bincount(c[c > 0].ravel(), minlength=256); k += 1
@@ -80,6 +82,7 @@ def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=256, halo=32, tile=2048
             del prob
             arr[:, y:y + u8.shape[1], x:x + u8.shape[2]] = u8
             print(f"tile y={y} x={x} done: read {t1 - t0:.0f}s slide {t2 - t1:.0f}s write {time.time() - t2:.0f}s", flush=True)
+    arr.attrs["done"] = True  # boxes() regenerates stores without it (interrupted runs)
     return out
 
 
@@ -90,17 +93,22 @@ def boxes(out_dir, n=50, size=(384, 2048, 2048), seed=0, volume=data.CT, exclude
     rng = np.random.default_rng(seed)
     ct, lo = data.open_zarr(volume), data.open_zarr(volume.rstrip("/").rsplit("/", 1)[0] + "/2")
     ex = data.box(data.open_zarr(exclude)) if exclude else None
-    size, shape, done = np.array(size), np.array(ct.shape), 0
+    size, shape, done, seen, tries = np.array(size), np.array(ct.shape), 0, set(), 0
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     while done < n:
+        tries += 1
+        assert tries < 200 * n, f"only {done} acceptable distinct boxes in {tries} draws (volume mostly air/masked?)"
         o = (rng.integers(0, shape - size) // 128) * 128
+        if tuple(o) in seen:
+            continue
         if ex is not None and np.all(o < ex[0] + ex[1]) and np.all(o + size > ex[0]):
             continue
         s = lo[o[0] // 4:(o[0] + size[0]) // 4, o[1] // 4:(o[1] + size[1]) // 4, o[2] // 4:(o[2] + size[2]) // 4]
         if s.mean() < min_mean or (s > 0).mean() < 0.7:
             continue
         out = f"{out_dir}/box_{o[0]}_{o[1]}_{o[2]}.zarr"
-        if not Path(out).exists():
+        seen.add(tuple(o))
+        if not (Path(out).exists() and data.open_zarr(out).attrs.get("done")):  # absent or interrupted
             (runner or run)(out, *o, *size, volume=volume, **kw)
         done += 1
         print(f"box {done}/{n} {out}", flush=True)

@@ -162,3 +162,26 @@ def test_pool_ops_coarsen_and_keep_shape(op):
         assert torch.allclose(y[:, 0, 0, 0, 0], x[:, 0, :3, :3, :3].flatten(1).median(1).values)
     if op == "stride":
         assert (y[:, 0, 0, 0, 0] == x[:, 0, 0, 0, 0]).all()
+
+
+def test_sheetcomp_pulls_sheets_together():
+    x = torch.zeros(1, 4, 64, 64, 64)
+    x[:, 0] = -1.0
+    x[:, 0, :, :, 10:13] = 1.0
+    x[:, 0, :, :, 30:33] = 1.0
+    x[:, 3] = 1.0
+    t = (x[:, :1] > 0).float()
+    torch.manual_seed(0)
+    y, u = A._sheetcomp(x, t, {"lo": 0.25, "hi": 0.25, "smooth": 0.0}, torch.ones(1, 1, 1, 1, 1))
+    prof = y[0, 0, 32, 32]
+    peaks = torch.nonzero(prof > 0).flatten()
+    assert peaks.numel() > 0 and peaks.max() < 30  # the second sheet moved towards the first (from x=30)
+    assert (u[0, 0, 32, 32] > 0.5).nonzero().max() < 30  # and the target rode along
+
+
+def test_pool_keeps_the_extent_for_non_divisible_sizes():
+    x = torch.zeros(1, 1, 32, 32, 32)
+    x[..., 30:] = 1.0  # a feature on the last planes
+    k = {**A.POOL["pool"], "ops": ["avg"], "k_lo": 3, "k_hi": 3, "aniso": 0.0, "nearest": 1.0}
+    y = A._pool(x, k)
+    assert y.shape == x.shape and y[..., 31].sum() > 0 and y[..., :27].sum() == 0
