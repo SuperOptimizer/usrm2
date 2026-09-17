@@ -122,9 +122,11 @@ def smooth(field, w, sigma):
 
 
 def filled(g, sigma=1.0):
-    """The grid with holes (NaN) filled from their neighbourhood, for normal estimation only."""
-    w = np.isfinite(g).all(-1).astype(np.float32)
-    return np.stack([smooth(np.where(w > 0, g[..., i], 0), w, sigma) for i in range(3)], -1)
+    """The grid with only its holes (NaN) filled from their neighbourhood; valid cells are untouched."""
+    ok = np.isfinite(g).all(-1)
+    w = ok.astype(np.float32)
+    f = np.stack([smooth(np.where(ok, g[..., i], 0), w, sigma) for i in range(3)], -1)
+    return np.where(ok[..., None], g, f)
 
 
 def normals(g, ax):

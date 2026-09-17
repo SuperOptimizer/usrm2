@@ -75,5 +75,6 @@ def test_upsample_densifies_and_keeps_holes():
     u = R.upsample(g, 5)
     assert u.shape == (21, 21, 3)
     ok = np.isfinite(u).all(-1)
-    assert np.allclose(u[ok][:, 0] % 4, 0, atol=1e-3) and np.abs(np.diff(u[0, :, 2])).mean() == pytest.approx(4.0, abs=1e-3)
+    v = u[ok][:, 0] / 4
+    assert np.abs(v - np.round(v)).max() < 1e-3 and np.abs(np.diff(u[0, :, 2])).mean() == pytest.approx(4.0, abs=1e-3)
     assert not ok[10, 10] and ok[0, 0] and ok[20, 20]
