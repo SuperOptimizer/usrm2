@@ -52,8 +52,8 @@ def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=192, halo=32, margin=64
     c = o - a
     prob = slide(fn, r, window, halo, dev, prep)[c[0]:c[0] + s[0], c[1]:c[1] + s[1], c[2]:c[2] + s[2]]
     up = F.interpolate(torch.from_numpy(prob)[None, None], size=(Z, Y, X), mode="trilinear", align_corners=False)[0, 0].numpy()
-    full = data.open_zarr(volume)[z0:z0 + Z, y0:y0 + Y, x0:x0 + X]
+    air = np.repeat(np.repeat(np.repeat(roi[c[0]:c[0] + s[0], c[1]:c[1] + s[1], c[2]:c[2] + s[2]] == 0, f, 0), f, 1), f, 2)
     arr = out_array(out, (Z, Y, X), (z0, y0, x0), volume=volume)
-    arr[:] = np.where(full > 0, np.clip(np.rint(up * 255), 0, 255), 0).astype(np.uint8)  # masked CT -> no surface
+    arr[:] = np.where(air, 0, np.clip(np.rint(up * 255), 0, 255)).astype(np.uint8)  # coarse air mask; the loader masks with the fine CT
     arr.attrs.update({"model": "m7", "level": level, "tta": tta})
     return out

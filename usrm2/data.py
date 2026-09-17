@@ -35,7 +35,12 @@ def open_zarr(path):
         import volcomp_zarr  # noqa: F401  (registers the "volcomp" codec)
     except Exception:
         pass
-    return zarr.open(local(str(path)), mode="r")
+    path = local(str(path))
+    if "://" in path:  # streamed: more chunk fetches in flight, and a stalled request fails instead of hanging
+        import aiohttp
+        zarr.config.set({"async.concurrency": 64})
+        return zarr.open(path, mode="r", storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=300)}})
+    return zarr.open(path, mode="r")
 
 
 def box(arr):
