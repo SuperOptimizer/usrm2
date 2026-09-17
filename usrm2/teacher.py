@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from usrm2 import data
-from usrm2.predict import out_array, slide, slide_gpu, zscore_t
+from usrm2.predict import out_array, put, slide, slide_gpu, zscore_t
 
 CKPT = "/vesuvius/tsm/models/surface_recto_3dunet.pth"
 
@@ -80,7 +80,7 @@ def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=256, halo=32, tile=2048
             for z in range(0, prob.shape[0], 32):  # slab-wise: no full-size float temporaries (a box is 1.6 G voxels)
                 u8[z:z + 32] = np.clip(np.rint(prob[z:z + 32] * 255), 0, 255)
             del prob
-            arr[:, y:y + u8.shape[1], x:x + u8.shape[2]] = u8
+            put(arr, u8, 0, y, x)
             print(f"tile y={y} x={x} done: read {t1 - t0:.0f}s slide {t2 - t1:.0f}s write {time.time() - t2:.0f}s", flush=True)
     arr.attrs["done"] = True  # boxes() regenerates stores without it (interrupted runs)
     return out

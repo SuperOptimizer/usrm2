@@ -97,6 +97,12 @@ def out_array(path, shape, origin, volcomp=True, volume=None, umbilicus=None):
     return z
 
 
+def put(arr, u8, z=0, y=0, x=0):
+    """Write a uint8 block into a store at a local offset, whatever its layout ((Z,Y,X) or (1,Z,Y,X))."""
+    s = (slice(z, z + u8.shape[0]), slice(y, y + u8.shape[1]), slice(x, x + u8.shape[2]))
+    arr[(0,) + s if arr.ndim == 4 else s] = u8
+
+
 def u8(prob):
     return np.clip(np.rint(prob * 255), 0, 255).astype(np.uint8)
 

@@ -67,3 +67,14 @@ def test_axis_default_follows_the_global(tmp_path, monkeypatch):
     p.write_text(json.dumps({"control_points": [{"z": 0, "y": 5, "x": 7}, {"z": 10, "y": 5, "x": 7}]}))
     monkeypatch.setattr(data, "UMBILICUS", str(p))
     assert data.axis()[1][0] == 5
+
+
+def test_put_handles_both_store_layouts(tmp_path):
+    import numpy as np, zarr
+    from usrm2 import predict as P
+    u = np.full((4, 4, 4), 9, np.uint8)
+    for shape, chunks in (((8, 8, 8), (4, 4, 4)), ((1, 8, 8, 8), (1, 4, 4, 4))):
+        a = zarr.create_array(str(tmp_path / f"s{len(shape)}.zarr"), shape=shape, chunks=chunks, dtype="uint8", fill_value=0)
+        P.put(a, u, 0, 4, 4)
+        v = a[0] if a.ndim == 4 else a[:]
+        assert v[:4, 4:, 4:].min() == 9 and v[:4, :4, :4].max() == 0

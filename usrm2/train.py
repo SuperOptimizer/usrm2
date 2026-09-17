@@ -57,6 +57,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
                 no_radial=no_radial, **kw)
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     grid = data.val_grid(patch=patch, ct=kw.get("ct", data.CT), store=kw.get("val", data.VAL), limit=val_patches)
+    assert grid, f"validation store {kw.get('val', data.VAL)} is smaller than the patch ({patch})"
     args["cout"] = cout = grid[0][1].shape[0]  # one head per teacher store
     net = M.build(size, cout=cout).to(dev)
     opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=0.01)
@@ -67,6 +68,8 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     ck = out / "ckpt.pt"
     if resume and ck.exists():
         st = torch.load(ck, map_location=dev)
+        diff = {k: (st["args"].get(k), v) for k, v in args.items() if k not in ("steps",) and st["args"].get(k) != v}
+        assert not diff, f"resume with different arguments (saved, now): {diff}"
         net.load_state_dict(st["model"]), opt.load_state_dict(st["opt"])
         ema, step = {k: v.to(dev) for k, v in st["ema"].items()}, st["step"]
         for _ in range(step):
@@ -78,9 +81,10 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     dl = data.loader(patch, batch, workers, ct=kw.get("ct", data.CT), stores=kw.get("stores", data.TRAIN),
                      exclude=kw.get("val", data.VAL), seed=step, sym=cfg.get("sym", True), aug=cfg)
 
-    def save():
+    def save():  # atomic: an interrupted write never loses the last resumable state
         torch.save({"model": net.state_dict(), "ema": ema, "opt": opt.state_dict(),
-                    "step": step, "args": args}, ck)
+                    "step": step, "args": args}, ck.with_suffix(".tmp"))
+        ck.with_suffix(".tmp").replace(ck)
 
     def log(name, rec):
         with open(out / name, "a") as f:
