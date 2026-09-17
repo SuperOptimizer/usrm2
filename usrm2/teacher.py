@@ -65,7 +65,7 @@ def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=256, halo=32, tile=1536
     return out
 
 
-def boxes(out_dir, n=50, size=(384, 2048, 2048), seed=0, volume=data.CT, exclude=data.VAL, min_mean=30, **kw):
+def boxes(out_dir, n=50, size=(384, 2048, 2048), seed=0, volume=data.CT, exclude=data.VAL, min_mean=30, runner=None, **kw):
     """Run the teacher over `n` random non-air boxes spread over the scroll -> out_dir/box_Z_Y_X.zarr each.
     Air test uses level 2 of the volume (1/4 pitch); boxes touching the val box are skipped."""
     from pathlib import Path
@@ -83,6 +83,6 @@ def boxes(out_dir, n=50, size=(384, 2048, 2048), seed=0, volume=data.CT, exclude
             continue
         out = f"{out_dir}/box_{o[0]}_{o[1]}_{o[2]}.zarr"
         if not Path(out).exists():
-            run(out, *o, *size, volume=volume, **kw)
+            (runner or run)(out, *o, *size, volume=volume, **kw)
         done += 1
         print(f"box {done}/{n} {out}", flush=True)
