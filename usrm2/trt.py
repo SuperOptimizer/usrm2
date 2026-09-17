@@ -21,9 +21,11 @@ def plan(name, window, build_if_missing=True):
     return None
 
 
-def build(onnx_path, plan_path, window, batch=1, workspace_gb=8.0):
+def build(onnx_path, plan_path, window, batch=1, workspace_gb=8.0, level=None, no_timing=False):
     """Parse the (shape-agnostic) ONNX graph with its I/O pinned to [batch,C,window^3] and build a fp16 engine
-    (ported from tsm.trt.build_engine; strongly typed, so the precision is the graph's own)."""
+    (ported from tsm.trt.build_engine; strongly typed, so the precision is the graph's own).
+    level: builder optimization level (0 = pick tactics without timing them, for GPUs whose virtualization
+    breaks the autotuner's pinned memory); no_timing also drops the cuBLAS/cuDNN tactic sources."""
     import onnx
     import tensorrt as trt
     m = onnx.load(onnx_path, load_external_data=True)
@@ -40,6 +42,10 @@ def build(onnx_path, plan_path, window, batch=1, workspace_gb=8.0):
     assert parser.parse(m.SerializeToString()), "; ".join(str(parser.get_error(i)) for i in range(parser.num_errors))
     cfg = b.create_builder_config()
     cfg.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(workspace_gb * (1 << 30)))
+    if level is not None:
+        cfg.builder_optimization_level = int(level)
+    if no_timing:
+        cfg.set_tactic_sources(0)
     t = time.time()
     ser = b.build_serialized_network(net, cfg)
     assert ser is not None, f"TensorRT build failed for {onnx_path}"
