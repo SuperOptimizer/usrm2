@@ -50,7 +50,8 @@ def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=256, halo=32, tile=2048
     """Tiles over y/x so RAM stays bounded. Each tile is read with a `margin` (>= half a window: the teacher
     is poor within ~32 voxels of a window edge, and the crop boundary must be covered by an interior window)."""
     dev = torch.device(device or "cuda")
-    torch.backends.cudnn.benchmark = True  # one window shape all run long
+    import os
+    torch.backends.cudnn.benchmark = os.environ.get("USRM2_CUDNN_BENCH", "1") == "1"  # one window shape all run long; off = no workspace spikes
     if backend == "trt":  # tsm's fp16 engine for this GPU (usrm2/trt.py)
         from usrm2 import trt
         net = trt.Engine(trt.plan("recto", window), dev)
