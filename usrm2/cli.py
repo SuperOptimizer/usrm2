@@ -94,6 +94,8 @@ def main(argv=None):
     b.add_argument("--window", type=int, default=None, help="recto 256 / m7 192 by default; bigger = less halo overlap")
     b.add_argument("--batch", type=int, default=1, help="windows per forward (with --gpu-acc)")
     b.add_argument("--streams", type=int, default=1, help="concurrent CUDA streams (with --gpu-acc)")
+    b.add_argument("--procs", type=int, default=1, help="worker processes sharing the GPU (each takes every k-th box)")
+    b.add_argument("--shard", type=int, nargs=2, default=(0, 1), metavar=("I", "K"), help="(internal) this worker's share")
     a = ap.parse_args(argv)
     from usrm2 import data, model, predict as P, train as T
     if a.umbilicus:
@@ -131,11 +133,17 @@ def main(argv=None):
         E.run(b[:3], b[3:], ckpt=a.ckpt, store=a.store, teacher=a.teacher, tifxyz=a.tifxyz or E.TIFXYZ,
               volume=a.volume, window=a.window, halo=a.halo, device=a.device, png_path=a.png, tta=a.tta, luts=luts,
               head=a.head if a.head in P.HEADS else int(a.head))
+    elif a.cmd == "teacher-boxes" and a.procs > 1:  # k workers on one GPU: a virtualized GPU only fills up this way
+        import subprocess, sys
+        argv = [x for x in sys.argv[1:] if not x.startswith("--procs")]
+        argv = [x for i, x in enumerate(argv) if not (x == str(a.procs) and argv[i - 1] == "--procs")]
+        ps = [subprocess.Popen([sys.executable, "-m", "usrm2.cli"] + argv + ["--shard", str(i), str(a.procs)]) for i in range(a.procs)]
+        sys.exit(max(p.wait() for p in ps))
     elif a.cmd == "teacher-boxes":
         from usrm2 import teacher
         ex = data.VAL if a.exclude == "default" else (None if a.exclude == "none" else a.exclude)
         runner = __import__("usrm2.m7", fromlist=["run"]).run if a.model == "m7" else None
-        teacher.boxes(a.out_dir, n=a.n, size=tuple(a.size), seed=a.seed, volume=a.volume or data.CT, exclude=ex, tta=a.tta, runner=runner, backend=a.backend, **({"window": a.window} if a.window else {}),
+        teacher.boxes(a.out_dir, n=a.n, size=tuple(a.size), seed=a.seed, volume=a.volume or data.CT, exclude=ex, tta=a.tta, runner=runner, backend=a.backend, shard=tuple(a.shard), **({"window": a.window} if a.window else {}),
                       **({"gpu_acc": True, "batch": a.batch, "streams": a.streams} if a.gpu_acc and a.model == "recto" else {}))
     elif a.cmd == "teacher":
         from usrm2 import teacher

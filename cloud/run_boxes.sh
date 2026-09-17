@@ -5,11 +5,12 @@ S=$1; N=$2
 cd ~; . venv/bin/activate
 export VOLCOMP_LIB=$HOME/lib/libvolcomp.so PYTHONUNBUFFERED=1 USRM2_TRT=$HOME/trt
 B=${BACKEND:-torch}  # BACKEND=trt once ~/trt holds the ONNX graphs (engines build on first use)
+P=${PROCS:-3}  # worker processes on the GPU: a virtualized GPU only fills up with several processes (~13 GB each)
 V=https://dl.ash2txt.org/community-uploads/forrest/volcomp/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/0
 O=~/out; mkdir -p $O
 for attempt in 1 2 3 4 5 6; do  # a streaming error kills the process; finished boxes are skipped on the retry
   for d in $O/boxes$S/box_*.zarr; do [ -d "$d" ] && ! grep -q "$(basename $d)" $O/boxes$S.log 2>/dev/null && rm -rf "$d"; done
-  usrm2 teacher-boxes $O/boxes$S --n $N --seed $S --volume $V --exclude ~/eval.zarr --backend $B --gpu-acc >> $O/boxes$S.log 2>&1
+  usrm2 teacher-boxes $O/boxes$S --n $N --seed $S --volume $V --exclude ~/eval.zarr --backend $B --gpu-acc --procs $P >> $O/boxes$S.log 2>&1
   grep -q "^box $N/$N" $O/boxes$S.log && break
   echo "retry $attempt $(date)" >> $O/boxes$S.log; sleep 30
 done

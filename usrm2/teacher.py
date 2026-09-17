@@ -86,9 +86,12 @@ def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=256, halo=32, tile=2048
     return out
 
 
-def boxes(out_dir, n=50, size=(384, 2048, 2048), seed=0, volume=data.CT, exclude=data.VAL, min_mean=30, runner=None, **kw):
+def boxes(out_dir, n=50, size=(384, 2048, 2048), seed=0, volume=data.CT, exclude=data.VAL, min_mean=30, runner=None,
+          shard=(0, 1), **kw):
     """Run the teacher over `n` random non-air boxes spread over the scroll -> out_dir/box_Z_Y_X.zarr each.
-    Air test uses level 2 of the volume (1/4 pitch); boxes touching the val box are skipped."""
+    Air test uses level 2 of the volume (1/4 pitch); boxes touching the val box are skipped. shard=(i, k): this
+    process takes every k-th accepted box starting at i (the accepted sequence is deterministic in the seed, so k
+    processes on one GPU cover the set exactly once; see `usrm2 teacher-boxes --procs`)."""
     from pathlib import Path
     rng = np.random.default_rng(seed)
     ct, lo = data.open_zarr(volume), data.open_zarr(volume.rstrip("/").rsplit("/", 1)[0] + "/2")
@@ -108,7 +111,9 @@ def boxes(out_dir, n=50, size=(384, 2048, 2048), seed=0, volume=data.CT, exclude
             continue
         out = f"{out_dir}/box_{o[0]}_{o[1]}_{o[2]}.zarr"
         seen.add(tuple(o))
+        done += 1
+        if (done - 1) % shard[1] != shard[0]:
+            continue
         if not (Path(out).exists() and data.open_zarr(out).attrs.get("done")):  # absent or interrupted
             (runner or run)(out, *o, *size, volume=volume, **kw)
-        done += 1
         print(f"box {done}/{n} {out}", flush=True)

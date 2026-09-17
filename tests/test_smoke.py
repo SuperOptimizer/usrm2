@@ -79,3 +79,23 @@ def test_put_handles_both_store_layouts(tmp_path):
         P.put(a, u, 0, 4, 4)
         v = a[0] if a.ndim == 4 else a[:]
         assert v[:4, 4:, 4:].min() == 9 and v[:4, :4, :4].max() == 0
+
+
+def test_teacher_boxes_shards_partition_the_sequence(tmp_path, monkeypatch):
+    import numpy as np
+    from usrm2 import teacher, data
+    ct = np.full((512, 512, 512), 100, np.uint8)
+    class A:  # a stand-in volume with a level-2 twin
+        shape = ct.shape
+        def __getitem__(self, s): return ct[s]
+    lo = np.full((128, 128, 128), 100, np.uint8)
+    class L:
+        def __getitem__(self, s): return lo[s]
+    monkeypatch.setattr(data, "open_zarr", lambda p: L() if p.endswith("/2") else A())
+    got = {}
+    def runner(out, *a, **k):
+        got.setdefault(k["tag"], []).append(out)
+    for i in range(3):
+        teacher.boxes(str(tmp_path), n=7, size=(256, 256, 256), seed=1, volume="v/0", exclude=None, runner=runner, shard=(i, 3), tag=i)
+    allb = sum(got.values(), [])
+    assert len(allb) == 7 and len(set(allb)) == 7 and [len(got[i]) for i in range(3)] == [3, 2, 2]
