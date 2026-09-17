@@ -42,15 +42,20 @@ def lut_to(volume, ref=data.CT, n=30, seed=0):
 
 
 def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=256, halo=32, tile=2048, margin=128, ckpt=CKPT, device=None,
-        tta=0, luts=()):
+        tta=0, luts=(), backend="torch"):
     """tta: number of flips to average (0/1 = none, 8 = all). luts: extra intensity LUTs (uint8->float) whose
     predictions are averaged with the plain one (intensity TTA, e.g. lut_to(volume, other_scroll))."""
     """Tiles over y/x so RAM stays bounded. Each tile is read with a `margin` (>= half a window: the teacher
     is poor within ~32 voxels of a window edge, and the crop boundary must be covered by an interior window)."""
     dev = torch.device(device or "cuda")
     torch.backends.cudnn.benchmark = True  # one window shape all run long
-    net = load(ckpt, dev)
-    fn = lambda t: torch.softmax(net(t)["surface"].float(), 1)[0, 1]
+    if backend == "trt":  # tsm's fp16 engine for this GPU (usrm2/trt.py)
+        from usrm2 import trt
+        net = trt.Engine(trt.plan("recto", window), dev)
+        fn = lambda t: torch.softmax(net(t), 1)[0, 1]
+    else:
+        net = load(ckpt, dev)
+        fn = lambda t: torch.softmax(net(t)["surface"].float(), 1)[0, 1]
     if tta > 1:
         fn = flips(fn, tta)
     preps = [None] + [(lambda c, _, l=l: data.zscore(l[c])[None]) for l in luts]
@@ -71,7 +76,7 @@ def boxes(out_dir, n=50, size=(384, 2048, 2048), seed=0, volume=data.CT, exclude
     Air test uses level 2 of the volume (1/4 pitch); boxes touching the val box are skipped."""
     from pathlib import Path
     rng = np.random.default_rng(seed)
-    ct, lo = data.open_zarr(volume), data.open_zarr(volume.replace("/0", "/2"))
+    ct, lo = data.open_zarr(volume), data.open_zarr(volume.rstrip("/").rsplit("/", 1)[0] + "/2")
     ex = data.box(data.open_zarr(exclude)) if exclude else None
     size, shape, done = np.array(size), np.array(ct.shape), 0
     Path(out_dir).mkdir(parents=True, exist_ok=True)

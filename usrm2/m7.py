@@ -29,12 +29,16 @@ def load(ckpt=CKPT, dev="cuda"):
     return net.to(dev).eval()
 
 
-def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=192, halo=32, margin=64, ckpt=CKPT, device=None, tta=0, level=LEVEL):
+def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=192, halo=32, margin=64, ckpt=CKPT, device=None, tta=0, level=LEVEL,
+        backend="torch"):
     """margin: level-`level` voxels of CT context read around the box (boxes are thin at 1/4 pitch)."""
     dev = torch.device(device or "cuda")
-    net = load(ckpt, dev)
+    net = load(ckpt, dev if backend == "torch" else "cpu")
     mean, std, lo, hi = net.norm
     prep = lambda c, _: ((np.clip(c.astype(np.float32), lo, hi) - mean) / std)[None]
+    if backend == "trt":
+        from usrm2 import trt
+        net = trt.Engine(trt.plan("m7", window), dev)
     fn = lambda t: torch.softmax(net(t).float(), 1)[0, 1]
     if tta > 1:
         fn = flips(fn, tta)

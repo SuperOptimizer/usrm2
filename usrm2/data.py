@@ -16,13 +16,26 @@ UMBILICUS = "/vesuvius/usrm/umbilicus/PHercParis4/umbilicus-full-resolution.json
 MARGIN = 16  # sliding-window predictions are worse at the teacher box edges
 
 
+LOCAL_VOLUMES = "/vesuvius/usrm/volcomp"  # mirror of dl.ash2txt.org/community-uploads/forrest/volcomp/<scroll>/volumes/
+
+
+def local(path):
+    """A streamed volume URL -> its local mirror when present (stores made in the cloud name the URL)."""
+    import os
+    if "://" in path and "/volcomp/" in path:
+        scroll, _, rest = path.split("/volcomp/", 1)[1].partition("/volumes/")
+        cand = f"{LOCAL_VOLUMES}/{scroll}/{rest}"
+        return cand if os.path.exists(cand) else path
+    return path
+
+
 def open_zarr(path):
     import zarr
     try:
         import volcomp_zarr  # noqa: F401  (registers the "volcomp" codec)
     except Exception:
         pass
-    return zarr.open(path, mode="r")
+    return zarr.open(local(str(path)), mode="r")
 
 
 def box(arr):
