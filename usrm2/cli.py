@@ -135,8 +135,12 @@ def main(argv=None):
               head=a.head if a.head in P.HEADS else int(a.head))
     elif a.cmd == "teacher-boxes" and a.procs > 1:  # k workers on one GPU: a virtualized GPU only fills up this way
         import subprocess, sys
-        argv = [x for x in sys.argv[1:] if not x.startswith("--procs")]
-        argv = [x for i, x in enumerate(argv) if not (x == str(a.procs) and argv[i - 1] == "--procs")]
+        argv, skip = [], False
+        for x in sys.argv[1:]:  # drop "--procs K" / "--procs=K"
+            if skip or x.startswith("--procs"):
+                skip = (x == "--procs")
+                continue
+            argv.append(x)
         ps = [subprocess.Popen([sys.executable, "-m", "usrm2.cli"] + argv + ["--shard", str(i), str(a.procs)]) for i in range(a.procs)]
         sys.exit(max(p.wait() for p in ps))
     elif a.cmd == "teacher-boxes":

@@ -99,3 +99,21 @@ def test_teacher_boxes_shards_partition_the_sequence(tmp_path, monkeypatch):
         teacher.boxes(str(tmp_path), n=7, size=(256, 256, 256), seed=1, volume="v/0", exclude=None, runner=runner, shard=(i, 3), tag=i)
     allb = sum(got.values(), [])
     assert len(allb) == 7 and len(set(allb)) == 7 and [len(got[i]) for i in range(3)] == [3, 2, 2]
+
+
+def test_procs_argv_strip(monkeypatch):
+    import sys
+    from usrm2 import cli
+    calls = []
+    class P:
+        def __init__(self, args): calls.append(args)
+        def wait(self): return 0
+    monkeypatch.setattr(cli, "subprocess", type("S", (), {"Popen": staticmethod(lambda args: P(args))})) if hasattr(cli, "subprocess") else None
+    import subprocess
+    monkeypatch.setattr(subprocess, "Popen", lambda args: P(args))
+    monkeypatch.setattr(sys, "argv", ["usrm2", "teacher-boxes", "/tmp/o", "--n", "4", "--procs", "3", "--gpu-acc"])
+    try:
+        cli.main()
+    except SystemExit:
+        pass
+    assert len(calls) == 3 and all("--procs" not in c and "3" not in c[:-2] and c[-3:-2] == ["--shard"] for c in calls)
