@@ -47,6 +47,8 @@ def main(argv=None):
     p.add_argument("--halo", type=int, default=16)
     p.add_argument("--plain", action="store_true", help="plain zarr (1,Z,Y,X) instead of volcomp")
     p.add_argument("--ome", action="store_true", help="zarr v2 OME group at full volume shape (tracer drop-in)")
+    p.add_argument("--tta", type=int, default=0, help="average over this many axis flips (8 = all)")
+    p.add_argument("--lut-to", nargs="*", default=(), metavar="REF", help="also average with the input histogram-matched to REF volumes")
     s = sub.add_parser("evalsurf", help="score a checkpoint or store against the published surfaces")
     s.add_argument("--box", type=int, nargs=6, default=None, metavar=("Z0", "Y0", "X0", "Z", "Y", "X"))
     s.add_argument("--ckpt")
@@ -56,6 +58,8 @@ def main(argv=None):
     s.add_argument("--volume", default=None)
     s.add_argument("--png", default=None)
     s.add_argument("--window", type=int, default=128)
+    s.add_argument("--tta", type=int, default=0)
+    s.add_argument("--lut-to", nargs="*", default=(), metavar="REF")
     s.add_argument("--halo", type=int, default=16)
     s.add_argument("--device", default=None)
     t = sub.add_parser("teacher", help="run the upstream teacher over a box")
@@ -102,8 +106,10 @@ def main(argv=None):
         from usrm2 import evalsurf as E
         assert a.ckpt or a.store, "need --ckpt or --store"
         b = a.box or (*E.VAL_BOX[0], *E.VAL_BOX[1])
+        from usrm2 import teacher
+        luts = [teacher.lut_to(a.volume or data.CT, r) for r in a.lut_to]
         E.run(b[:3], b[3:], ckpt=a.ckpt, store=a.store, teacher=a.teacher, tifxyz=a.tifxyz or E.TIFXYZ,
-              volume=a.volume, window=a.window, halo=a.halo, device=a.device, png_path=a.png)
+              volume=a.volume, window=a.window, halo=a.halo, device=a.device, png_path=a.png, tta=a.tta, luts=luts)
     elif a.cmd == "teacher-boxes":
         from usrm2 import teacher
         ex = data.VAL if a.exclude == "default" else (None if a.exclude == "none" else a.exclude)
@@ -113,8 +119,10 @@ def main(argv=None):
         vol = a.volume or data.CT
         teacher.run(a.out, *a.origin, *a.size, volume=vol, tta=a.tta, luts=[teacher.lut_to(vol, r) for r in a.lut_to])
     else:
-        P.predict(a.ckpt, a.volume or data.CT, *a.origin, *a.size, a.out,
-                  window=a.window, halo=a.halo, volcomp=not a.plain, ome=a.ome)
+        from usrm2 import teacher
+        vol = a.volume or data.CT
+        P.predict(a.ckpt, vol, *a.origin, *a.size, a.out, window=a.window, halo=a.halo, volcomp=not a.plain, ome=a.ome,
+                  tta=a.tta, luts=[teacher.lut_to(vol, r) for r in a.lut_to])
 
 
 if __name__ == "__main__":

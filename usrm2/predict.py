@@ -101,8 +101,24 @@ def write_ome(path, prob_u8, origin, levels=3, full_shape=None, meta=None):
     return path
 
 
-def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None):
-    """Sliding-window recto probability (float32) over a box; returns (prob, checkpoint state)."""
+def flips_vec(fn, n=8):
+    """Flip TTA for the student: flipping spatial axis d also negates radial component d (channel 1+d)."""
+    fl = [(), (0,), (1,), (2,), (0, 1), (0, 2), (1, 2), (0, 1, 2)][:n]
+
+    def go(t):
+        out = 0
+        for f in fl:
+            x = torch.flip(t, [2 + d for d in f]).clone()
+            for d in f:
+                x[:, 1 + d] = -x[:, 1 + d]
+            out = out + torch.flip(fn(x), list(f))
+        return out / len(fl)
+    return go
+
+
+def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, tta=0, luts=()):
+    """Sliding-window recto probability (float32) over a box; returns (prob, checkpoint state).
+    tta: number of axis flips to average; luts: intensity LUTs (uint8->float) whose predictions are averaged in."""
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     st = torch.load(ckpt, map_location=dev)
     net = M.build(st["args"]["size"], verbose=False).to(dev)
@@ -110,12 +126,16 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None):
     net.eval()
     roi, ax = data.open_zarr(volume)[z0:z0 + Z, y0:y0 + Y, x0:x0 + X], data.axis()
     r = 0.0 if st["args"].get("no_radial") else 1.0  # training zeroed the radial channels
-    prep = lambda c, o: data.inputs(c, data.radial(ax, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape) * r)
-    return slide(lambda t: torch.sigmoid(net(t))[0, 0], roi, window, halo, dev, prep), st
+    rad = lambda c, o: data.radial(ax, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape) * r
+    preps = [lambda c, o: data.inputs(c, rad(c, o))] + [(lambda c, o, l=l: data.inputs(l[c], rad(c, o))) for l in luts]
+    fn = lambda t: torch.sigmoid(net(t))[0, 0]
+    if tta > 1:
+        fn = flips_vec(fn, tta)
+    return sum(slide(fn, roi, window, halo, dev, pr) for pr in preps) / len(preps), st
 
 
-def predict(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=None, volcomp=True, ome=False):
-    prob, st = probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=window, halo=halo, device=device)
+def predict(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=None, volcomp=True, ome=False, tta=0, luts=()):
+    prob, st = probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=window, halo=halo, device=device, tta=tta, luts=luts)
     if ome:
         write_ome(out, u8(prob), (z0, y0, x0), meta={"checkpoint": str(ckpt), "step": int(st.get("step", 0))})
     else:
