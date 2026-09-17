@@ -16,6 +16,7 @@ def main(argv=None):
     t.add_argument("--workers", type=int, default=4)
     t.add_argument("--eval-every", type=int, default=500)
     t.add_argument("--val-patches", type=int, default=32)
+    t.add_argument("--accum", type=int, default=1, help="gradient accumulation: micro-batches per optimizer step")
     t.add_argument("--resume", action="store_true")
     t.add_argument("--stores", nargs="+", default=None, help="teacher stores to train on (default: data.TRAIN); "
                    "'a.zarr,a_m7.zarr' = several teachers over one box, one head each")
@@ -115,7 +116,7 @@ def main(argv=None):
     if a.umbilicus:
         data.UMBILICUS = a.umbilicus
     if a.cmd == "train":
-        T.train(a.out_dir, size=a.size, steps=a.steps, patch=a.patch, batch=a.batch, lr=a.lr,
+        T.train(a.out_dir, accum=a.accum, size=a.size, steps=a.steps, patch=a.patch, batch=a.batch, lr=a.lr,
                 workers=a.workers, eval_every=a.eval_every, val_patches=a.val_patches, resume=a.resume,
                 aug=a.aug, no_radial=a.no_radial,
                 **{k: v for k, v in dict(stores=a.stores, val=a.val).items() if v})

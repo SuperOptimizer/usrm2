@@ -48,13 +48,14 @@ def evaluate(net, grid, dev):
 
 
 def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=4, warmup=200,
-          eval_every=500, val_patches=32, resume=False, device=None, aug="geo", no_radial=False, **kw):
+          eval_every=500, val_patches=32, resume=False, device=None, aug="geo", no_radial=False, accum=1, **kw):
+    """accum: gradient accumulation (micro-batches per optimizer step), for big models on small cards."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     cfg = dict(A.get(aug), **({"norad": True} if no_radial else {}))
     no_radial = bool(cfg.get("norad"))
     args = dict(size=size, steps=steps, patch=patch, batch=batch, lr=lr, aug=aug, aug_cfg=cfg,
-                no_radial=no_radial, **kw)
+                no_radial=no_radial, accum=accum, **kw)
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     grid = data.val_grid(patch=patch, ct=kw.get("ct", data.CT), store=kw.get("val", data.VAL), limit=val_patches)
     assert grid, f"validation store {kw.get('val', data.VAL)} is smaller than the patch ({patch})"
@@ -92,7 +93,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         print(name, rec, flush=True)
 
     log("train.jsonl", {"step": step, "aug": aug, "cfg": cfg, "size": size, "patch": patch, "batch": batch})
-    t0 = time.time()
+    t0, micro = time.time(), 0
     for ct, tg in dl:
         if step >= steps:
             break
@@ -101,7 +102,11 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         with autocast(dev):
             bce, dice = losses(net(ct).float(), tg)
         loss = bce + dice
-        loss.backward()
+        (loss / accum).backward()
+        micro += 1
+        if micro < accum:
+            continue
+        micro = 0
         torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
         opt.step(), opt.zero_grad(set_to_none=True), sched.step()
         ema_update(ema, net)
@@ -109,7 +114,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         if step % 20 == 0:
             dt = time.time() - t0
             log("train.jsonl", {"step": step, "loss": loss.item(), "bce": bce.item(), "dice": dice.item(),
-                                "lr": sched.get_last_lr()[0], "vox_s": round(20 * batch * patch ** 3 / dt),
+                                "lr": sched.get_last_lr()[0], "vox_s": round(20 * accum * batch * patch ** 3 / dt),
                                 "vram_MiB": round(torch.cuda.max_memory_allocated() / 2 ** 20) if dev.type == "cuda" else 0})
             t0 = time.time()
         if step % eval_every == 0 or step == steps:
