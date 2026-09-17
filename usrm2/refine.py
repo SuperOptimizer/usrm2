@@ -95,7 +95,7 @@ def ray_neighbours(q, n, others, R, lateral=3.0):
     return below, above
 
 
-def upsample(g, f, order=3):
+def upsample(g, f, order=1):
     """A denser grid: (H,W,3) -> ((H-1)f+1, (W-1)f+1, 3) by spline interpolation of each coordinate (holes filled
     for the interpolation, then re-masked: a new cell is a hole if any of the 4 old cells around it was one).
     Published tifxyz grids are 1/20 voxel pitch (meta scale 0.05); f=4..5 gives a 4-5 voxel pitch."""
