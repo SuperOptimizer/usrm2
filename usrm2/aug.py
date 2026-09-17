@@ -277,6 +277,32 @@ def _thick(c, k):  # anisotropic low resolution along ONE random axis (thicker s
     return F.interpolate(F.interpolate(c, size=T, mode="nearest"), size=S, mode="trilinear", align_corners=False)
 
 
+def _pool(c, k):  # a coarser voxel grid, by a pooling op: avg/gauss = detector integration (a real coarser
+    # pitch), max/min = fat/thin sheets (a morphological close/open), median = a filtered reconstruction,
+    # stride = decimation without a prefilter (aliasing). Kernel integer, optionally anisotropic; the
+    # way back up is nearest (blocky) or trilinear (smooth).
+    op = k["ops"][int(torch.randint(len(k["ops"]), (1,)))]
+    r = int(torch.randint(k["k_lo"], k["k_hi"] + 1, (1,)))
+    ks = [r, r, r]
+    if torch.rand(1) < k["aniso"]:
+        ks[int(torch.randint(3, (1,)))] = 1
+    S, x = c.shape[2:], c[:, :, :c.shape[2] // ks[0] * ks[0], :c.shape[3] // ks[1] * ks[1], :c.shape[4] // ks[2] * ks[2]]
+    if op == "avg":
+        d = F.avg_pool3d(x, ks, ks)
+    elif op == "max":
+        d = F.max_pool3d(x, ks, ks)
+    elif op == "min":
+        d = -F.max_pool3d(-x, ks, ks)
+    elif op == "gauss":
+        d = _blur1(x, tuple(0.5 * (q - 1) for q in ks))[:, :, ::ks[0], ::ks[1], ::ks[2]]
+    elif op == "median":
+        d = x.unfold(2, ks[0], ks[0]).unfold(3, ks[1], ks[1]).unfold(4, ks[2], ks[2]).flatten(5).median(-1).values
+    else:  # stride
+        d = x[:, :, ::ks[0], ::ks[1], ::ks[2]]
+    up = "nearest" if torch.rand(1) < k["nearest"] else "trilinear"
+    return F.interpolate(d, size=S, mode=up, **({} if up == "nearest" else {"align_corners": False}))
+
+
 def _zjit(c, k):  # the z-score itself is uncalibrated: jitter its scale and offset (speculative)
     return c * _p(c, k["s_lo"], k["s_hi"]) + _p(c, -k["b"], k["b"])
 
@@ -352,7 +378,7 @@ def _cor(x, k, m):
     return torch.cat([c * (1 - a) + gh * a, d], 1)
 
 
-INTENS = [("bias", _bias), ("lowres", _lowres), ("thick", _thick), ("blur", _blur),
+INTENS = [("bias", _bias), ("lowres", _lowres), ("thick", _thick), ("pool", _pool), ("blur", _blur),
           ("aniso_blur", _aniso_blur), ("haze", _haze), ("sharpen", _sharpen), ("unsharp", _unsharp),
           ("class_contrast", _class_contrast), ("gamma", _gamma), ("contrast", _contrast),
           ("bright", _bright), ("noise", _noise), ("mulnoise", _mulnoise), ("spectral_noise", _spectral),
@@ -401,6 +427,8 @@ SCAN = {"window": {"p": 0.5, "lo_lo": -12.0, "lo_hi": 12.0, "hi_lo": 200.0, "hi_
         "stripe": {"p": 0.05, "a_lo": 0.01, "a_hi": 0.05, "w_lo": 1, "w_hi": 3}}
 TONE = {"tone": {"p": 0.3, "knots": 4, "max": 0.7}}
 THICK = {"thick": {"p": 0.3, "lo": 1.0, "hi": 4.0}, "lowres": {"p": 0.25, "lo": 1.0, "hi": 4.0}}
+POOL_OPS = ["avg", "max", "min", "median", "gauss", "stride"]
+POOL = {"pool": {"p": 0.3, "ops": POOL_OPS, "k_lo": 2, "k_hi": 4, "aniso": 0.3, "nearest": 0.5}}
 VOLCOMP = {"volcomp": {"p": 0.3, "q": [4.0, 12.0]}}  # the real codec residual (worker, CPU)
 BLANK = {"blank": {"p": 0.03}}  # an all-air patch with target 0 (data.Patches)
 ZJIT = {"zjit": {"p": 0.3, "s_lo": 0.9, "s_hi": 1.1, "b": 0.1}}
@@ -431,6 +459,8 @@ PRESETS = {
     "scan": _pre(SCAN),
     "tone": _pre(TONE),
     "thick": _pre(THICK),
+    "pool": _pre(POOL),
+    **{f"pool_{o}": _pre({"pool": {**POOL["pool"], "ops": [o]}}) for o in POOL_OPS},
     "volcomp": _pre(VOLCOMP),
     "blank": _pre(BLANK),
     "zjit": _pre(ZJIT),

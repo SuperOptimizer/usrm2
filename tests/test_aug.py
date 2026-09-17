@@ -142,3 +142,23 @@ def test_cor_ghost_is_radial_and_zero_at_the_centre():
     c = p // 2
     assert float(d[0, c, c, c]) < 1e-3 < float(d[0, c, c, 2])  # zero on the axis, ghosting off it
     assert torch.equal(y[:, 1:], x[:, 1:])
+
+
+@pytest.mark.parametrize("op", A.POOL_OPS)
+def test_pool_ops_coarsen_and_keep_shape(op):
+    torch.manual_seed(0)
+    x = torch.randn(2, 1, 24, 24, 24)
+    k = {**A.POOL["pool"], "ops": [op], "k_lo": 3, "k_hi": 3, "aniso": 0.0, "nearest": 1.0}
+    y = A._pool(x, k)
+    assert y.shape == x.shape and torch.isfinite(y).all()
+    assert (y[:, :, :3, :3, :3] == y[:, :, :1, :1, :1]).all()  # nearest-up: one value per 3^3 block
+    if op == "max":
+        assert (y[:, :, :3, :3, :3] >= x[:, :, :3, :3, :3]).all()
+    if op == "min":
+        assert (y[:, :, :3, :3, :3] <= x[:, :, :3, :3, :3]).all()
+    if op == "avg":
+        assert torch.allclose(y[:, 0, 0, 0, 0], x[:, 0, :3, :3, :3].mean((1, 2, 3)), atol=1e-5)
+    if op == "median":
+        assert torch.allclose(y[:, 0, 0, 0, 0], x[:, 0, :3, :3, :3].flatten(1).median(1).values)
+    if op == "stride":
+        assert (y[:, 0, 0, 0, 0] == x[:, 0, 0, 0, 0]).all()
