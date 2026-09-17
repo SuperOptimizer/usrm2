@@ -44,32 +44,52 @@ def slide(fn, roi, window, halo, dev, prep=None):
     return np.where((wsum > 0) & (roi > 0), acc / np.maximum(wsum, 1e-6), 0)  # masked CT (0) -> no surface
 
 
-def slide_gpu(fn, roi, window, halo, dev, prep, batch=1):
-    """slide() with the ROI, the normalization and the (fp16) accumulators all on the GPU and `batch` windows
-    per forward: no per-window CPU work, for cards with room (a 384x2048x2048 box needs ~8 GB + the model +
-    batch x the activations). prep(ct_window uint8 tensor, (z,y,x)) -> (C,w,w,w) float tensor; masked CT (0) ->
-    no surface, as in slide()."""
+def slide_gpu(fn, roi, window, halo, dev, prep, batch=1, streams=1):
+    """slide() with the ROI, the normalization and the (fp16) accumulators all on the GPU, `batch` windows per
+    forward and `streams` CUDA streams (one thread + its own accumulators each, summed at the end) so the card
+    never idles between kernel launches. A 384x2048x2048 box needs ~8 GB per stream + the model + batch x the
+    activations. prep(ct_window uint8 tensor, (z,y,x)) -> (C,w,w,w) float tensor; masked CT (0) -> no surface."""
+    import threading
     if any(s < window for s in roi.shape):
         S = roi.shape
         roi = np.pad(roi, [(0, max(window - s, 0)) for s in S])
-        return slide_gpu(fn, roi, window, halo, dev, prep, batch)[:S[0], :S[1], :S[2]]
+        return slide_gpu(fn, roi, window, halo, dev, prep, batch, streams)[:S[0], :S[1], :S[2]]
     R = torch.from_numpy(np.ascontiguousarray(roi)).to(dev)
-    acc = torch.zeros(R.shape, dtype=torch.float16, device=dev)
-    wsum = torch.zeros_like(acc)
     g = torch.from_numpy(gauss(window)).to(dev).half()
     Z, Y, X = R.shape
     stride = window - 2 * halo
+    todo = [(z, y, x) for z in starts(Z, window, stride) for y in starts(Y, window, stride) for x in starts(X, window, stride)
+            if R[z:z + window, y:y + window, x:x + window].any()]
+    accs, wsums = [], []
+
+    def work(k):
+        acc, wsum = torch.zeros(R.shape, dtype=torch.float16, device=dev), torch.zeros(R.shape, dtype=torch.float16, device=dev)
+        accs.append(acc), wsums.append(wsum)
+        s = torch.cuda.Stream(dev) if dev.type == "cuda" else None
+        with torch.no_grad(), (torch.cuda.stream(s) if s else contextlib.nullcontext()):
+            mine = todo[k::streams]
+            for i in range(0, len(mine), batch):
+                offs = mine[i:i + batch]
+                t = torch.stack([prep(R[z:z + window, y:y + window, x:x + window], o) for o in offs for z, y, x in [o]])
+                with autocast(dev):
+                    p = fn(t.contiguous(memory_format=torch.channels_last_3d))
+                for (z, y, x), pj in zip(offs, p):
+                    acc[z:z + window, y:y + window, x:x + window] += (pj.float() * g.float()).half()
+                    wsum[z:z + window, y:y + window, x:x + window] += g
+            if s:
+                s.synchronize()
+    import contextlib
+    if streams > 1:
+        ths = [threading.Thread(target=work, args=(k,)) for k in range(streams)]
+        [t.start() for t in ths], [t.join() for t in ths]
+    else:
+        work(0)
+    acc, wsum = accs[0], wsums[0]
+    for a, w in zip(accs[1:], wsums[1:]):
+        acc += a
+        wsum += w
+    del accs, wsums
     with torch.no_grad():
-        todo = [(z, y, x) for z in starts(Z, window, stride) for y in starts(Y, window, stride) for x in starts(X, window, stride)
-                if R[z:z + window, y:y + window, x:x + window].any()]
-        for i in range(0, len(todo), batch):
-            offs = todo[i:i + batch]
-            t = torch.stack([prep(R[z:z + window, y:y + window, x:x + window], o) for o in offs for z, y, x in [o]])
-            with autocast(dev):
-                p = fn(t.contiguous(memory_format=torch.channels_last_3d))
-            for (z, y, x), pj in zip(offs, p):
-                acc[z:z + window, y:y + window, x:x + window] += (pj.float() * g.float()).half()
-                wsum[z:z + window, y:y + window, x:x + window] += g
         out = np.empty(R.shape, np.float32)
         for z in range(0, Z, 64):  # a slab at a time keeps the float32 temporaries small
             a, w, r = acc[z:z + 64].float(), wsum[z:z + 64].float(), R[z:z + 64]

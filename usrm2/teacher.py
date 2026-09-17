@@ -44,7 +44,7 @@ def lut_to(volume, ref=data.CT, n=30, seed=0):
 
 
 def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=256, halo=32, tile=2048, margin=128, ckpt=CKPT, device=None,
-        tta=0, luts=(), backend="torch", gpu_acc=False, batch=1):
+        tta=0, luts=(), backend="torch", gpu_acc=False, batch=1, streams=1):
     """tta: number of flips to average (0/1 = none, 8 = all). luts: extra intensity LUTs (uint8->float) whose
     predictions are averaged with the plain one (intensity TTA, e.g. lut_to(volume, other_scroll))."""
     """Tiles over y/x so RAM stays bounded. Each tile is read with a `margin` (>= half a window: the teacher
@@ -72,7 +72,7 @@ def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=256, halo=32, tile=2048
             t0 = time.time()
             roi = ct[z0:z0 + Z, y0 + ya:y0 + yb, x0 + xa:x0 + xb]
             t1 = time.time()
-            sl = (lambda *a: slide_gpu(*a, batch=batch)) if gpu_acc else slide
+            sl = (lambda *a: slide_gpu(*a, batch=batch, streams=streams)) if gpu_acc else slide
             prob = sum(sl(fn, roi, window, halo, dev, pr) for pr in preps) / len(preps) if roi.any() else np.zeros(roi.shape, np.float32)
             prob = prob[:, y - ya:y - ya + tile, x - xa:x - xa + tile]
             t2 = time.time()

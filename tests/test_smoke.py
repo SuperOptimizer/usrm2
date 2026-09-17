@@ -48,8 +48,8 @@ def test_slide_gpu_matches_slide():
     roi[:, :8] = 0  # masked strip
     fn = lambda t: torch.sigmoid(t[:, 0] * 0.1)
     a = P.slide(fn, roi, 32, 4, torch.device("cpu"))
-    for batch in (1, 3):
-        b = P.slide_gpu(fn, roi, 32, 4, torch.device("cpu"), lambda c, o: P.zscore_t(c)[None], batch=batch)
+    for batch, streams in ((1, 1), (3, 1), (1, 2), (2, 3)):
+        b = P.slide_gpu(fn, roi, 32, 4, torch.device("cpu"), lambda c, o: P.zscore_t(c)[None], batch=batch, streams=streams)
         assert a.shape == b.shape and np.abs(a - b).max() < 2e-2 and np.abs(a - b).mean() < 1e-3 and (b[:, :8] == 0).all()  # fp16 accumulators
 
 
