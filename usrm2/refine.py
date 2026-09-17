@@ -272,7 +272,9 @@ def run(surfaces, store, out_root, eval_store=None, far=12, sigma=2.0, iters=3, 
         note = {"store": str(store), "far": far, "sigma": sigma, "iters": iters, "thr": thr, "joint_with": len(surfaces), "up": up}
         if up > 1:
             note["crop_rc"] = list(crops[i])  # the dense grid covers this window of the published grid (x up)
-        outs.append(write_tifxyz(d, os.path.join(out_root, os.path.basename(d.rstrip("/"))), g, note, up=up))
+        name = os.path.basename(d.rstrip("/"))
+        write_tifxyz(d, os.path.join(out_root, name + ".before"), g0[i], {"unrefined_input": True, "up": up}, up=up)
+        outs.append(write_tifxyz(d, os.path.join(out_root, name), g, note, up=up))
     ev = eval_store or store
     if ev != store:
         b = data.open_zarr(ev)
@@ -292,31 +294,32 @@ def run(surfaces, store, out_root, eval_store=None, far=12, sigma=2.0, iters=3, 
     return outs
 
 
-def compare_png(path, ct, V, origin, before, after, crop=384, scale=2, slab=1.5):
-    """Before/after image for one surface: the CT z-slice with most surface points, the probability band faint
-    red, published points green, refined points magenta, cropped around the points and upscaled."""
+def compare_png(path, ct, V, origin, before, after, crop=320, scale=3, slab=2.5, dot=2):
+    """Before | after panels for one surface: the CT z-slice with most surface points, the probability band as a
+    red tint, published points (left, green) and refined points (right, magenta), cropped and upscaled."""
     from PIL import Image
     o = np.asarray(origin, np.float32)
     pts = [g[np.isfinite(g).all(-1) & ((g >= o) & (g < o + np.array(V.shape))).all(-1)] - o for g in (before, after)]
     if not len(pts[0]):
         return None
     zi = int(np.bincount(np.clip(np.rint(pts[0][:, 0]).astype(int), 0, ct.shape[0] - 1)).argmax())
-    img = np.repeat(np.asarray(ct[zi], np.uint8)[..., None], 3, -1).astype(np.float32)
-    band = np.asarray(V[zi], np.float32)
-    img[..., 0] = np.clip(img[..., 0] + 160 * band, 0, 255)  # probability as a red tint
-    k = [np.abs(p[:, 0] - zi) <= slab for p in pts]
-    yx = [np.rint(p[m, 1:]).astype(int) for p, m in zip(pts, k)]
-    cy, cx = (yx[0].mean(0) if len(yx[0]) else np.array(img.shape[:2]) // 2).astype(int)
-    y0, x0 = max(cy - crop // 2, 0), max(cx - crop // 2, 0)
-    img = img[y0:y0 + crop, x0:x0 + crop]
-    img = np.repeat(np.repeat(img, scale, 0), scale, 1)
+    base = np.repeat(np.asarray(ct[zi], np.uint8)[..., None], 3, -1).astype(np.float32) * 0.85
+    base[..., 0] = np.clip(base[..., 0] + 140 * np.asarray(V[zi], np.float32), 0, 255)
+    yx = [np.rint(p[np.abs(p[:, 0] - zi) <= slab, 1:]).astype(int) for p in pts]
+    cy, cx = (yx[0].mean(0) if len(yx[0]) else np.array(base.shape[:2]) // 2).astype(int)
+    y0, x0 = int(max(cy - crop // 2, 0)), int(max(cx - crop // 2, 0))
+    panel = np.repeat(np.repeat(base[y0:y0 + crop, x0:x0 + crop], scale, 0), scale, 1)
+    panels = []
     for q, col in ((yx[0], (0, 255, 0)), (yx[1], (255, 0, 255))):
-        q = (q - (y0, x0)) * scale
+        img = panel.copy()
+        q = (q - (y0, x0)) * scale + scale // 2
         q = q[(q >= 0).all(1) & (q[:, 0] < img.shape[0]) & (q[:, 1] < img.shape[1])]
-        for dy in range(scale):
-            for dx in range(scale):
+        for dy in range(-dot, dot + 1):
+            for dx in range(-dot, dot + 1):
                 img[np.clip(q[:, 0] + dy, 0, img.shape[0] - 1), np.clip(q[:, 1] + dx, 0, img.shape[1] - 1)] = col
-    Image.fromarray(img.astype(np.uint8)).save(path)
+        panels.append(img)
+    sep = np.full((panel.shape[0], 6, 3), 255, np.float32)
+    Image.fromarray(np.concatenate([panels[0], sep, panels[1]], 1).astype(np.uint8)).save(path)
     return path
 
 
@@ -329,8 +332,12 @@ def compare(store, before_root, after_root, out_dir, volume=None):
     os.makedirs(out_dir, exist_ok=True)
     outs = []
     for name in sorted(os.listdir(after_root)):
-        b = next((d for d in (f"{before_root}/{name}", *[p for p in __import__("glob").glob(f"{before_root}/*/{name}")]) if os.path.isdir(d)), None)
-        if b is None or not os.path.exists(f"{after_root}/{name}/meta.json"):
+        if name.endswith(".before") or not os.path.exists(f"{after_root}/{name}/meta.json"):
+            continue
+        b = f"{after_root}/{name}.before"  # the refiner's own input crop; else the published surface
+        if not os.path.isdir(b):
+            b = next((d for d in (f"{before_root}/{name}", *[p for p in __import__("glob").glob(f"{before_root}/*/{name}")]) if os.path.isdir(d)), None)
+        if b is None:
             continue
         p = compare_png(f"{out_dir}/{name}.png", ct, V, o, E.read_surface(b), E.read_surface(f"{after_root}/{name}"))
         if p:
