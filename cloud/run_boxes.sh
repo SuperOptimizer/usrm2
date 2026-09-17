@@ -8,6 +8,7 @@ B=${BACKEND:-torch}  # BACKEND=trt once ~/trt holds the ONNX graphs (engines bui
 P=${PROCS:-2}  # worker processes on the GPU: a virtualized GPU only fills up with several processes (~13 GB each,
 SZ=${SIZE:-384 2048 2048}  # ~9 GB with SIZE="384 1024 1024" and USRM2_CUDNN_BENCH=0, which allows 4)
 export USRM2_CUDNN_BENCH=${USRM2_CUDNN_BENCH:-1}
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}  # less fragmentation -> 3 workers fit
 V=https://dl.ash2txt.org/community-uploads/forrest/volcomp/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/0
 O=~/out; mkdir -p $O
 for attempt in 1 2 3 4 5 6; do  # a streaming error kills the process; finished boxes are skipped on the retry
