@@ -132,7 +132,7 @@ class Patches(torch.utils.data.IterableDataset):
         self.boxes = [box(a) for a in self.arrs]
         self.w = np.array([np.prod(s) for _, s in self.boxes], np.float64)
         self.w /= self.w.sum()
-        ex = open_zarr(self.exclude) if self.exclude else None
+        ex = open_zarr(str(self.exclude).split(",")[0]) if self.exclude else None
         self.ex, self.ex_vol = (box(ex), ex.attrs.get("volume", self.ct_path)) if ex is not None else (None, None)
 
     def __iter__(self):
