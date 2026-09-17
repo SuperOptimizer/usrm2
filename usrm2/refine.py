@@ -95,6 +95,18 @@ def ray_neighbours(q, n, others, R, lateral=3.0):
     return below, above
 
 
+def crop_to_box(g, origin, size, margin=64, pad=8):
+    """The grid rows/cols whose points touch the box (+margin voxels), plus `pad` cells; (crop, (r0, c0))."""
+    o, s = np.asarray(origin, np.float32), np.asarray(size, np.float32)
+    k = np.isfinite(g).all(-1) & ((g >= o - margin) & (g < o + s + margin)).all(-1)
+    if not k.any():
+        return g[:0, :0], (0, 0)
+    rows, cols = np.where(k.any(1))[0], np.where(k.any(0))[0]
+    r0, r1 = max(rows.min() - pad, 0), min(rows.max() + pad + 1, g.shape[0])
+    c0, c1 = max(cols.min() - pad, 0), min(cols.max() + pad + 1, g.shape[1])
+    return g[r0:r1, c0:c1], (int(r0), int(c0))
+
+
 def upsample(g, f, order=1):
     """A denser grid: (H,W,3) -> ((H-1)f+1, (W-1)f+1, 3) by spline interpolation of each coordinate (holes filled
     for the interpolation, then re-masked: a new cell is a hole if any of the 4 old cells around it was one).
@@ -243,13 +255,24 @@ def run(surfaces, store, out_root, eval_store=None, far=12, sigma=2.0, iters=3, 
     V = np.asarray(a[(0,) + (slice(None),) * 3] if a.ndim == 4 else a[:], np.float32) / 255.0
     ct = data.open_zarr(volume or a.attrs.get("volume", data.CT))[o[0]:o[0] + s[0], o[1]:o[1] + s[1], o[2]:o[2] + s[2]]
     ax = data.axis(a.attrs.get("umbilicus", None))
-    g0 = [upsample(E.read_surface(d), up) for d in surfaces]
-    print(json.dumps({"box": [*o.tolist(), *s.tolist()], "surfaces": [os.path.basename(d.rstrip("/")) for d in surfaces], "up": up}))
+    g0, crops = [], []
+    for d in surfaces:  # a dense grid is only made for the part of the surface near the box
+        g = E.read_surface(d)
+        if up > 1:
+            g, rc = crop_to_box(g, o, s)
+            crops.append(rc)
+        g0.append(upsample(g, up))
+    print(json.dumps({"box": [*o.tolist(), *s.tolist()], "surfaces": [os.path.basename(d.rstrip("/")) for d in surfaces], "up": up,
+                      "crops": crops}))
     g1, stats = refine_many(g0, V, o, ax, far=far, sigma=sigma * up, iters=iters, thr=thr, ct=ct)
     for st in stats:
         print(json.dumps(st))
-    note = {"store": str(store), "far": far, "sigma": sigma, "iters": iters, "thr": thr, "joint_with": len(surfaces), "up": up}
-    outs = [write_tifxyz(d, os.path.join(out_root, os.path.basename(d.rstrip("/"))), g, note, up=up) for d, g in zip(surfaces, g1)]
+    outs = []
+    for i, (d, g) in enumerate(zip(surfaces, g1)):
+        note = {"store": str(store), "far": far, "sigma": sigma, "iters": iters, "thr": thr, "joint_with": len(surfaces), "up": up}
+        if up > 1:
+            note["crop_rc"] = list(crops[i])  # the dense grid covers this window of the published grid (x up)
+        outs.append(write_tifxyz(d, os.path.join(out_root, os.path.basename(d.rstrip("/"))), g, note, up=up))
     ev = eval_store or store
     if ev != store:
         b = data.open_zarr(ev)
