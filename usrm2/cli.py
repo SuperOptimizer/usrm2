@@ -63,6 +63,8 @@ def main(argv=None):
     t.add_argument("--origin", type=int, nargs=3, required=True, metavar=("Z0", "Y0", "X0"))
     t.add_argument("--size", type=int, nargs=3, required=True, metavar=("Z", "Y", "X"))
     t.add_argument("--volume", default=None)
+    t.add_argument("--tta", type=int, default=0, help="average over this many axis flips (8 = all)")
+    t.add_argument("--lut-to", nargs="*", default=(), metavar="REF", help="also average with the input histogram-matched to each REF volume")
     b = sub.add_parser("teacher-boxes", help="run the teacher over many random non-air boxes")
     b.add_argument("out_dir")
     b.add_argument("--n", type=int, default=50)
@@ -108,7 +110,8 @@ def main(argv=None):
         teacher.boxes(a.out_dir, n=a.n, size=tuple(a.size), seed=a.seed, volume=a.volume or data.CT, exclude=ex)
     elif a.cmd == "teacher":
         from usrm2 import teacher
-        teacher.run(a.out, *a.origin, *a.size, volume=a.volume or data.CT)
+        vol = a.volume or data.CT
+        teacher.run(a.out, *a.origin, *a.size, volume=vol, tta=a.tta, luts=[teacher.lut_to(vol, r) for r in a.lut_to])
     else:
         P.predict(a.ckpt, a.volume or data.CT, *a.origin, *a.size, a.out,
                   window=a.window, halo=a.halo, volcomp=not a.plain, ome=a.ome)

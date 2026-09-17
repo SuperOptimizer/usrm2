@@ -22,18 +22,43 @@ def load(ckpt=CKPT, dev="cuda"):
     return net.to(dev).eval()
 
 
-def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=256, halo=32, tile=1536, margin=128, ckpt=CKPT, device=None):
+def flips(fn, n=8):
+    """Test-time augmentation: average fn over the first n of the 8 axis flips (exact inverses)."""
+    fl = [(), (2,), (3,), (4,), (2, 3), (2, 4), (3, 4), (2, 3, 4)][:n]
+    return lambda t: sum(torch.flip(fn(torch.flip(t, f)), [d - 2 for d in f]) for f in fl) / len(fl)
+
+
+def lut_to(volume, ref=data.CT, n=30, seed=0):
+    """uint8 LUT that histogram-matches `volume` to `ref` (non-air voxels of n random 128^3 patches each)."""
+    def hist(v):
+        a, rng, h, k = data.open_zarr(v), np.random.default_rng(seed), np.zeros(256), 0
+        while k < n:
+            o = rng.integers(0, np.array(a.shape) - 128); c = a[o[0]:o[0] + 128, o[1]:o[1] + 128, o[2]:o[2] + 128]
+            if (c > 0).mean() >= 0.7 and c.mean() >= 30:
+                h += np.bincount(c[c > 0].ravel(), minlength=256); k += 1
+        return np.cumsum(h) / h.sum()
+    lut = np.interp(hist(volume), hist(ref), np.arange(256)).astype(np.float32); lut[0] = 0
+    return lut
+
+
+def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=256, halo=32, tile=1536, margin=128, ckpt=CKPT, device=None,
+        tta=0, luts=()):
+    """tta: number of flips to average (0/1 = none, 8 = all). luts: extra intensity LUTs (uint8->float) whose
+    predictions are averaged with the plain one (intensity TTA, e.g. lut_to(volume, other_scroll))."""
     """Tiles over y/x so RAM stays bounded. Each tile is read with a `margin` (>= half a window: the teacher
     is poor within ~32 voxels of a window edge, and the crop boundary must be covered by an interior window)."""
     dev = torch.device(device or "cuda")
     net = load(ckpt, dev)
     fn = lambda t: torch.softmax(net(t)["surface"].float(), 1)[0, 1]
+    if tta > 1:
+        fn = flips(fn, tta)
+    preps = [None] + [(lambda c, _, l=l: data.zscore(l[c])[None]) for l in luts]
     ct, arr = data.open_zarr(volume), out_array(out, (Z, Y, X), (z0, y0, x0), volume=volume)
     for y in range(0, Y, tile):
         for x in range(0, X, tile):
             ya, yb, xa, xb = max(y - margin, 0), min(y + tile + margin, Y), max(x - margin, 0), min(x + tile + margin, X)
             roi = ct[z0:z0 + Z, y0 + ya:y0 + yb, x0 + xa:x0 + xb]
-            prob = slide(fn, roi, window, halo, dev) if roi.any() else np.zeros(roi.shape, np.float32)
+            prob = sum(slide(fn, roi, window, halo, dev, pr) for pr in preps) / len(preps) if roi.any() else np.zeros(roi.shape, np.float32)
             prob = prob[:, y - ya:y - ya + tile, x - xa:x - xa + tile]
             arr[:, y:y + prob.shape[1], x:x + prob.shape[2]] = np.clip(np.rint(prob * 255), 0, 255).astype(np.uint8)
             print(f"tile y={y} x={x} done", flush=True)
