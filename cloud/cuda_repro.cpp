@@ -26,6 +26,7 @@ int main() {
     F(cuMemcpyHtoD_v2, CUdeviceptr, const void*, size_t)
     F(cuMemcpyDtoH_v2, void*, CUdeviceptr, size_t)
     F(cuMemFreeHost, void*)
+    F(cuDeviceGetAttribute, int*, int, CUdevice)
     auto cuGetErrorName = (CUresult(*)(CUresult, const char**))dlsym(lib, "cuGetErrorName");
     auto name = [&](CUresult r) { const char* s = "?"; if (cuGetErrorName) cuGetErrorName(r, &s); return s; };
 #define CHECK(call) do { CUresult r = (call); printf("%-70s -> %d (%s)\n", #call, r, name(r)); } while (0)
@@ -35,6 +36,16 @@ int main() {
     CHECK(cuDeviceGet(&dev, 0));
     CHECK(cuDevicePrimaryCtxRetain(&ctx, dev));
     CHECK(cuCtxSetCurrent(ctx));
+    // what the driver claims about mapped host memory (CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY = 19,
+    // CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING = 41, CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS = 88,
+    // CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED = 99)
+    int can_map = -1, uva = -1, pageable = -1, hostreg = -1;
+    CHECK(cuDeviceGetAttribute(&can_map, 19, dev));
+    CHECK(cuDeviceGetAttribute(&uva, 41, dev));
+    CHECK(cuDeviceGetAttribute(&pageable, 88, dev));
+    CHECK(cuDeviceGetAttribute(&hostreg, 99, dev));
+    printf("attributes: CAN_MAP_HOST_MEMORY=%d UNIFIED_ADDRESSING=%d PAGEABLE_MEMORY_ACCESS=%d HOST_REGISTER_SUPPORTED=%d\n",
+           can_map, uva, pageable, hostreg);
 
     const size_t n = 1 << 20;
     // 1. plain device memory + copies: the baseline everything else relies on
