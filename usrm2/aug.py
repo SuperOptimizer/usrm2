@@ -475,6 +475,8 @@ PRESETS = {
     "all2": _pre(SPATIAL, INTENSITY, CUTOUT, SCAN, TONE, THICK, VOLCOMP, BLANK,
                  HAZE, UNSHARP, QUANT, COR),
 }
+PRESETS["all3"] = _pre(SPATIAL, INTENSITY, CUTOUT, SCAN, TONE, THICK, POOL, VOLCOMP, BLANK, ZJIT, SHEETCOMP,
+                       HAZE, UNSHARP, QUANT, COR)  # everything, incl. pool and the corrected sheet compression
 PRESETS["p4"] = _pre({"lowres": INTENSITY["lowres"]}, BLANK, VOLCOMP)  # sweeps 1-3: the only presets that
 # helped Paris 4 recall (blank/volcomp 0.61 vs 0.57 baseline) plus the one that generalized (lowres)
 PRESETS["all2_light"] = {k: ({**v, "p": v["p"] / 2} if isinstance(v, dict) else v)

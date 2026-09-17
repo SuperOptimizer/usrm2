@@ -1,6 +1,8 @@
 """Distillation training: BCE + soft dice against the teacher's soft probabilities."""
 import json
 import math
+
+import numpy as np
 import time
 from pathlib import Path
 
@@ -45,6 +47,26 @@ def evaluate(net, grid, dev):
     net.train()
     m /= max(len(grid), 1)
     return {"bce": m[0].item(), "dice": m[1].item(), "mae": m[2].item()}
+
+
+def val_png(path, net, grid, dev):
+    """Middle z-slice of the first 4 val patches: CT (gray), each teacher target and each student head as a red
+    opacity overlay (no threshold), tiled patches x [CT, targets..., heads...]."""
+    from PIL import Image
+    rows = []
+    with torch.no_grad():
+        for x, t in grid[:4]:
+            with autocast(dev):
+                p = torch.sigmoid(net(x[None].to(dev).to(memory_format=torch.channels_last_3d)).float())[0].cpu()
+            z = x.shape[1] // 2
+            c = x[0, z].numpy()
+            c = (c - c.min()) / (c.max() - c.min() + 1e-6) * 255 * 0.9
+            tiles = [np.repeat(c[..., None], 3, -1)]
+            for a in list(t[:, z].numpy()) + list(p[:, z].numpy()):
+                al = np.clip(a, 0, 1)[..., None] * 0.85
+                tiles.append(np.repeat(c[..., None], 3, -1) * (1 - al) + np.array([255, 40, 40]) * al)
+            rows.append(np.concatenate(tiles, 1))
+    Image.fromarray(np.concatenate(rows, 0).astype(np.uint8)).save(path)
 
 
 def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=4, warmup=200,
@@ -120,6 +142,10 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         if step % eval_every == 0 or step == steps:
             evnet.load_state_dict(ema)
             log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev)})
+            try:
+                val_png(out / f"val_{step:06d}.png", evnet, grid, dev)
+            except Exception as e:  # a missing PIL must not stop training
+                print("val_png:", repr(e))
             save()
             t0 = time.time()
     save()
