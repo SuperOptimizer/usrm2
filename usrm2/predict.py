@@ -19,7 +19,7 @@ def starts(n, w, stride):
 
 
 def slide(fn, roi, window, halo, dev, prep=None):
-    """Gaussian-blended sliding window over a uint8 ROI. fn: normalized (1,C,w,w,w) tensor -> prob (w,w,w).
+    """Gaussian-blended sliding window over a uint8 ROI. fn: normalized (B,C,w,w,w) tensor -> prob (B,w,w,w).
     prep(ct_window, (z,y,x) window offset) -> (C,w,w,w) float input; default is z-scored CT alone."""
     prep = prep or (lambda c, o: data.zscore(c)[None])
     if any(s < window for s in roi.shape):  # thinner than a window: pad with air, crop the result
@@ -38,16 +38,21 @@ def slide(fn, roi, window, halo, dev, prep=None):
                         continue
                     t = torch.from_numpy(prep(c, (z, y, x)))[None].to(dev).to(memory_format=torch.channels_last_3d)
                     with autocast(dev):
-                        p = fn(t).float().cpu().numpy()
+                        p = fn(t)[0].float().cpu().numpy()
                     acc[z:z + window, y:y + window, x:x + window] += p * g
                     wsum[z:z + window, y:y + window, x:x + window] += g
     return np.where((wsum > 0) & (roi > 0), acc / np.maximum(wsum, 1e-6), 0)  # masked CT (0) -> no surface
 
 
-def slide_gpu(fn, roi, window, halo, dev, prep):
-    """slide() with the ROI, the normalization and the (fp16) accumulators all on the GPU: no per-window CPU
-    work, for cards with room (a 384x2048x2048 box needs ~8 GB + the model). prep(ct_window uint8 tensor,
-    (z,y,x)) -> (C,w,w,w) float tensor; masked CT (0) -> no surface, as in slide()."""
+def slide_gpu(fn, roi, window, halo, dev, prep, batch=1):
+    """slide() with the ROI, the normalization and the (fp16) accumulators all on the GPU and `batch` windows
+    per forward: no per-window CPU work, for cards with room (a 384x2048x2048 box needs ~8 GB + the model +
+    batch x the activations). prep(ct_window uint8 tensor, (z,y,x)) -> (C,w,w,w) float tensor; masked CT (0) ->
+    no surface, as in slide()."""
+    if any(s < window for s in roi.shape):
+        S = roi.shape
+        roi = np.pad(roi, [(0, max(window - s, 0)) for s in S])
+        return slide_gpu(fn, roi, window, halo, dev, prep, batch)[:S[0], :S[1], :S[2]]
     R = torch.from_numpy(np.ascontiguousarray(roi)).to(dev)
     acc = torch.zeros(R.shape, dtype=torch.float16, device=dev)
     wsum = torch.zeros_like(acc)
@@ -55,17 +60,16 @@ def slide_gpu(fn, roi, window, halo, dev, prep):
     Z, Y, X = R.shape
     stride = window - 2 * halo
     with torch.no_grad():
-        for z in starts(Z, window, stride):
-            for y in starts(Y, window, stride):
-                for x in starts(X, window, stride):
-                    c = R[z:z + window, y:y + window, x:x + window]
-                    if not c.any():
-                        continue
-                    t = prep(c, (z, y, x))[None].contiguous(memory_format=torch.channels_last_3d)
-                    with autocast(dev):
-                        p = fn(t)
-                    acc[z:z + window, y:y + window, x:x + window] += (p.float() * g.float()).half()
-                    wsum[z:z + window, y:y + window, x:x + window] += g
+        todo = [(z, y, x) for z in starts(Z, window, stride) for y in starts(Y, window, stride) for x in starts(X, window, stride)
+                if R[z:z + window, y:y + window, x:x + window].any()]
+        for i in range(0, len(todo), batch):
+            offs = todo[i:i + batch]
+            t = torch.stack([prep(R[z:z + window, y:y + window, x:x + window], o) for o in offs for z, y, x in [o]])
+            with autocast(dev):
+                p = fn(t.contiguous(memory_format=torch.channels_last_3d))
+            for (z, y, x), pj in zip(offs, p):
+                acc[z:z + window, y:y + window, x:x + window] += (pj.float() * g.float()).half()
+                wsum[z:z + window, y:y + window, x:x + window] += g
         out = np.empty(R.shape, np.float32)
         for z in range(0, Z, 64):  # a slab at a time keeps the float32 temporaries small
             a, w, r = acc[z:z + 64].float(), wsum[z:z + 64].float(), R[z:z + 64]
@@ -156,12 +160,12 @@ def flips_vec(fn, n=8):
             x = torch.flip(t, [2 + d for d in f]).clone()
             for d in f:
                 x[:, 1 + d] = -x[:, 1 + d]
-            out = out + torch.flip(fn(x), list(f))
+            out = out + torch.flip(fn(x), [1 + d for d in f])
         return out / len(fl)
     return go
 
 
-HEADS = {"mean": lambda p: p.mean(0), "prod": lambda p: p.prod(0) ** (1 / p.shape[0]), "max": lambda p: p.max(0).values}
+HEADS = {"mean": lambda p: p.mean(1), "prod": lambda p: p.prod(1) ** (1 / p.shape[1]), "max": lambda p: p.max(1).values}
 
 
 def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, tta=0, luts=(), head=0):
@@ -177,8 +181,8 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
     r = 0.0 if st["args"].get("no_radial") else 1.0  # training zeroed the radial channels
     rad = lambda c, o: data.radial(ax, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape) * r
     preps = [lambda c, o: data.inputs(c, rad(c, o))] + [(lambda c, o, l=l: data.inputs(l[c], rad(c, o))) for l in luts]
-    pick = HEADS[head] if isinstance(head, str) else (lambda p: p[int(head)])
-    fn = lambda t: pick(torch.sigmoid(net(t))[0])
+    pick = HEADS[head] if isinstance(head, str) else (lambda p: p[:, int(head)])
+    fn = lambda t: pick(torch.sigmoid(net(t)))  # (B,C,...) -> (B,...)
     if tta > 1:
         fn = flips_vec(fn, tta)
     return sum(slide(fn, roi, window, halo, dev, pr) for pr in preps) / len(preps), st

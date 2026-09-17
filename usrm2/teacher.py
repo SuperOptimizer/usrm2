@@ -25,7 +25,7 @@ def load(ckpt=CKPT, dev="cuda"):
 def flips(fn, n=8):
     """Test-time augmentation: average fn over the first n of the 8 axis flips (exact inverses)."""
     fl = [(), (2,), (3,), (4,), (2, 3), (2, 4), (3, 4), (2, 3, 4)][:n]
-    return lambda t: sum(torch.flip(fn(torch.flip(t, f)), [d - 2 for d in f]) for f in fl) / len(fl)
+    return lambda t: sum(torch.flip(fn(torch.flip(t, f)), [d - 1 for d in f]) for f in fl) / len(fl)  # fn: (B,C,..)->(B,..)
 
 
 def lut_to(volume, ref=data.CT, n=30, seed=0):
@@ -44,7 +44,7 @@ def lut_to(volume, ref=data.CT, n=30, seed=0):
 
 
 def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=256, halo=32, tile=2048, margin=128, ckpt=CKPT, device=None,
-        tta=0, luts=(), backend="torch", gpu_acc=False):
+        tta=0, luts=(), backend="torch", gpu_acc=False, batch=1):
     """tta: number of flips to average (0/1 = none, 8 = all). luts: extra intensity LUTs (uint8->float) whose
     predictions are averaged with the plain one (intensity TTA, e.g. lut_to(volume, other_scroll))."""
     """Tiles over y/x so RAM stays bounded. Each tile is read with a `margin` (>= half a window: the teacher
@@ -54,10 +54,10 @@ def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=256, halo=32, tile=2048
     if backend == "trt":  # tsm's fp16 engine for this GPU (usrm2/trt.py)
         from usrm2 import trt
         net = trt.Engine(trt.plan("recto", window), dev)
-        fn = lambda t: torch.softmax(net(t), 1)[0, 1]
+        fn = lambda t: torch.softmax(net(t), 1)[:, 1]
     else:
         net = load(ckpt, dev)
-        fn = lambda t: torch.softmax(net(t)["surface"].float(), 1)[0, 1]
+        fn = lambda t: torch.softmax(net(t)["surface"].float(), 1)[:, 1]
     if tta > 1:
         fn = flips(fn, tta)
     preps = [None] + [(lambda c, _, l=l: data.zscore(l[c])[None]) for l in luts]
@@ -72,7 +72,7 @@ def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=256, halo=32, tile=2048
             t0 = time.time()
             roi = ct[z0:z0 + Z, y0 + ya:y0 + yb, x0 + xa:x0 + xb]
             t1 = time.time()
-            sl = slide_gpu if gpu_acc else slide
+            sl = (lambda *a: slide_gpu(*a, batch=batch)) if gpu_acc else slide
             prob = sum(sl(fn, roi, window, halo, dev, pr) for pr in preps) / len(preps) if roi.any() else np.zeros(roi.shape, np.float32)
             prob = prob[:, y - ya:y - ya + tile, x - xa:x - xa + tile]
             t2 = time.time()

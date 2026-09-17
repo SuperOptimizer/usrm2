@@ -39,7 +39,7 @@ def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=192, halo=32, margin=64
     if backend == "trt":
         from usrm2 import trt
         net = trt.Engine(trt.plan("m7", window), dev)
-    fn = lambda t: torch.softmax(net(t).float(), 1)[0, 1]
+    fn = lambda t: torch.softmax(net(t).float(), 1)[:, 1]
     if tta > 1:
         fn = flips(fn, tta)
     f = 1 << level

@@ -77,6 +77,8 @@ def main(argv=None):
     t.add_argument("--model", default="recto", choices=["recto", "m7"], help="m7 = the 8um nnU-Net on level 2, upsampled")
     t.add_argument("--backend", default="torch", choices=["torch", "trt"], help="trt = tsm's fp16 TensorRT engine")
     t.add_argument("--gpu-acc", action="store_true", help="box, normalization and accumulators on the GPU (needs ~8 GB spare)")
+    t.add_argument("--window", type=int, default=None, help="recto 256 / m7 192 by default; bigger = less halo overlap")
+    t.add_argument("--batch", type=int, default=1, help="windows per forward (with --gpu-acc)")
     b = sub.add_parser("teacher-boxes", help="run the teacher over many random non-air boxes")
     b.add_argument("out_dir")
     b.add_argument("--n", type=int, default=50)
@@ -88,6 +90,8 @@ def main(argv=None):
     b.add_argument("--model", default="recto", choices=["recto", "m7"], help="m7 = the 8um nnU-Net on level 2, upsampled")
     b.add_argument("--backend", default="torch", choices=["torch", "trt"], help="trt = tsm's fp16 TensorRT engine")
     b.add_argument("--gpu-acc", action="store_true", help="box, normalization and accumulators on the GPU (needs ~8 GB spare)")
+    b.add_argument("--window", type=int, default=None, help="recto 256 / m7 192 by default; bigger = less halo overlap")
+    b.add_argument("--batch", type=int, default=1, help="windows per forward (with --gpu-acc)")
     a = ap.parse_args(argv)
     from usrm2 import data, model, predict as P, train as T
     if a.umbilicus:
@@ -129,15 +133,17 @@ def main(argv=None):
         from usrm2 import teacher
         ex = data.VAL if a.exclude == "default" else (None if a.exclude == "none" else a.exclude)
         runner = __import__("usrm2.m7", fromlist=["run"]).run if a.model == "m7" else None
-        teacher.boxes(a.out_dir, n=a.n, size=tuple(a.size), seed=a.seed, volume=a.volume or data.CT, exclude=ex, tta=a.tta, runner=runner, backend=a.backend, **({"gpu_acc": True} if a.gpu_acc and a.model == "recto" else {}))
+        teacher.boxes(a.out_dir, n=a.n, size=tuple(a.size), seed=a.seed, volume=a.volume or data.CT, exclude=ex, tta=a.tta, runner=runner, backend=a.backend, **({"window": a.window} if a.window else {}),
+                      **({"gpu_acc": True, "batch": a.batch} if a.gpu_acc and a.model == "recto" else {}))
     elif a.cmd == "teacher":
         from usrm2 import teacher
         vol = a.volume or data.CT
         if a.model == "m7":
             from usrm2 import m7
-            m7.run(a.out, *a.origin, *a.size, volume=vol, tta=a.tta, backend=a.backend)
+            m7.run(a.out, *a.origin, *a.size, volume=vol, tta=a.tta, backend=a.backend, **({"window": a.window} if a.window else {}))
         else:
-            teacher.run(a.out, *a.origin, *a.size, volume=vol, tta=a.tta, luts=[teacher.lut_to(vol, r) for r in a.lut_to], backend=a.backend, gpu_acc=a.gpu_acc)
+            teacher.run(a.out, *a.origin, *a.size, volume=vol, tta=a.tta, luts=[teacher.lut_to(vol, r) for r in a.lut_to], backend=a.backend,
+                        gpu_acc=a.gpu_acc, batch=a.batch, **({"window": a.window} if a.window else {}))
     else:
         from usrm2 import teacher
         vol = a.volume or data.CT
