@@ -125,7 +125,7 @@ def png(path, ct, p_u8, origin, pts, thr=0.5):
 
 
 def run(origin=VAL_BOX[0], size=VAL_BOX[1], ckpt=None, store=None, teacher=None, tifxyz=TIFXYZ,
-        volume=None, window=128, halo=16, device=None, png_path=None, cache=None, tta=0, luts=()):
+        volume=None, window=128, halo=16, device=None, png_path=None, cache=None, tta=0, luts=(), head=0):
     o, s = tuple(origin), tuple(size)
     pts, nrm, counts = sites(o, s, tifxyz, cache=cache or (store and store.rstrip("/") + f".sites_{o[0]}_{o[1]}_{o[2]}.npz"))
     ct = data.open_zarr(volume or data.CT)[o[0]:o[0] + s[0], o[1]:o[1] + s[1], o[2]:o[2] + s[2]]
@@ -133,8 +133,8 @@ def run(origin=VAL_BOX[0], size=VAL_BOX[1], ckpt=None, store=None, teacher=None,
     pts, nrm = pts[keep], nrm[keep]
     print(json.dumps({"box": [*o, *s], "surfaces": counts, "masked_points_dropped": int((~keep).sum())}))
     if ckpt:
-        prob, st = P.probs(ckpt, volume or data.CT, *o, *s, window=window, halo=halo, device=device, tta=tta, luts=luts)
-        p_u8, name = P.u8(prob), f"{ckpt}@{st.get('step')}" + (f"+tta{tta}" if tta > 1 else "") + (f"+lut{len(luts)}" if luts else "")
+        prob, st = P.probs(ckpt, volume or data.CT, *o, *s, window=window, halo=halo, device=device, tta=tta, luts=luts, head=head)
+        p_u8, name = P.u8(prob), f"{ckpt}@{st.get('step')}" + (f"+tta{tta}" if tta > 1 else "") + (f"+lut{len(luts)}" if luts else "") + f"+head{head}"
     else:
         p_u8, name = read_box(store, o, s), store
     print(json.dumps({"source": name, **metrics(p_u8, o, pts, nrm)}))

@@ -16,8 +16,9 @@ def main(argv=None):
     t.add_argument("--eval-every", type=int, default=500)
     t.add_argument("--val-patches", type=int, default=32)
     t.add_argument("--resume", action="store_true")
-    t.add_argument("--stores", nargs="+", default=None, help="teacher stores to train on (default: data.TRAIN)")
-    t.add_argument("--val", default=None, help="teacher store for validation (default: data.VAL)")
+    t.add_argument("--stores", nargs="+", default=None, help="teacher stores to train on (default: data.TRAIN); "
+                   "'a.zarr,a_m7.zarr' = several teachers over one box, one head each")
+    t.add_argument("--val", default=None, help="teacher store for validation (default: data.VAL); same comma form")
     t.add_argument("--aug", default="geo", help="augmentation preset (see aug.PRESETS)")
     t.add_argument("--no-radial", action="store_true", help="zero the radial channels 1..3")
     b = sub.add_parser("ablate", help="train one run per augmentation preset, sequentially")
@@ -48,6 +49,7 @@ def main(argv=None):
     p.add_argument("--plain", action="store_true", help="plain zarr (1,Z,Y,X) instead of volcomp")
     p.add_argument("--ome", action="store_true", help="zarr v2 OME group at full volume shape (tracer drop-in)")
     p.add_argument("--tta", type=int, default=0, help="average over this many axis flips (8 = all)")
+    p.add_argument("--head", default="0", help="head index of a multi-teacher student, or mean / prod / max")
     p.add_argument("--lut-to", nargs="*", default=(), metavar="REF", help="also average with the input histogram-matched to REF volumes")
     s = sub.add_parser("evalsurf", help="score a checkpoint or store against the published surfaces")
     s.add_argument("--box", type=int, nargs=6, default=None, metavar=("Z0", "Y0", "X0", "Z", "Y", "X"))
@@ -59,6 +61,7 @@ def main(argv=None):
     s.add_argument("--png", default=None)
     s.add_argument("--window", type=int, default=128)
     s.add_argument("--tta", type=int, default=0)
+    s.add_argument("--head", default="0", help="head index of a multi-teacher student, or mean / prod / max")
     s.add_argument("--lut-to", nargs="*", default=(), metavar="REF")
     s.add_argument("--halo", type=int, default=16)
     s.add_argument("--device", default=None)
@@ -112,7 +115,8 @@ def main(argv=None):
         from usrm2 import teacher
         luts = [teacher.lut_to(a.volume or data.CT, r) for r in a.lut_to]
         E.run(b[:3], b[3:], ckpt=a.ckpt, store=a.store, teacher=a.teacher, tifxyz=a.tifxyz or E.TIFXYZ,
-              volume=a.volume, window=a.window, halo=a.halo, device=a.device, png_path=a.png, tta=a.tta, luts=luts)
+              volume=a.volume, window=a.window, halo=a.halo, device=a.device, png_path=a.png, tta=a.tta, luts=luts,
+              head=a.head if a.head in P.HEADS else int(a.head))
     elif a.cmd == "teacher-boxes":
         from usrm2 import teacher
         ex = data.VAL if a.exclude == "default" else (None if a.exclude == "none" else a.exclude)
@@ -130,7 +134,7 @@ def main(argv=None):
         from usrm2 import teacher
         vol = a.volume or data.CT
         P.predict(a.ckpt, vol, *a.origin, *a.size, a.out, window=a.window, halo=a.halo, volcomp=not a.plain, ome=a.ome,
-                  tta=a.tta, luts=[teacher.lut_to(vol, r) for r in a.lut_to])
+                  tta=a.tta, luts=[teacher.lut_to(vol, r) for r in a.lut_to], head=a.head if a.head in P.HEADS else int(a.head))
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Tiny 3D U-Net: 4 input channels (z-scored CT + radial unit vector) -> 1 recto logit."""
+"""Tiny 3D U-Net: 4 input channels (z-scored CT + radial unit vector) -> one logit per teacher (head)."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,13 +14,13 @@ def block(cin, cout):
 
 
 class UNet(nn.Module):
-    def __init__(self, widths=PRESETS["1m"], cin=4):
+    def __init__(self, widths=PRESETS["1m"], cin=4, cout=1):
         super().__init__()
         w = list(widths)
         self.enc = nn.ModuleList([block(cin if i == 0 else w[i - 1], w[i]) for i in range(len(w))])
         self.down = nn.ModuleList([nn.Conv3d(c, c, 3, stride=2, padding=1) for c in w[:-1]])
         self.dec = nn.ModuleList([block(w[i] + w[i + 1], w[i]) for i in range(len(w) - 1)])
-        self.head = nn.Conv3d(w[0], 1, 1)
+        self.head = nn.Conv3d(w[0], cout, 1)
 
     def forward(self, x):
         skips = []
@@ -35,9 +35,9 @@ class UNet(nn.Module):
         return self.head(x)
 
 
-def build(size="1m", verbose=True):
-    m = UNet(PRESETS[size]).to(memory_format=torch.channels_last_3d)
+def build(size="1m", verbose=True, cout=1):
+    m = UNet(PRESETS[size], cout=cout).to(memory_format=torch.channels_last_3d)
     n = sum(p.numel() for p in m.parameters())
     if verbose:
-        print(f"usrm2 UNet {size} widths={PRESETS[size]} params={n / 1e6:.2f}M")
+        print(f"usrm2 UNet {size} widths={PRESETS[size]} heads={cout} params={n / 1e6:.2f}M")
     return m

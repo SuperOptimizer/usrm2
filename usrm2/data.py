@@ -2,6 +2,8 @@
 
 Teacher stores: uint8 = recto probability * 255, shape (Z,Y,X) (or (1,Z,Y,X)),
 attrs origin_zyx = the level-0 index of element 0. CT: uint8, 0 = air/masked.
+A store entry "a.zarr,a_m7.zarr" names several teachers over the SAME box: one target channel each
+(a multi-head student); the first one supplies the box, volume and umbilicus.
 """
 import numpy as np
 import torch
@@ -92,11 +94,11 @@ def raw(rng, ct, cfg):
 
 
 def augment(rng, x, tg):
-    """Random axis permutation + flips applied to the (C,Z,Y,X) input and (Z,Y,X) target; the radial
+    """Random axis permutation + flips applied to the (C,Z,Y,X) input and (T,Z,Y,X) target; the radial
     vector channels 1..3 of x are permuted/negated to match."""
     perm, flip = rng.permutation(3), rng.random(3) < 0.5
     sl = tuple(slice(None, None, -1 if f else 1) for f in flip)
-    tg = np.ascontiguousarray(np.transpose(tg, perm)[sl])
+    tg = np.ascontiguousarray(np.transpose(tg, (0,) + tuple(perm + 1))[(slice(None),) + sl])
     x = np.transpose(x, (0,) + tuple(perm + 1))[(slice(None),) + sl]
     x = np.concatenate([x[:1], x[1 + perm] * np.where(flip, -1, 1).astype(np.float32)[:, None, None, None]])
     return np.ascontiguousarray(x), tg
@@ -113,7 +115,7 @@ class Patches(torch.utils.data.IterableDataset):
     def __init__(self, patch=128, ct=CT, stores=TRAIN, exclude=VAL, seed=0, air_keep=0.1, fg_min=0.05,
                  fg_keep=0.25, sym=True, aug=None):
         super().__init__()
-        self.patch, self.ct_path, self.paths, self.exclude, self.seed = patch, ct, list(stores), exclude, seed
+        self.patch, self.ct_path, self.paths, self.exclude, self.seed = patch, ct, [str(s).split(",") for s in stores], exclude, seed
         self.sym = sym  # the 48 cube symmetries; the GPU augs are in aug.py
         self.aug = aug or {}  # the worker-side raw-uint8 stage: window / volcomp / blank
         self.air_keep, self.fg_min, self.fg_keep = air_keep, fg_min, fg_keep  # low-foreground patches are mostly skipped
@@ -121,7 +123,8 @@ class Patches(torch.utils.data.IterableDataset):
 
     def _open(self):
         """Each teacher store names its CT volume and scroll axis (attrs), so stores from several scrolls can mix."""
-        self.arrs = [open_zarr(p) for p in self.paths]
+        self.heads = [[open_zarr(q) for q in ps] for ps in self.paths]  # target channels
+        self.arrs = [h[0] for h in self.heads]
         self.vols = [a.attrs.get("volume", self.ct_path) for a in self.arrs]
         cts = {v: open_zarr(v) for v in set(self.vols)}
         self.cts = [cts[v] for v in self.vols]
@@ -150,24 +153,25 @@ class Patches(torch.utils.data.IterableDataset):
                 continue
             bl = self.aug.get("blank")
             if bl and rng.random() < bl["p"]:  # an all-air patch (CT 0 = air) with target 0
-                ct, tg = np.zeros((p, p, p), np.uint8), np.zeros((p, p, p), np.float32)
+                ct, tg = np.zeros((p, p, p), np.uint8), np.zeros((len(self.heads[i]), p, p, p), np.float32)
             else:
                 ct = self.cts[i][g[0]:g[0] + p, g[1]:g[1] + p, g[2]:g[2] + p]
                 if (ct == 0).mean() > 0.9 and rng.random() > self.air_keep:
                     continue
-                tg = read3(self.arrs[i], lo, p).astype(np.float32) / 255.0 * (ct > 0)  # masked CT -> no surface
+                tg = np.stack([read3(a, lo, p) for a in self.heads[i]]).astype(np.float32) / 255.0 * (ct > 0)  # masked CT -> no surface
                 if tg.mean() < self.fg_min and rng.random() > self.fg_keep:
                     continue
                 ct = raw(rng, ct, self.aug)
             rejected, x = 0, inputs(ct, radial(self.axes[i], g, ct.shape))
             if self.sym:
                 x, tg = augment(rng, x, tg)
-            yield torch.from_numpy(x), torch.from_numpy(tg)[None]
+            yield torch.from_numpy(x), torch.from_numpy(tg)
 
 
 def val_grid(patch=128, ct=CT, store=VAL, limit=32):
     """Deterministic non-overlapping tiling of the val box -> list of (ct, tgt)."""
-    tga = open_zarr(store)
+    heads = [open_zarr(q) for q in str(store).split(",")]
+    tga = heads[0]
     cta, ax = open_zarr(tga.attrs.get("volume", ct)), axis(tga.attrs.get("umbilicus", UMBILICUS))
     o, s = box(tga)
     corners = [(z, y, x) for z in range(0, s[0] - patch + 1, patch)
@@ -179,8 +183,8 @@ def val_grid(patch=128, ct=CT, store=VAL, limit=32):
     for lo in corners:
         g = o + np.array(lo)
         c = cta[g[0]:g[0] + patch, g[1]:g[1] + patch, g[2]:g[2] + patch]
-        t = read3(tga, lo, patch).astype(np.float32) / 255.0 * (c > 0)
-        out.append((torch.from_numpy(inputs(c, radial(ax, g, c.shape))), torch.from_numpy(t)[None]))
+        t = np.stack([read3(a, lo, patch) for a in heads]).astype(np.float32) / 255.0 * (c > 0)
+        out.append((torch.from_numpy(inputs(c, radial(ax, g, c.shape))), torch.from_numpy(t)))
     return out
 
 

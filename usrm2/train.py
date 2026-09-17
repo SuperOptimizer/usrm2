@@ -12,8 +12,8 @@ from usrm2 import aug as A, data, model as M
 
 def losses(logit, tgt):
     bce = F.binary_cross_entropy_with_logits(logit, tgt)
-    p = torch.sigmoid(logit)
-    dice = 1 - (2 * (p * tgt).sum() + 1) / (p.sum() + tgt.sum() + 1)
+    p, d = torch.sigmoid(logit), (0, 2, 3, 4)
+    dice = (1 - (2 * (p * tgt).sum(d) + 1) / (p.sum(d) + tgt.sum(d) + 1)).mean()  # per head
     return bce, dice
 
 
@@ -55,7 +55,9 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     args = dict(size=size, steps=steps, patch=patch, batch=batch, lr=lr, aug=aug, aug_cfg=cfg,
                 no_radial=no_radial, **kw)
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    net = M.build(size).to(dev)
+    grid = data.val_grid(patch=patch, ct=kw.get("ct", data.CT), store=kw.get("val", data.VAL), limit=val_patches)
+    args["cout"] = cout = grid[0][1].shape[0]  # one head per teacher store
+    net = M.build(size, cout=cout).to(dev)
     opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min((s + 1) / warmup, 1.0) *
                                               0.5 * (1 + math.cos(math.pi * min(s / steps, 1.0))))
@@ -68,11 +70,10 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         ema, step = {k: v.to(dev) for k, v in st["ema"].items()}, st["step"]
         for _ in range(step):
             sched.step()
-    grid = data.val_grid(patch=patch, ct=kw.get("ct", data.CT), store=kw.get("val", data.VAL), limit=val_patches)
     if no_radial:
         for x, _ in grid:
             x[1:] = 0
-    evnet = M.build(size, verbose=False).to(dev)
+    evnet = M.build(size, verbose=False, cout=cout).to(dev)
     dl = data.loader(patch, batch, workers, ct=kw.get("ct", data.CT), stores=kw.get("stores", data.TRAIN),
                      exclude=kw.get("val", data.VAL), seed=step, sym=cfg.get("sym", True), aug=cfg)
 
