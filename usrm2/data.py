@@ -148,7 +148,8 @@ class Patches(torch.utils.data.IterableDataset):
         for ps, h in zip(self.paths, self.heads):
             for q, a in zip(ps[1:], h[1:]):
                 assert box(a)[0].tolist() == box(h[0])[0].tolist() and a.shape[-3:] == h[0].shape[-3:] \
-                    and a.attrs.get("volume", self.ct_path) == h[0].attrs.get("volume", self.ct_path), f"{q} is not the same box as {ps[0]}"
+                    and local(a.attrs.get("volume", self.ct_path)) == local(h[0].attrs.get("volume", self.ct_path)), \
+                    f"{q} is not the same box as {ps[0]}"  # (a streamed URL and its local mirror are the same volume)
         self.arrs = [h[0] for h in self.heads]
         self.vols = [a.attrs.get("volume", self.ct_path) for a in self.arrs]
         cts = {v: open_zarr(v) for v in set(self.vols)}
