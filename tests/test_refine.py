@@ -66,3 +66,14 @@ def test_assign_prefers_one_peak_per_sheet_in_order():
     assert abs(R.assign(pos, stren, np.array([np.nan]), np.array([np.nan]))[0] - 2.0) < 1e-4
     # with another sheet 6 above: that sheet takes +2, this one gets -4
     assert abs(R.assign(pos, stren, np.array([np.nan]), np.array([6.0]))[0] + 4.0) < 1e-4
+
+
+def test_upsample_densifies_and_keeps_holes():
+    Z, X = np.meshgrid(np.arange(0, 100, 20, dtype=np.float32), np.arange(0, 100, 20, dtype=np.float32), indexing="ij")
+    g = np.stack([Z, 30 + 0.1 * X, X], -1)
+    g[2, 2] = np.nan
+    u = R.upsample(g, 5)
+    assert u.shape == (21, 21, 3)
+    ok = np.isfinite(u).all(-1)
+    assert np.allclose(u[ok][:, 0] % 4, 0, atol=1e-3) and np.abs(np.diff(u[0, :, 2])).mean() == pytest.approx(4.0, abs=1e-3)
+    assert not ok[10, 10] and ok[0, 0] and ok[20, 20]

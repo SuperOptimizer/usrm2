@@ -6,7 +6,7 @@ import torch
 from usrm2 import data
 from usrm2.predict import out_array, put, slide, slide_gpu, zscore_t
 
-CKPT = "/vesuvius/tsm/models/surface_recto_3dunet.pth"
+CKPT = __import__("os").environ.get("USRM2_RECTO_CKPT", "/vesuvius/tsm/models/surface_recto_3dunet.pth")
 
 
 def load(ckpt=CKPT, dev="cuda"):

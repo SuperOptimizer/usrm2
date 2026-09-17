@@ -1,4 +1,5 @@
 import argparse
+import os
 
 
 def main(argv=None):
@@ -91,6 +92,8 @@ def main(argv=None):
     r.add_argument("--iters", type=int, default=3)
     r.add_argument("--thr", type=float, default=0.5, help="minimum peak probability to count as evidence")
     r.add_argument("--volume", default=None)
+    r.add_argument("--png", default=None, help="also write before/after slice images into this directory")
+    r.add_argument("--up", type=int, default=1, help="resample the grids this many times denser before refining (published = 1/20 voxel)")
     b = sub.add_parser("teacher-boxes", help="run the teacher over many random non-air boxes")
     b.add_argument("out_dir")
     b.add_argument("--n", type=int, default=50)
@@ -146,8 +149,10 @@ def main(argv=None):
               head=a.head if a.head in P.HEADS else int(a.head))
     elif a.cmd == "refine":
         from usrm2 import refine
-        refine.run(a.surfaces, a.store, a.out, eval_store=a.eval_store, far=a.far, sigma=a.sigma, iters=a.iters, thr=a.thr,
-                   volume=a.volume, tifxyz=a.tifxyz)
+        outs = refine.run(a.surfaces, a.store, a.out, eval_store=a.eval_store, far=a.far, sigma=a.sigma, iters=a.iters, thr=a.thr,
+                          volume=a.volume, tifxyz=a.tifxyz, up=a.up)
+        if a.png:
+            refine.compare(a.store, a.tifxyz or os.path.dirname(a.surfaces[0].rstrip("/")), a.out, a.png, volume=a.volume)
     elif a.cmd == "teacher-boxes" and a.procs > 1:  # k workers on one GPU: a virtualized GPU only fills up this way
         import subprocess, sys
         argv, skip = [], False

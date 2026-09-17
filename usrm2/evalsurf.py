@@ -11,7 +11,7 @@ import numpy as np
 
 from usrm2 import data, predict as P
 
-TIFXYZ = "/vesuvius/usrm/tifxyz/PHercParis4"
+TIFXYZ = os.environ.get("USRM2_TIFXYZ", "/vesuvius/usrm/tifxyz/PHercParis4")
 VAL_BOX = ((34432, 15104, 18432), (256, 1024, 1024))  # what /vesuvius/usrm2/teacher/eval.zarr covers
 
 

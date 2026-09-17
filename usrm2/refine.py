@@ -95,6 +95,23 @@ def ray_neighbours(q, n, others, R, lateral=3.0):
     return below, above
 
 
+def upsample(g, f, order=3):
+    """A denser grid: (H,W,3) -> ((H-1)f+1, (W-1)f+1, 3) by spline interpolation of each coordinate (holes filled
+    for the interpolation, then re-masked: a new cell is a hole if any of the 4 old cells around it was one).
+    Published tifxyz grids are 1/20 voxel pitch (meta scale 0.05); f=4..5 gives a 4-5 voxel pitch."""
+    from scipy.ndimage import zoom
+    if f == 1:
+        return g.copy()
+    ok = np.isfinite(g).all(-1)
+    fg = filled(g, sigma=2.0)
+    H, W = g.shape[:2]
+    zf = ((H - 1) * f + 1) / H, ((W - 1) * f + 1) / W
+    out = np.stack([zoom(fg[..., i], zf, order=order, mode="nearest") for i in range(3)], -1)
+    okz = zoom(ok.astype(np.float32), zf, order=1, mode="nearest") > 0.999
+    out[~okz] = np.nan
+    return out.astype(np.float32)
+
+
 def smooth(field, w, sigma):
     """Confidence-weighted Gaussian smoothing over the grid (normalized convolution); NaN/zero-weight cells get
     the neighbourhood's value."""
@@ -177,13 +194,15 @@ def refine(g, V, origin, ax, **kw):
     return gs[0], stats
 
 
-def write_tifxyz(src_dir, out_dir, g, note):
-    """A tifxyz directory like `src_dir` with the refined points (meta.json copied, bbox recomputed)."""
+def write_tifxyz(src_dir, out_dir, g, note, up=1):
+    """A tifxyz directory like `src_dir` with the refined points (meta.json copied, bbox recomputed, scale x up)."""
     import tifffile
     os.makedirs(out_dir, exist_ok=True)
     for i, c in enumerate("zyx"):
         tifffile.imwrite(f"{out_dir}/{c}.tif", np.where(np.isfinite(g[..., i]), g[..., i], 0).astype(np.float32))
     meta = json.load(open(f"{src_dir}/meta.json"))
+    if up != 1 and "scale" in meta:
+        meta["scale"] = [float(v) * up for v in meta["scale"]]
     v = g[np.isfinite(g).all(-1)]
     meta["bbox"] = [v.min(0)[::-1].tolist(), v.max(0)[::-1].tolist()] if len(v) else meta.get("bbox")
     meta["refined"] = note
@@ -210,9 +229,10 @@ def surfaces_in(tifxyz, origin, size, min_pts=200):
     return out
 
 
-def run(surfaces, store, out_root, eval_store=None, far=12, sigma=2.0, iters=3, thr=0.5, volume=None, tifxyz=None):
+def run(surfaces, store, out_root, eval_store=None, far=12, sigma=2.0, iters=3, thr=0.5, volume=None, tifxyz=None, up=1):
     """Refine `surfaces` (tifxyz dirs; or every surface of `tifxyz` crossing the store's box) jointly with `store`,
-    write them under out_root/<name>, and report metrics before/after on `eval_store` (default: `store`)."""
+    write them under out_root/<name>, and report metrics before/after on `eval_store` (default: `store`).
+    up: resample the grids `up` times denser first (sigma is in grid cells, so it is scaled along)."""
     a = data.open_zarr(store)
     o, s = data.box(a)
     if tifxyz:
@@ -221,13 +241,13 @@ def run(surfaces, store, out_root, eval_store=None, far=12, sigma=2.0, iters=3, 
     V = np.asarray(a[(0,) + (slice(None),) * 3] if a.ndim == 4 else a[:], np.float32) / 255.0
     ct = data.open_zarr(volume or a.attrs.get("volume", data.CT))[o[0]:o[0] + s[0], o[1]:o[1] + s[1], o[2]:o[2] + s[2]]
     ax = data.axis(a.attrs.get("umbilicus", None))
-    g0 = [E.read_surface(d) for d in surfaces]
-    print(json.dumps({"box": [*o.tolist(), *s.tolist()], "surfaces": [os.path.basename(d.rstrip("/")) for d in surfaces]}))
-    g1, stats = refine_many(g0, V, o, ax, far=far, sigma=sigma, iters=iters, thr=thr, ct=ct)
+    g0 = [upsample(E.read_surface(d), up) for d in surfaces]
+    print(json.dumps({"box": [*o.tolist(), *s.tolist()], "surfaces": [os.path.basename(d.rstrip("/")) for d in surfaces], "up": up}))
+    g1, stats = refine_many(g0, V, o, ax, far=far, sigma=sigma * up, iters=iters, thr=thr, ct=ct)
     for st in stats:
         print(json.dumps(st))
-    note = {"store": str(store), "far": far, "sigma": sigma, "iters": iters, "thr": thr, "joint_with": len(surfaces)}
-    outs = [write_tifxyz(d, os.path.join(out_root, os.path.basename(d.rstrip("/"))), g, note) for d, g in zip(surfaces, g1)]
+    note = {"store": str(store), "far": far, "sigma": sigma, "iters": iters, "thr": thr, "joint_with": len(surfaces), "up": up}
+    outs = [write_tifxyz(d, os.path.join(out_root, os.path.basename(d.rstrip("/"))), g, note, up=up) for d, g in zip(surfaces, g1)]
     ev = eval_store or store
     if ev != store:
         b = data.open_zarr(ev)
@@ -244,4 +264,51 @@ def run(surfaces, store, out_root, eval_store=None, far=12, sigma=2.0, iters=3, 
             rec[name] = {q: round(m[q], 4) for q in ("recall@2", "recall@4", "offset_mean", "offset_std", "offset_le3", "merge_frac") if q in m}
             rec["points"] = int(k.sum())
         print(json.dumps(rec))
+    return outs
+
+
+def compare_png(path, ct, V, origin, before, after, crop=384, scale=2, slab=1.5):
+    """Before/after image for one surface: the CT z-slice with most surface points, the probability band faint
+    red, published points green, refined points magenta, cropped around the points and upscaled."""
+    from PIL import Image
+    o = np.asarray(origin, np.float32)
+    pts = [g[np.isfinite(g).all(-1) & ((g >= o) & (g < o + np.array(V.shape))).all(-1)] - o for g in (before, after)]
+    if not len(pts[0]):
+        return None
+    zi = int(np.bincount(np.clip(np.rint(pts[0][:, 0]).astype(int), 0, ct.shape[0] - 1)).argmax())
+    img = np.repeat(np.asarray(ct[zi], np.uint8)[..., None], 3, -1).astype(np.float32)
+    band = np.asarray(V[zi], np.float32)
+    img[..., 0] = np.clip(img[..., 0] + 160 * band, 0, 255)  # probability as a red tint
+    k = [np.abs(p[:, 0] - zi) <= slab for p in pts]
+    yx = [np.rint(p[m, 1:]).astype(int) for p, m in zip(pts, k)]
+    cy, cx = (yx[0].mean(0) if len(yx[0]) else np.array(img.shape[:2]) // 2).astype(int)
+    y0, x0 = max(cy - crop // 2, 0), max(cx - crop // 2, 0)
+    img = img[y0:y0 + crop, x0:x0 + crop]
+    img = np.repeat(np.repeat(img, scale, 0), scale, 1)
+    for q, col in ((yx[0], (0, 255, 0)), (yx[1], (255, 0, 255))):
+        q = (q - (y0, x0)) * scale
+        q = q[(q >= 0).all(1) & (q[:, 0] < img.shape[0]) & (q[:, 1] < img.shape[1])]
+        for dy in range(scale):
+            for dx in range(scale):
+                img[np.clip(q[:, 0] + dy, 0, img.shape[0] - 1), np.clip(q[:, 1] + dx, 0, img.shape[1] - 1)] = col
+    Image.fromarray(img.astype(np.uint8)).save(path)
+    return path
+
+
+def compare(store, before_root, after_root, out_dir, volume=None):
+    """Before/after PNGs for every refined surface under after_root (matching dirs under before_root)."""
+    a = data.open_zarr(store)
+    o, s = data.box(a)
+    V = np.asarray(a[(0,) + (slice(None),) * 3] if a.ndim == 4 else a[:], np.float32) / 255.0
+    ct = data.open_zarr(volume or a.attrs.get("volume", data.CT))[o[0]:o[0] + s[0], o[1]:o[1] + s[1], o[2]:o[2] + s[2]]
+    os.makedirs(out_dir, exist_ok=True)
+    outs = []
+    for name in sorted(os.listdir(after_root)):
+        b = next((d for d in (f"{before_root}/{name}", *[p for p in __import__("glob").glob(f"{before_root}/*/{name}")]) if os.path.isdir(d)), None)
+        if b is None or not os.path.exists(f"{after_root}/{name}/meta.json"):
+            continue
+        p = compare_png(f"{out_dir}/{name}.png", ct, V, o, E.read_surface(b), E.read_surface(f"{after_root}/{name}"))
+        if p:
+            outs.append(p)
+            print(p, flush=True)
     return outs

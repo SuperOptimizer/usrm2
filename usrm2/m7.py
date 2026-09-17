@@ -3,6 +3,7 @@
 ~8 um, so we run it on level 2 of the volume (9.6 um) and upsample its probability x4 to level 0, giving a
 thin, well-localized band in the same store format as the 2.4 um teacher."""
 import importlib
+import os
 
 import numpy as np
 import torch
@@ -12,7 +13,7 @@ from usrm2 import data
 from usrm2.predict import out_array, put, slide
 from usrm2.teacher import flips
 
-CKPT = "/vesuvius/tsm/models/surface_m7_nnunet.pth"
+CKPT = os.environ.get("USRM2_M7_CKPT", "/vesuvius/tsm/models/surface_m7_nnunet.pth")
 LEVEL = 2
 
 

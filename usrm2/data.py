@@ -8,11 +8,13 @@ A store entry "a.zarr,a_m7.zarr" names several teachers over the SAME box: one t
 import numpy as np
 import torch
 
-CT = "/vesuvius/usrm/volcomp/PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr/0"
+import os as _os
+# defaults are the forlindesk2 layout; USRM2_* environment variables override them on other machines
+CT = _os.environ.get("USRM2_CT", "/vesuvius/usrm/volcomp/PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr/0")
 TRAIN = ["/vesuvius/usrm2/teacher/a.zarr", "/vesuvius/usrm2/teacher/b.zarr"]  # made by `usrm2 teacher`; plus
 TRAIN += sorted(__import__("glob").glob("/vesuvius/usrm2/teacher/boxes/box_*.zarr"))  # `usrm2 teacher-boxes` output
-VAL = "/vesuvius/usrm2/teacher/eval.zarr"
-UMBILICUS = "/vesuvius/usrm/umbilicus/PHercParis4/umbilicus-full-resolution.json"
+VAL = _os.environ.get("USRM2_VAL", "/vesuvius/usrm2/teacher/eval.zarr")
+UMBILICUS = _os.environ.get("USRM2_UMBILICUS", "/vesuvius/usrm/umbilicus/PHercParis4/umbilicus-full-resolution.json")
 MARGIN = 16  # sliding-window predictions are worse at the teacher box edges
 
 
