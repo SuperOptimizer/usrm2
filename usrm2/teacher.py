@@ -63,15 +63,19 @@ def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=256, halo=32, tile=2048
         assert not luts, "gpu_acc has no LUT support"
         preps = [lambda c, _: zscore_t(c)[None]]
     ct, arr = data.open_zarr(volume), out_array(out, (Z, Y, X), (z0, y0, x0), volume=volume)
+    import time
     for y in range(0, Y, tile):
         for x in range(0, X, tile):
             ya, yb, xa, xb = max(y - margin, 0), min(y + tile + margin, Y), max(x - margin, 0), min(x + tile + margin, X)
+            t0 = time.time()
             roi = ct[z0:z0 + Z, y0 + ya:y0 + yb, x0 + xa:x0 + xb]
+            t1 = time.time()
             sl = slide_gpu if gpu_acc else slide
             prob = sum(sl(fn, roi, window, halo, dev, pr) for pr in preps) / len(preps) if roi.any() else np.zeros(roi.shape, np.float32)
             prob = prob[:, y - ya:y - ya + tile, x - xa:x - xa + tile]
+            t2 = time.time()
             arr[:, y:y + prob.shape[1], x:x + prob.shape[2]] = np.clip(np.rint(prob * 255), 0, 255).astype(np.uint8)
-            print(f"tile y={y} x={x} done", flush=True)
+            print(f"tile y={y} x={x} done: read {t1 - t0:.0f}s slide {t2 - t1:.0f}s write {time.time() - t2:.0f}s", flush=True)
     return out
 
 
