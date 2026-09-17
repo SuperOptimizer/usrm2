@@ -80,6 +80,17 @@ def main(argv=None):
     t.add_argument("--window", type=int, default=None, help="recto 256 / m7 192 by default; bigger = less halo overlap")
     t.add_argument("--batch", type=int, default=1, help="windows per forward (with --gpu-acc)")
     t.add_argument("--streams", type=int, default=1, help="concurrent CUDA streams (with --gpu-acc)")
+    r = sub.add_parser("refine", help="move a tifxyz surface onto the probability peaks of a store (prediction-guided)")
+    r.add_argument("out", help="output root: one refined tifxyz directory per surface goes under it")
+    r.add_argument("surfaces", nargs="*", help="tifxyz directories (z.tif y.tif x.tif meta.json)")
+    r.add_argument("--tifxyz", default=None, help="refine every surface of this tifxyz root that crosses the store's box")
+    r.add_argument("--store", required=True, help="recto probability store to refine on")
+    r.add_argument("--eval-store", default=None, help="a different store to report before/after metrics on")
+    r.add_argument("--far", type=int, default=12, help="search range along the normal (voxels), shrinks per iteration")
+    r.add_argument("--sigma", type=float, default=2.0, help="grid smoothing of the displacement field (grid cells)")
+    r.add_argument("--iters", type=int, default=3)
+    r.add_argument("--thr", type=float, default=0.5, help="minimum peak probability to count as evidence")
+    r.add_argument("--volume", default=None)
     b = sub.add_parser("teacher-boxes", help="run the teacher over many random non-air boxes")
     b.add_argument("out_dir")
     b.add_argument("--n", type=int, default=50)
@@ -133,6 +144,10 @@ def main(argv=None):
         E.run(b[:3], b[3:], ckpt=a.ckpt, store=a.store, teacher=a.teacher, tifxyz=a.tifxyz or E.TIFXYZ,
               volume=a.volume, window=a.window, halo=a.halo, device=a.device, png_path=a.png, tta=a.tta, luts=luts,
               head=a.head if a.head in P.HEADS else int(a.head))
+    elif a.cmd == "refine":
+        from usrm2 import refine
+        refine.run(a.surfaces, a.store, a.out, eval_store=a.eval_store, far=a.far, sigma=a.sigma, iters=a.iters, thr=a.thr,
+                   volume=a.volume, tifxyz=a.tifxyz)
     elif a.cmd == "teacher-boxes" and a.procs > 1:  # k workers on one GPU: a virtualized GPU only fills up this way
         import subprocess, sys
         argv, skip = [], False
