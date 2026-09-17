@@ -8,6 +8,7 @@ V=https://dl.ash2txt.org/community-uploads/forrest/volcomp/PHercParis4/volumes/2
 O=~/out; mkdir -p $O
 usrm2 teacher-boxes $O/boxes$S --n $N --seed $S --volume $V --exclude ~/eval.zarr > $O/boxes$S.log 2>&1
 for b in $O/boxes$S/box_*.zarr; do
+  [ -d "$b" ] || continue
   n=$(basename $b); o=${n#box_}; o=${o%.zarr}; o=${o//_/ }
   [ -d $O/boxes${S}_m7/$n ] || usrm2 teacher $O/boxes${S}_m7/$n --origin $o --size 384 2048 2048 --volume $V --model m7 2>&1 | grep -i "traceback\|error"
   echo "m7 $n"
