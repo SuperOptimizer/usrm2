@@ -9,7 +9,7 @@ V=https://dl.ash2txt.org/community-uploads/forrest/volcomp/PHercParis4/volumes/2
 O=~/out; mkdir -p $O
 for attempt in 1 2 3 4 5 6; do  # a streaming error kills the process; finished boxes are skipped on the retry
   for d in $O/boxes$S/box_*.zarr; do [ -d "$d" ] && ! grep -q "$(basename $d)" $O/boxes$S.log 2>/dev/null && rm -rf "$d"; done
-  usrm2 teacher-boxes $O/boxes$S --n $N --seed $S --volume $V --exclude ~/eval.zarr --backend $B >> $O/boxes$S.log 2>&1
+  usrm2 teacher-boxes $O/boxes$S --n $N --seed $S --volume $V --exclude ~/eval.zarr --backend $B --gpu-acc >> $O/boxes$S.log 2>&1
   grep -q "^box $N/$N" $O/boxes$S.log && break
   echo "retry $attempt $(date)" >> $O/boxes$S.log; sleep 30
 done

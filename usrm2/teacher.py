@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from usrm2 import data
-from usrm2.predict import out_array, slide
+from usrm2.predict import out_array, slide, slide_gpu, zscore_t
 
 CKPT = "/vesuvius/tsm/models/surface_recto_3dunet.pth"
 
@@ -42,7 +42,7 @@ def lut_to(volume, ref=data.CT, n=30, seed=0):
 
 
 def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=256, halo=32, tile=2048, margin=128, ckpt=CKPT, device=None,
-        tta=0, luts=(), backend="torch"):
+        tta=0, luts=(), backend="torch", gpu_acc=False):
     """tta: number of flips to average (0/1 = none, 8 = all). luts: extra intensity LUTs (uint8->float) whose
     predictions are averaged with the plain one (intensity TTA, e.g. lut_to(volume, other_scroll))."""
     """Tiles over y/x so RAM stays bounded. Each tile is read with a `margin` (>= half a window: the teacher
@@ -59,12 +59,16 @@ def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=256, halo=32, tile=2048
     if tta > 1:
         fn = flips(fn, tta)
     preps = [None] + [(lambda c, _, l=l: data.zscore(l[c])[None]) for l in luts]
+    if gpu_acc:  # everything on the card (predict.slide_gpu); intensity LUTs stay on the CPU path
+        assert not luts, "gpu_acc has no LUT support"
+        preps = [lambda c, _: zscore_t(c)[None]]
     ct, arr = data.open_zarr(volume), out_array(out, (Z, Y, X), (z0, y0, x0), volume=volume)
     for y in range(0, Y, tile):
         for x in range(0, X, tile):
             ya, yb, xa, xb = max(y - margin, 0), min(y + tile + margin, Y), max(x - margin, 0), min(x + tile + margin, X)
             roi = ct[z0:z0 + Z, y0 + ya:y0 + yb, x0 + xa:x0 + xb]
-            prob = sum(slide(fn, roi, window, halo, dev, pr) for pr in preps) / len(preps) if roi.any() else np.zeros(roi.shape, np.float32)
+            sl = slide_gpu if gpu_acc else slide
+            prob = sum(sl(fn, roi, window, halo, dev, pr) for pr in preps) / len(preps) if roi.any() else np.zeros(roi.shape, np.float32)
             prob = prob[:, y - ya:y - ya + tile, x - xa:x - xa + tile]
             arr[:, y:y + prob.shape[1], x:x + prob.shape[2]] = np.clip(np.rint(prob * 255), 0, 255).astype(np.uint8)
             print(f"tile y={y} x={x} done", flush=True)

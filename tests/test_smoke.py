@@ -38,3 +38,15 @@ def test_train_and_predict(tmp_path, monkeypatch):
     assert a.shape == (1, 64, 64, 64) and a.dtype == np.uint8
     assert a.attrs["origin_zyx"] == [0, 0, 0] and a.attrs["channels"] == ["recto"]
     assert np.isfinite(a[:]).all()
+
+
+def test_slide_gpu_matches_slide():
+    import numpy as np, torch
+    from usrm2 import predict as P
+    rng = np.random.default_rng(0)
+    roi = rng.integers(1, 255, (40, 56, 48), dtype=np.uint8)
+    roi[:, :8] = 0  # masked strip
+    fn = lambda t: torch.sigmoid(t[0, 0] * 0.1)
+    a = P.slide(fn, roi, 32, 4, torch.device("cpu"))
+    b = P.slide_gpu(fn, roi, 32, 4, torch.device("cpu"), lambda c, o: P.zscore_t(c)[None])
+    assert a.shape == b.shape and np.abs(a - b).max() < 2e-2 and np.abs(a - b).mean() < 1e-3 and (b[:, :8] == 0).all()  # fp16 accumulators

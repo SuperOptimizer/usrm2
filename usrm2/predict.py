@@ -40,6 +40,41 @@ def slide(fn, roi, window, halo, dev, prep=None):
     return np.where((wsum > 0) & (roi > 0), acc / np.maximum(wsum, 1e-6), 0)  # masked CT (0) -> no surface
 
 
+def slide_gpu(fn, roi, window, halo, dev, prep):
+    """slide() with the ROI, the normalization and the (fp16) accumulators all on the GPU: no per-window CPU
+    work, for cards with room (a 384x2048x2048 box needs ~8 GB + the model). prep(ct_window uint8 tensor,
+    (z,y,x)) -> (C,w,w,w) float tensor; masked CT (0) -> no surface, as in slide()."""
+    R = torch.from_numpy(np.ascontiguousarray(roi)).to(dev)
+    acc = torch.zeros(R.shape, dtype=torch.float16, device=dev)
+    wsum = torch.zeros_like(acc)
+    g = torch.from_numpy(gauss(window)).to(dev).half()
+    Z, Y, X = R.shape
+    stride = window - 2 * halo
+    with torch.no_grad():
+        for z in starts(Z, window, stride):
+            for y in starts(Y, window, stride):
+                for x in starts(X, window, stride):
+                    c = R[z:z + window, y:y + window, x:x + window]
+                    if not c.any():
+                        continue
+                    t = prep(c, (z, y, x))[None].contiguous(memory_format=torch.channels_last_3d)
+                    with autocast(dev):
+                        p = fn(t)
+                    acc[z:z + window, y:y + window, x:x + window] += (p.float() * g.float()).half()
+                    wsum[z:z + window, y:y + window, x:x + window] += g
+        out = np.empty(R.shape, np.float32)
+        for z in range(0, Z, 64):  # a slab at a time keeps the float32 temporaries small
+            a, w, r = acc[z:z + 64].float(), wsum[z:z + 64].float(), R[z:z + 64]
+            out[z:z + 64] = torch.where((w > 0) & (r > 0), a / w.clamp_min(1e-6), torch.zeros_like(a)).cpu().numpy()
+    del R, acc, wsum
+    return out
+
+
+def zscore_t(c):
+    x = c.float()
+    return (x - x.mean()) / (x.std() + 1e-3)
+
+
 def out_array(path, shape, origin, volcomp=True, volume=None, umbilicus=None):
     import zarr
     try:
