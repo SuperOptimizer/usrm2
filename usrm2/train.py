@@ -1,6 +1,7 @@
 """Distillation training: BCE + soft dice against the teacher's soft probabilities."""
 import json
 import math
+import os
 
 import numpy as np
 import time
@@ -99,17 +100,28 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     """accum: gradient accumulation (micro-batches per optimizer step), for big models on small cards.
     lr_floor: the cosine decays to lr_floor * lr instead of 0. norm: "patch" (per-patch z-score) or "global"
     (fixed scan mean/std, stored in the checkpoint). dense_pow / ridge_w: see data.Patches / losses.
-    wtgt: target channels that carry loss weights (verso targets from verso.py), e.g. (2, 3) for a 4-head student."""
+    wtgt: target channels that carry loss weights (verso targets from verso.py), e.g. (2, 3) for a 4-head student.
+    Multi-GPU: launch with `torchrun --nproc_per_node N -m usrm2.cli train ...`; every rank draws its own patches
+    (seed offset), gradients are all-reduced (DDP), rank 0 evaluates, logs and saves. One optimizer step then sees
+    N * batch * accum patches."""
+    rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
+    main = rank == 0
+    if world > 1:
+        import torch.distributed as dist
+        dist.init_process_group("nccl")
+        local = int(os.environ.get("LOCAL_RANK", rank))
+        torch.cuda.set_device(local)
+        device = f"cuda:{local}"
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     cfg = dict(A.get(aug), **({"norad": True} if no_radial else {}))
     no_radial = bool(cfg.get("norad"))
     args = dict(size=size, steps=steps, patch=patch, batch=batch, lr=lr, aug=aug, aug_cfg=cfg,
                 no_radial=no_radial, accum=accum, ema_decay=ema_decay, lr_floor=lr_floor, ridge_w=ridge_w, wtgt=list(wtgt),
-                dense_pow=dense_pow, norm=norm, ctx=list(ctx), **kw)
+                dense_pow=dense_pow, norm=norm, ctx=list(ctx), world=world, **kw)
     if norm == "global":
         args["norm_stats"] = data.global_norm(kw.get("ct", data.CT))
-        print("global normalization", args["norm_stats"], flush=True)
+        main and print("global normalization", args["norm_stats"], flush=True)
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     grid = data.val_grid(patch=patch, ct=kw.get("ct", data.CT), store=kw.get("val", data.VAL), limit=val_patches, ctx=ctx)
     assert grid, f"validation store {kw.get('val', data.VAL)} is smaller than the patch ({patch})"
@@ -130,7 +142,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
             j = torch.arange(cout, device=hw.device) % hw.shape[0]
             src["head.weight"], src["head.bias"] = hw[j].clone(), hb[j].clone()
         missing = net.load_state_dict(src, strict=False)
-        print(f"warm start from {init_from}: {len(missing.missing_keys)} missing, {len(missing.unexpected_keys)} unexpected", flush=True)
+        main and print(f"warm start from {init_from}: {len(missing.missing_keys)} missing, {len(missing.unexpected_keys)} unexpected", flush=True)
         args["init_from"] = str(init_from)
     opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min((s + 1) / warmup, 1.0) *
@@ -155,14 +167,19 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
             x[-3:] = 0
     evnet = M.build(size, verbose=False, cout=cout, cin=cin).to(dev)
     dl = data.loader(patch, batch, workers, ct=kw.get("ct", data.CT), stores=kw.get("stores", data.TRAIN),
-                     exclude=kw.get("val", data.VAL), seed=step, sym=cfg.get("sym", True), aug=cfg, dense_pow=dense_pow, ctx=ctx)
+                     exclude=kw.get("val", data.VAL), seed=step + 7919 * rank, sym=cfg.get("sym", True), aug=cfg, dense_pow=dense_pow, ctx=ctx)
+    model = torch.nn.parallel.DistributedDataParallel(net, device_ids=[dev.index]) if world > 1 else net
 
     def save():  # atomic: an interrupted write never loses the last resumable state
+        if not main:
+            return
         torch.save({"model": net.state_dict(), "ema": ema, "opt": opt.state_dict(),
                     "step": step, "args": args}, ck.with_suffix(".tmp"))
         ck.with_suffix(".tmp").replace(ck)
 
     def log(name, rec):
+        if not main:
+            return
         with open(out / name, "a") as f:
             f.write(json.dumps(rec) + "\n")
         print(name, rec, flush=True)
@@ -175,7 +192,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         ct, tg = A.apply(ct.to(dev, non_blocking=True), tg.to(dev, non_blocking=True), cfg)
         ct = ct.to(memory_format=torch.channels_last_3d)
         with autocast(dev):
-            bce, dice = losses(net(ct).float(), tg, ridge_w, wtgt)
+            bce, dice = losses(model(ct).float(), tg, ridge_w, wtgt)
         loss = bce + dice
         (loss / accum).backward()
         micro += 1
@@ -189,10 +206,10 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         if step % 20 == 0:
             dt = time.time() - t0
             log("train.jsonl", {"step": step, "loss": loss.item(), "bce": bce.item(), "dice": dice.item(),
-                                "lr": sched.get_last_lr()[0], "vox_s": round(20 * accum * batch * patch ** 3 / dt),
+                                "lr": sched.get_last_lr()[0], "vox_s": round(20 * accum * batch * world * patch ** 3 / dt),
                                 "vram_MiB": round(torch.cuda.max_memory_allocated() / 2 ** 20) if dev.type == "cuda" else 0})
             t0 = time.time()
-        if step % eval_every == 0 or step == steps:
+        if (step % eval_every == 0 or step == steps) and main:
             evnet.load_state_dict(ema)
             log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev, wtgt)})
             try:
@@ -202,4 +219,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
             save()
             t0 = time.time()
     save()
+    if world > 1:
+        dist.barrier()
+        dist.destroy_process_group()
     return ck
