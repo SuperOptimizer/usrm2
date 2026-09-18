@@ -35,9 +35,9 @@ class UNet(nn.Module):
         return self.head(x)
 
 
-def build(size="1m", verbose=True, cout=1):
-    m = UNet(PRESETS[size], cout=cout).to(memory_format=torch.channels_last_3d)
+def build(size="1m", verbose=True, cout=1, cin=4):
+    m = UNet(PRESETS[size], cin=cin, cout=cout).to(memory_format=torch.channels_last_3d)
     n = sum(p.numel() for p in m.parameters())
     if verbose:
-        print(f"usrm2 UNet {size} widths={PRESETS[size]} heads={cout} params={n / 1e6:.2f}M")
+        print(f"usrm2 UNet {size} widths={PRESETS[size]} in={cin} heads={cout} params={n / 1e6:.2f}M")
     return m

@@ -22,6 +22,8 @@ def main(argv=None):
     t.add_argument("--ridge-w", type=float, default=0.0, help="extra BCE weight on the band core (target >= 0.9)")
     t.add_argument("--dense-pow", type=float, default=0.0, help="bias sampling towards sheet-dense patches (1-2)")
     t.add_argument("--norm", default="patch", choices=["patch", "global"], help="per-patch z-score or fixed scan mean/std")
+    t.add_argument("--ctx", type=int, nargs="*", default=(), help="coarse context channels: pyramid levels, e.g. 1 2 3 = 4.8/9.6/19.2um cubes")
+    t.add_argument("--init-from", default=None, help="warm start from this checkpoint's EMA weights (new input channels start at zero)")
     t.add_argument("--resume", action="store_true")
     t.add_argument("--stores", nargs="+", default=None, help="teacher stores to train on (default: data.TRAIN); "
                    "'a.zarr,a_m7.zarr' = several teachers over one box, one head each")
@@ -122,7 +124,7 @@ def main(argv=None):
         data.UMBILICUS = a.umbilicus
     if a.cmd == "train":
         T.train(a.out_dir, accum=a.accum, ema_decay=a.ema, lr_floor=a.lr_floor, ridge_w=a.ridge_w, dense_pow=a.dense_pow,
-                norm=a.norm, size=a.size, steps=a.steps, patch=a.patch, batch=a.batch, lr=a.lr,
+                norm=a.norm, ctx=tuple(a.ctx), init_from=a.init_from, size=a.size, steps=a.steps, patch=a.patch, batch=a.batch, lr=a.lr,
                 workers=a.workers, eval_every=a.eval_every, val_patches=a.val_patches, resume=a.resume,
                 aug=a.aug, no_radial=a.no_radial,
                 **{k: v for k, v in dict(stores=a.stores, val=a.val).items() if v})
@@ -136,14 +138,14 @@ def main(argv=None):
         import torch
         st = torch.load(a.ckpt, map_location="cpu")
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        net = model.build(st["args"]["size"], cout=st["args"].get("cout", 1)).to(dev)
+        net = model.build(st["args"]["size"], cout=st["args"].get("cout", 1), cin=st["args"].get("cin", 4)).to(dev)
         net.load_state_dict({k: v.to(dev) for k, v in st["ema"].items()})
         sa = st["args"]  # the run's own validation set unless overridden
-        grid = data.val_grid(patch=a.patch, limit=a.val_patches, ct=a.ct or sa.get("ct", data.CT), store=a.val or sa.get("val", data.VAL))
+        grid = data.val_grid(patch=a.patch, limit=a.val_patches, ct=a.ct or sa.get("ct", data.CT), store=a.val or sa.get("val", data.VAL), ctx=tuple(sa.get("ctx") or ()))
         print("val", a.val or sa.get("val", data.VAL))
         if st["args"].get("no_radial"):
             for x, _ in grid:
-                x[1:] = 0
+                x[-3:] = 0
         print(st["step"], T.evaluate(net, grid, dev))
     elif a.cmd == "evalsurf":
         from usrm2 import evalsurf as E

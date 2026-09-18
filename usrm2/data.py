@@ -140,26 +140,71 @@ def augment(rng, x, tg):
     sl = tuple(slice(None, None, -1 if f else 1) for f in flip)
     tg = np.ascontiguousarray(np.transpose(tg, (0,) + tuple(perm + 1))[(slice(None),) + sl])
     x = np.transpose(x, (0,) + tuple(perm + 1))[(slice(None),) + sl]
-    x = np.concatenate([x[:1], x[1 + perm] * np.where(flip, -1, 1).astype(np.float32)[:, None, None, None]])
+    ni = x.shape[0] - 3  # the radial vector is the last 3 channels
+    x = np.concatenate([x[:ni], x[ni + perm] * np.where(flip, -1, 1).astype(np.float32)[:, None, None, None]])
     return np.ascontiguousarray(x), tg
 
 
-def inputs(ct, rad):
-    """Model input (4,Z,Y,X): z-scored CT + radial unit vector."""
-    return np.concatenate([zscore(ct)[None], rad])
+CTX_CACHE = {}
+
+
+def levels(volume):
+    """The pyramid levels of a volume path '.../name.zarr/0' -> {level: zarr array} for the levels on disk."""
+    base = str(volume).rstrip("/").rsplit("/", 1)[0]
+    if base not in CTX_CACHE:
+        d = {}
+        for l in range(1, 4):
+            try:
+                d[l] = open_zarr(f"{base}/{l}")
+            except Exception:
+                break
+        CTX_CACHE[base] = d
+    return CTX_CACHE[base]
+
+
+def context(volume, origin, shape, ctx):
+    """Coarse cubes of the SAME size centred on the same point as the level-0 patch at `origin`/`shape`:
+    one (Z,Y,X) uint8 cube per level in `ctx` (1 = 4.8um, 2 = 9.6um, 3 = 19.2um), read from the pyramid;
+    a level that is not on disk is made by 2x mean-pooling the level below. Outside the volume = 0 (air)."""
+    lv, out = levels(volume), []
+    c0 = np.asarray(origin, np.int64) + np.asarray(shape, np.int64) // 2  # centre, level-0 voxels
+    for l in ctx:
+        src = l if l in lv else max(lv) if lv else None
+        assert src is not None, f"{volume} has no pyramid levels for context channels"
+        f_read, extra = 2 ** src, 2 ** (l - src)  # read at `src`, pool by `extra`
+        n = np.asarray(shape, np.int64) * extra
+        lo = c0 // f_read - n // 2
+        a = lv[src]
+        hi = np.minimum(lo + n, a.shape[-3:])
+        lo_c = np.maximum(lo, 0)
+        cube = np.zeros(tuple(n), np.uint8)
+        if (hi > lo_c).all():
+            blk = a[lo_c[0]:hi[0], lo_c[1]:hi[1], lo_c[2]:hi[2]]
+            s = lo_c - lo
+            cube[s[0]:s[0] + blk.shape[0], s[1]:s[1] + blk.shape[1], s[2]:s[2] + blk.shape[2]] = blk
+        if extra > 1:
+            e = extra
+            cube = cube.reshape(shape[0], e, shape[1], e, shape[2], e).mean((1, 3, 5)).astype(np.uint8)
+        out.append(cube)
+    return out
+
+
+def inputs(ct, rad, ctx=()):
+    """Model input (1+len(ctx)+3, Z,Y,X): z-scored CT, z-scored coarse context cubes, radial unit vector."""
+    return np.concatenate([zscore(ct)[None]] + [zscore(c)[None] for c in ctx] + [rad])
 
 
 class Patches(torch.utils.data.IterableDataset):
     """Random (ct, teacher) patches; train patches never touch the val box."""
 
     def __init__(self, patch=128, ct=CT, stores=TRAIN, exclude=VAL, seed=0, air_keep=0.1, fg_min=0.05,
-                 fg_keep=0.25, sym=True, aug=None, dense_pow=0.0, dense_ref=0.2):
+                 fg_keep=0.25, sym=True, aug=None, dense_pow=0.0, dense_ref=0.2, ctx=()):
         """dense_pow > 0 biases sampling towards sheet-dense patches: a patch whose target mean m is below
         dense_ref is kept with probability (m / dense_ref) ** dense_pow (crushed windings are where students fail)."""
         super().__init__()
         self.patch, self.ct_path, self.paths, self.seed = patch, ct, [str(s).split(",") for s in stores], seed
         self.exclude = [e for e in (exclude if isinstance(exclude, (list, tuple)) else [exclude]) if e]
-        self.dense_pow, self.dense_ref = dense_pow, dense_ref
+        self.dense_pow, self.dense_ref, self.ctx = dense_pow, dense_ref, tuple(ctx)  # coarse context levels
         self.sym = sym  # the 48 cube symmetries; the GPU augs are in aug.py
         self.aug = aug or {}  # the worker-side raw-uint8 stage: window / volcomp / blank
         self.air_keep, self.fg_min, self.fg_keep = air_keep, fg_min, fg_keep  # low-foreground patches are mostly skipped
@@ -214,17 +259,18 @@ class Patches(torch.utils.data.IterableDataset):
                 if self.dense_pow > 0 and m < self.dense_ref and rng.random() > (m / self.dense_ref) ** self.dense_pow:
                     continue
                 ct = raw(rng, ct, self.aug)
-            rejected, x = 0, inputs(ct, radial(self.axes[i], g, ct.shape))
+            cx = context(self.vols[i], g, ct.shape, self.ctx) if self.ctx else ()
+            rejected, x = 0, inputs(ct, radial(self.axes[i], g, ct.shape), cx)
             if self.sym:
                 x, tg = augment(rng, x, tg)
             yield torch.from_numpy(x), torch.from_numpy(tg)
 
 
-def val_grid(patch=128, ct=CT, store=VAL, limit=32):
+def val_grid(patch=128, ct=CT, store=VAL, limit=32, ctx=()):
     """Deterministic non-overlapping tiling of the val box(es) -> list of (ct, tgt). `store` may be a list of
     boxes (each a comma-joined teacher group); `limit` patches are taken from each."""
     if isinstance(store, (list, tuple)):
-        return [x for s in store for x in val_grid(patch, ct, s, limit)]
+        return [x for s in store for x in val_grid(patch, ct, s, limit, ctx)]
     heads = [open_zarr(q) for q in str(store).split(",")]
     tga = heads[0]
     cta, ax = open_zarr(tga.attrs.get("volume", ct)), axis(tga.attrs.get("umbilicus", UMBILICUS))
@@ -239,7 +285,9 @@ def val_grid(patch=128, ct=CT, store=VAL, limit=32):
         g = o + np.array(lo)
         c = cta[g[0]:g[0] + patch, g[1]:g[1] + patch, g[2]:g[2] + patch]
         t = np.stack([read3(a, lo, patch) for a in heads]).astype(np.float32) / 255.0 * (c > 0)
-        out.append((torch.from_numpy(inputs(c, radial(ax, g, c.shape))), torch.from_numpy(t)))
+        vol = tga.attrs.get("volume", ct)
+        cx = context(vol, g, c.shape, ctx) if ctx else ()
+        out.append((torch.from_numpy(inputs(c, radial(ax, g, c.shape), cx)), torch.from_numpy(t)))
     return out
 
 

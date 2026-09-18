@@ -15,12 +15,12 @@ def preview(ckpt, png, patch, ct, val, no_radial=False):
     from PIL import Image
     st = torch.load(ckpt, map_location="cpu")
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net = M.build(st["args"]["size"], verbose=False, cout=st["args"].get("cout", 1)).to(dev)
+    net = M.build(st["args"]["size"], verbose=False, cout=st["args"].get("cout", 1), cin=st["args"].get("cin", 4)).to(dev)
     net.load_state_dict({k: v.to(dev) for k, v in st["ema"].items()})
     net.eval()
     x, t = data.val_grid(patch=patch, ct=ct, store=val, limit=1)[0]
     if no_radial:
-        x[1:] = 0
+        x[-3:] = 0
     with torch.no_grad(), T.autocast(dev):
         p = torch.sigmoid(net(x[None].to(dev)).float())[0, 0, patch // 2].cpu().numpy()
     c = x[0, patch // 2].numpy()

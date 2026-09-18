@@ -148,3 +148,49 @@ def test_continuity_metric_prefers_unbroken_bands(tmp_path):
     broken = full.copy(); broken[:, :, ::8] = 0  # a gap every 8 voxels along x
     cf, cb = (E.continuity(v, (0, 0, 0), (64, 64, 64), tifxyz=str(tmp_path), ax=ax, min_pts=50) for v in (full, broken))
     assert cf["continuity"] > 0.95 and cb["continuity"] < cf["continuity"] - 0.3 and cb["hit_frac"] < cf["hit_frac"]
+
+
+def test_context_cubes_are_centred_and_pooled(tmp_path, monkeypatch):
+    import numpy as np, zarr
+    from usrm2 import data
+    # a tiny pyramid: level 0 64^3 with a bright block, level 1 = 2x mean pool, level 2 = 4x
+    v0 = np.zeros((64, 64, 64), np.uint8); v0[16:48, 16:48, 16:48] = 200
+    root = tmp_path / "vol.zarr"; root.mkdir()
+    for l, v in enumerate([v0, v0.reshape(32, 2, 32, 2, 32, 2).mean((1, 3, 5)).astype(np.uint8),
+                           v0.reshape(16, 4, 16, 4, 16, 4).mean((1, 3, 5)).astype(np.uint8)]):
+        a = zarr.create_array(str(root / str(l)), shape=v.shape, chunks=v.shape, dtype="uint8"); a[:] = v
+    monkeypatch.setattr(data, "CTX_CACHE", {})
+    cubes = data.context(str(root / "0"), (16, 16, 16), (32, 32, 32), ctx=(1, 2, 3))
+    assert [c.shape for c in cubes] == [(32, 32, 32)] * 3
+    assert cubes[0][8:24, 8:24, 8:24].min() == 200 and cubes[0][:4].max() == 0      # 4.8um cube: the block is the middle half
+    assert cubes[1][12:20, 12:20, 12:20].min() == 200 and cubes[1][:8].max() == 0  # 9.6um: quarter
+    assert cubes[2].shape == (32, 32, 32) and cubes[2][14:18, 14:18, 14:18].min() == 200  # 19.2um pooled from level 2
+    x = data.inputs(v0[:32, :32, :32], np.zeros((3, 32, 32, 32), np.float32), cubes)
+    assert x.shape == (7, 32, 32, 32)
+
+
+def test_augment_and_apply_keep_extra_channels_and_flip_only_the_vector():
+    import numpy as np, torch
+    from usrm2 import data, aug as A
+    rng = np.random.default_rng(0)
+    x = np.zeros((7, 8, 8, 8), np.float32); x[:4] = rng.random((4, 8, 8, 8)); x[6] = 1.0  # radial = +x
+    t = np.zeros((1, 8, 8, 8), np.float32)
+    y, _ = data.augment(rng, x, t)
+    assert y.shape == x.shape and np.allclose(np.linalg.norm(y[4:], axis=0), 1.0)
+    xb = torch.from_numpy(x)[None]
+    yb, _ = A.apply(xb.clone(), torch.from_numpy(t)[None], A.get("all3"))
+    assert yb.shape == xb.shape and torch.isfinite(yb).all()
+    n = yb[0, 4:].norm(dim=0); assert ((n - 1).abs() < 1e-3).float().mean() > 0.9  # still unit vectors
+
+
+def test_warm_start_widens_the_first_conv_without_changing_the_output():
+    import torch
+    from usrm2 import model as M
+    old = M.build("1m", verbose=False, cin=4); new = M.build("1m", verbose=False, cin=7)
+    src = old.state_dict(); w = src["enc.0.0.weight"]
+    w2 = torch.zeros(w.shape[0], 7, *w.shape[2:]); w2[:, :1], w2[:, 4:] = w[:, :1], w[:, 1:]
+    src["enc.0.0.weight"] = w2; new.load_state_dict(src)
+    x = torch.randn(1, 7, 16, 16, 16); x4 = torch.cat([x[:, :1], x[:, 4:]], 1)
+    old.eval(); new.eval()
+    with torch.no_grad():
+        assert torch.allclose(old(x4), new(x), atol=1e-5)

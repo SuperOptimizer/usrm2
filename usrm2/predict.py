@@ -178,8 +178,9 @@ def flips_vec(fn, n=8):
         out = 0
         for f in fl:
             x = torch.flip(t, [2 + d for d in f]).clone()
+            ni = x.shape[1] - 3
             for d in f:
-                x[:, 1 + d] = -x[:, 1 + d]
+                x[:, ni + d] = -x[:, ni + d]
             out = out + torch.flip(fn(x), [1 + d for d in f])
         return out / len(fl)
     return go
@@ -194,14 +195,16 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
     head: which head of a multi-teacher student (int), or "mean" / "prod" / "max" over all heads."""
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     st = torch.load(ckpt, map_location=dev)
-    net = M.build(st["args"]["size"], verbose=False, cout=st["args"].get("cout", 1)).to(dev)
+    net = M.build(st["args"]["size"], verbose=False, cout=st["args"].get("cout", 1), cin=st["args"].get("cin", 4)).to(dev)
     net.load_state_dict(st["ema"])
     net.eval()
     roi, ax = data.open_zarr(volume)[z0:z0 + Z, y0:y0 + Y, x0:x0 + X], data.axis()
     r = 0.0 if st["args"].get("no_radial") else 1.0  # training zeroed the radial channels
     data.NORM = tuple(st["args"]["norm_stats"]) if st["args"].get("norm") == "global" else None  # as trained
     rad = lambda c, o: data.radial(ax, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape) * r
-    preps = [lambda c, o: data.inputs(c, rad(c, o))] + [(lambda c, o, l=l: data.inputs(l[c], rad(c, o))) for l in luts]
+    ctx = tuple(st["args"].get("ctx") or ())
+    cx = (lambda c, o: data.context(volume, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape, ctx)) if ctx else (lambda c, o: ())
+    preps = [lambda c, o: data.inputs(c, rad(c, o), cx(c, o))] + [(lambda c, o, l=l: data.inputs(l[c], rad(c, o), cx(c, o))) for l in luts]
     pick = HEADS[head] if isinstance(head, str) else (lambda p: p[:, int(head)])
     fn = lambda t: pick(torch.sigmoid(net(t)))  # (B,C,...) -> (B,...)
     if tta > 1:

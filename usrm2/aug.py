@@ -63,9 +63,10 @@ def warp(x, tg, M, el=None):
         grid = _elastic(grid, *el)
     g = dict(mode="bilinear", padding_mode="reflection", align_corners=False)
     o, tg = F.grid_sample(x.float(), grid, **g), F.grid_sample(tg.float(), grid, **g)
-    v = torch.einsum("bij,bjzyx->bizyx", M.inverse(), o[:, [3, 2, 1]])[:, [2, 1, 0]]  # zyx <-> xyz
+    ni = o.shape[1] - 3  # image channels first, the radial vector is the last 3
+    v = torch.einsum("bij,bjzyx->bizyx", M.inverse(), o[:, [ni + 2, ni + 1, ni]])[:, [2, 1, 0]]  # zyx <-> xyz
     n = v.norm(dim=1, keepdim=True)
-    return torch.cat([o[:, :1], v / n.clamp_min(1e-6) * (n > 1e-3)], 1), tg.clamp(0, 1)
+    return torch.cat([o[:, :ni], v / n.clamp_min(1e-6) * (n > 1e-3)], 1), tg.clamp(0, 1)
 
 
 def spatial(x, tg, cfg):
@@ -116,7 +117,8 @@ def _blur1(c, s):  # separable gaussian; s is one sigma for the whole batch or o
         pad[2 * (2 - d)] = pad[2 * (2 - d) + 1] = r
         sh = [1, 1, 1, 1, 1]
         sh[2 + d] = -1
-        c = F.conv3d(F.pad(c, pad, mode="replicate"), g.view(sh))
+        C = c.shape[1]
+        c = F.conv3d(F.pad(c, pad, mode="replicate"), g.view(sh).expand(C, 1, *sh[2:]).contiguous(), groups=C)
     return c
 
 
@@ -326,8 +328,9 @@ def _sheetcomp(x, tg, k, m):
     g[..., 2 - d] = g[..., 2 - d] + dis[:, 0] * (2.0 / S[d])  # out->in: advance faster through air = gaps shrink
     gs = dict(mode="bilinear", padding_mode="border", align_corners=False)
     o, tg = F.grid_sample(x, g, **gs), F.grid_sample(tg, g, **gs)
-    n = o[:, 1:].norm(dim=1, keepdim=True)
-    return torch.cat([o[:, :1], o[:, 1:] / n.clamp_min(1e-6) * (n > 1e-3)], 1), tg.clamp(0, 1)
+    ni = o.shape[1] - 3
+    n = o[:, ni:].norm(dim=1, keepdim=True)
+    return torch.cat([o[:, :ni], o[:, ni:] / n.clamp_min(1e-6) * (n > 1e-3)], 1), tg.clamp(0, 1)
 
 
 # pipeline order (tsm's, extended): resolution -> sharpen -> class contrast -> photometric ->
@@ -370,7 +373,8 @@ def _cor(x, k, m):
     radial channels give it), with an amplitude that grows with the in-plane distance from the
     patch centre and vanishes on it."""
     b, dev, S = x.shape[0], x.device, x.shape[2:]
-    c, d = x[:, :1], x[:, 1:]
+    ni = x.shape[1] - 3
+    c, d = x[:, :ni], x[:, ni:]
     o = torch.stack([d[:, 2] / S[2], d[:, 1] / S[1], d[:, 0] / S[0]], -1) * 2 * (_p(c, k["lo"], k["hi"]) * m)
     g = F.affine_grid(torch.cat([_eye(b, dev), torch.zeros(b, 3, 1, device=dev)], 2), (b, 1, *S),
                       align_corners=False)
@@ -398,15 +402,17 @@ def intensity(c, cfg):
 
 
 def apply(x, tg, cfg):
-    """(B,4,Z,Y,X) input + (B,1,Z,Y,X) target -> augmented pair (float32)."""
+    """(B,C,Z,Y,X) input (image channels, then the 3 radial-vector channels) + (B,T,Z,Y,X) target -> augmented
+    pair (float32). Intensity augs act on every image channel with the same per-sample parameters."""
     if not cfg:
         return x, tg
+    ni = x.shape[1] - 3
     x, tg = spatial(x.float(), tg.float(), cfg)
-    x = torch.cat([intensity(x[:, :1], cfg), x[:, 1:]], 1)
+    x = torch.cat([intensity(x[:, :ni], cfg), x[:, ni:]], 1)
     if cfg.get("cor"):  # needs the radial channels for the shift direction, so not in `intensity`
         x = _cor(x, cfg["cor"], _m(x.shape[0], x.device, cfg["cor"]["p"]))
     if cfg.get("norad"):
-        x[:, 1:] = 0
+        x[:, ni:] = 0
     return x, tg
 
 
