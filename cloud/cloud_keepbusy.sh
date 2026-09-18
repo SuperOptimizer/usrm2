@@ -7,7 +7,11 @@ while true; do
   for h in tnr-0 tnr-1; do
     if ! ssh -o ConnectTimeout=20 $h "pgrep -f 'cloud/run_boxes.s[h]' > /dev/null" 2>/dev/null; then
       st=$(ssh -o ConnectTimeout=20 $h "echo up" 2>/dev/null); [ "$st" = "up" ] || { echo "$(date) $h unreachable"; continue; }
-      S=$(cat ~/cloud_seed_next); echo $((S + 1)) > ~/cloud_seed_next
+      if [ -s ~/cloud_backfill ]; then  # seeds that ended short (a dead worker): re-run, finished boxes are skipped
+        S=$(head -1 ~/cloud_backfill); sed -i 1d ~/cloud_backfill
+      else
+        S=$(cat ~/cloud_seed_next); echo $((S + 1)) > ~/cloud_seed_next
+      fi
       ssh $h "PROCS=3 SIZE=\"384 1024 1024\" USRM2_CUDNN_BENCH=0 bash inst_relaunch.sh $S 200" | tail -1
       nohup bash cloud/pull.sh $h $S > ~/cloud_pull_$S.log 2>&1 &
       echo "$(date) $h idle -> seed $S started"

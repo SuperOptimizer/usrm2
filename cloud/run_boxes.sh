@@ -14,7 +14,7 @@ O=~/out; mkdir -p $O
 for attempt in 1 2 3 4 5 6; do  # a streaming error kills the process; finished boxes are skipped on the retry
   for d in $O/boxes$S/box_*.zarr; do [ -d "$d" ] && ! grep -q "$(basename $d)" $O/boxes$S.log 2>/dev/null && rm -rf "$d"; done
   usrm2 teacher-boxes $O/boxes$S --n $N --seed $S --size $SZ --volume $V --exclude ~/eval.zarr --backend $B --gpu-acc --procs $P >> $O/boxes$S.log 2>&1
-  grep -q "^box $N/$N" $O/boxes$S.log && break
+  [ "$(grep "^box " $O/boxes$S.log | sort -u | wc -l)" -ge "$N" ] && break  # every shard's boxes, not just the last line
   echo "retry $attempt $(date)" >> $O/boxes$S.log; sleep 30
 done
 for b in $O/boxes$S/box_*.zarr; do
