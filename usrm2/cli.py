@@ -206,10 +206,20 @@ def main(argv=None):
         from usrm2 import verso
         groups = a.stores[::-1] if a.reverse else a.stores
         groups = groups[a.shard[0]::a.shard[1]] if a.shard else groups
+        import torch
+        failed = 0
         for i, g in enumerate(groups):
             t0 = time.time()
-            outs = verso.run(g, a.ckpt, window=a.window, halo=a.halo, tile=a.tile, margin=a.margin, force=a.force, batch=a.batch, modes=tuple(a.modes))
+            try:
+                outs = verso.run(g, a.ckpt, window=a.window, halo=a.halo, tile=a.tile, margin=a.margin, force=a.force, batch=a.batch, modes=tuple(a.modes))
+            except torch.OutOfMemoryError as e:  # one oversized group must not kill the shard: it is left without `done` (a later pass redoes it)
+                failed += 1
+                print(f"verso {i + 1}/{len(groups)} {g} FAILED (OOM: {str(e)[:80]}) ({time.time() - t0:.0f} s)", flush=True)
+                torch.cuda.empty_cache()
+                continue
             print(f"verso {i + 1}/{len(groups)} {g} -> {outs} ({time.time() - t0:.0f} s)", flush=True)
+        if failed:
+            print(f"verso: {failed} groups failed (OOM); rerun with a smaller --tile to fill them", flush=True)
     else:
         from usrm2 import teacher
         vol = a.volume or data.CT
