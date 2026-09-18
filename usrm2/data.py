@@ -158,8 +158,9 @@ CTX_CACHE = {}
 
 
 def levels(volume):
-    """The pyramid levels of a volume path '.../name.zarr/0' -> {level: zarr array} for the levels on disk."""
-    base = str(volume).rstrip("/").rsplit("/", 1)[0]
+    """The pyramid levels of a volume path '.../name.zarr/0' -> {level: zarr array} for the levels on disk
+    (a streamed URL is mapped to its local mirror first: stores made in the cloud record the URL)."""
+    base = str(local(str(volume))).rstrip("/").rsplit("/", 1)[0]
     if base not in CTX_CACHE:
         d = {}
         for l in range(1, 4):
