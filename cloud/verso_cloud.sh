@@ -19,8 +19,8 @@ for dd in $O/boxes*/; do d=$(basename ${dd%/}); case $d in *_m7|*_v|*_vraw) cont
     G="$G $b,$O/${d}_m7/$n"
   done
 done
-W=${WORKERS:-5}
-echo "verso (cloud) for $(echo $G | wc -w) groups, $W workers: $(date)"
-for i in $(seq 0 $((W - 1))); do usrm2 verso ~/student.pt --shard $i $W --stores $G > ~/verso_gen_$i.out 2>&1 & done
+W=${WORKERS:-5}; TL=${TILE:-384}  # 5 workers at tile 512 occasionally spike past 48 GB (OOM); 384 leaves headroom
+echo "verso (cloud) for $(echo $G | wc -w) groups, $W workers, tile $TL: $(date)"
+for i in $(seq 0 $((W - 1))); do usrm2 verso ~/student.pt --shard $i $W --tile $TL --stores $G > ~/verso_gen_$i.out 2>&1 & done
 wait
 echo "CLOUDVERSODONE $(date)"
