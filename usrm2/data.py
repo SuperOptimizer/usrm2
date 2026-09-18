@@ -160,10 +160,13 @@ CTX_CACHE = {}
 def levels(volume):
     """The pyramid levels of a volume path '.../name.zarr/0' -> {level: zarr array} for the levels on disk
     (a streamed URL is mapped to its local mirror first: stores made in the cloud record the URL)."""
+    import os
     base = str(local(str(volume))).rstrip("/").rsplit("/", 1)[0]
     if base not in CTX_CACHE:
         d = {}
         for l in range(1, 4):
+            if "://" not in base and not os.path.isdir(f"{base}/{l}"):
+                break  # a level missing from the local mirror is pooled from the one below, never streamed
             try:
                 d[l] = open_zarr(f"{base}/{l}")
             except Exception:
