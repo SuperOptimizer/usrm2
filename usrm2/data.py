@@ -207,10 +207,17 @@ class Patches(torch.utils.data.IterableDataset):
     """Random (ct, teacher) patches; train patches never touch the val box."""
 
     def __init__(self, patch=128, ct=CT, stores=TRAIN, exclude=VAL, seed=0, air_keep=0.1, fg_min=0.05,
-                 fg_keep=0.25, sym=True, aug=None, dense_pow=0.0, dense_ref=0.2, ctx=()):
+                 fg_keep=0.25, sym=True, aug=None, dense_pow=0.0, dense_ref=0.2, ctx=(), stores_file=None,
+                 recheck=200):
         """dense_pow > 0 biases sampling towards sheet-dense patches: a patch whose target mean m is below
-        dense_ref is kept with probability (m / dense_ref) ** dense_pow (crushed windings are where students fail)."""
+        dense_ref is kept with probability (m / dense_ref) ** dense_pow (crushed windings are where students fail).
+        stores_file: instead of `stores`, a text file with one comma-joined group per line that is re-read
+        whenever its mtime changes (checked every `recheck` patches): a training run picks up new stores as
+        they are generated, and keeps sampling the old ones (by voxel count) when nothing new arrived."""
         super().__init__()
+        self.stores_file, self.recheck, self.file_mtime = stores_file, recheck, None
+        if stores_file:
+            stores = self.read_groups()
         self.patch, self.ct_path, self.paths, self.seed = patch, ct, [str(s).split(",") for s in stores], seed
         self.exclude = [e for e in (exclude if isinstance(exclude, (list, tuple)) else [exclude]) if e]
         self.dense_pow, self.dense_ref, self.ctx = dense_pow, dense_ref, tuple(ctx)  # coarse context levels
@@ -219,8 +226,23 @@ class Patches(torch.utils.data.IterableDataset):
         self.air_keep, self.fg_min, self.fg_keep = air_keep, fg_min, fg_keep  # low-foreground patches are mostly skipped
         self.arrs = None
 
+    def read_groups(self):
+        import os
+        self.file_mtime = os.path.getmtime(self.stores_file)
+        return [l.strip() for l in open(self.stores_file) if l.strip() and not l.startswith("#")]
+
+    def file_changed(self):
+        import os
+        try:
+            return self.stores_file and os.path.getmtime(self.stores_file) != self.file_mtime
+        except OSError:  # being rewritten
+            return False
+
     def _open(self):
         """Each teacher store names its CT volume and scroll axis (attrs), so stores from several scrolls can mix."""
+        if self.stores_file:
+            self.paths = [g.split(",") for g in self.read_groups()]
+            assert self.paths, f"{self.stores_file} lists no store groups"
         self.heads = [[open_zarr(q) for q in ps] for ps in self.paths]  # target channels
         for ps, h in zip(self.paths, self.heads):
             for q, a in zip(ps[1:], h[1:]):
@@ -244,10 +266,15 @@ class Patches(torch.utils.data.IterableDataset):
         info = torch.utils.data.get_worker_info()
         rng = np.random.default_rng(self.seed + 1000 * (info.id if info else 0))
         p = self.patch
-        rejected = 0
+        rejected, served = 0, 0
         while True:
             assert rejected < 10000, "no acceptable patch in 10000 draws (stores all air, or all inside the val box?)"
             rejected += 1
+            if served and served % self.recheck == 0 and self.file_changed():
+                n0 = len(self.paths)
+                self._open()  # the group list grew (or changed): re-open everything, new weights
+                print(f"stores file changed: {n0} -> {len(self.paths)} groups", flush=True)
+                served += 1
             i = rng.choice(len(self.arrs), p=self.w)
             o, s = self.boxes[i]
             lo = rng.integers(MARGIN, s - MARGIN - p + 1)  # store-local corner
@@ -272,6 +299,7 @@ class Patches(torch.utils.data.IterableDataset):
             rejected, x = 0, inputs(ct, radial(self.axes[i], g, ct.shape), cx)
             if self.sym:
                 x, tg = augment(rng, x, tg)
+            served += 1
             yield torch.from_numpy(x), torch.from_numpy(tg)
 
 

@@ -160,7 +160,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     ck = out / "ckpt.pt"
     if resume and ck.exists():
         st = torch.load(ck, map_location=dev)
-        grow = ("steps", "stores", "val")  # a continued run may train longer and on more data
+        grow = ("steps", "stores", "stores_file", "val")  # a continued run may train longer and on more data
         diff = {k: (st["args"][k], args.get(k)) for k in st["args"] if k not in grow and k != "aug_cfg" and st["args"][k] != args.get(k)}
         assert not diff, f"resume with different arguments (saved, now): {diff}"
         if st["args"].get("stores") != args.get("stores"):
@@ -175,7 +175,8 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
             x[-3:] = 0
     evnet = M.build(size, verbose=False, cout=cout, cin=cin).to(dev)
     dl = data.loader(patch, batch, workers, ct=kw.get("ct", data.CT), stores=kw.get("stores", data.TRAIN),
-                     exclude=kw.get("val", data.VAL), seed=step + 7919 * rank, sym=cfg.get("sym", True), aug=cfg, dense_pow=dense_pow, ctx=ctx)
+                     exclude=kw.get("val", data.VAL), seed=step + 7919 * rank, sym=cfg.get("sym", True), aug=cfg, dense_pow=dense_pow, ctx=ctx,
+                     stores_file=kw.get("stores_file"))  # a stores file is re-read as it grows (data.Patches)
     model = torch.nn.parallel.DistributedDataParallel(net, device_ids=[dev.index]) if world > 1 else net
 
     def save():  # atomic: an interrupted write never loses the last resumable state

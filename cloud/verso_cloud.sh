@@ -8,6 +8,10 @@ export VOLCOMP_LIB=$HOME/lib/libvolcomp.so PYTHONUNBUFFERED=1
 export USRM2_CT=https://dl.ash2txt.org/community-uploads/forrest/volcomp/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/0
 export USRM2_UMBILICUS=$HOME/umbilicus.json USRM2_VAL=$HOME/eval.zarr
 O=$HOME/out; G=""
+for z in $O/*.zarr; do  # desk-made single stores shipped up (a.zarr + a_m7.zarr)
+  n=$(basename $z .zarr); case $n in *_m7|*_v|*_vraw|eval*|p4val*) continue;; esac
+  [ -d $O/${n}_m7.zarr/c ] && G="$G $z,$O/${n}_m7.zarr"
+done
 for dd in $O/boxes*/; do d=$(basename ${dd%/}); case $d in *_m7|*_v|*_vraw) continue;; esac
   for b in $O/$d/box_*.zarr; do
     [ -d "$b" ] || continue; n=$(basename $b)

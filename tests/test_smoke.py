@@ -194,3 +194,24 @@ def test_warm_start_widens_the_first_conv_without_changing_the_output():
     old.eval(); new.eval()
     with torch.no_grad():
         assert torch.allclose(old(x4), new(x), atol=1e-5)
+
+
+def test_stores_file_is_reread_when_it_grows(tmp_path, monkeypatch):
+    import os, time
+    ct, (tr, va) = make(tmp_path)
+    umb = tmp_path / "umb.json"
+    umb.write_text(json.dumps({"control_points": [{"z": 0, "y": 128, "x": 128}, {"z": 256, "y": 128, "x": 128}]}))
+    monkeypatch.setattr(data, "UMBILICUS", str(umb))
+    f = tmp_path / "groups.txt"
+    f.write_text(tr + "\n")
+    ds = data.Patches(patch=32, ct=ct, stores_file=str(f), exclude=va, air_keep=1.0, fg_keep=1.0, recheck=3)
+    it = iter(ds)
+    for _ in range(3):
+        next(it)
+    assert len(ds.paths) == 1
+    time.sleep(0.05)
+    f.write_text(tr + "\n" + va + "\n")  # a second group appears (the val store, just as more data here)
+    os.utime(f, None)
+    for _ in range(6):
+        next(it)
+    assert len(ds.paths) == 2 and ds.exclude == [va]
