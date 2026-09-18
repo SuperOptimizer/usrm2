@@ -67,8 +67,8 @@ def slide_gpu(fn, roi, window, halo, dev, prep, batch=1, streams=1):
     accs, wsums = [], []
 
     def work(k):
-        acc, wsum = torch.zeros(R.shape, dtype=torch.float16, device=dev), torch.zeros(R.shape, dtype=torch.float16, device=dev)
-        accs.append(acc), wsums.append(wsum)
+        acc, wsum = None, torch.zeros(R.shape, dtype=torch.float16, device=dev)
+        wsums.append(wsum)
         s = torch.cuda.Stream(dev) if dev.type == "cuda" else None
         with torch.no_grad(), (torch.cuda.stream(s) if s else contextlib.nullcontext()):
             mine = todo[k::streams]
@@ -76,9 +76,12 @@ def slide_gpu(fn, roi, window, halo, dev, prep, batch=1, streams=1):
                 offs = mine[i:i + batch]
                 t = torch.stack([prep(R[z:z + window, y:y + window, x:x + window], o) for o in offs for z, y, x in [o]])
                 with autocast(dev):
-                    p = fn(t.contiguous(memory_format=torch.channels_last_3d))
+                    p = fn(t.contiguous(memory_format=torch.channels_last_3d))  # (B,w,w,w) or (B,C,w,w,w)
+                if acc is None:
+                    acc = torch.zeros(tuple(p.shape[1:-3]) + tuple(R.shape), dtype=torch.float16, device=dev)
+                    accs.append(acc)
                 for (z, y, x), pj in zip(offs, p):
-                    acc[z:z + window, y:y + window, x:x + window] += (pj.float() * g.float()).half()
+                    acc[..., z:z + window, y:y + window, x:x + window] += (pj.float() * g.float()).half()
                     wsum[z:z + window, y:y + window, x:x + window] += g
             if s:
                 s.synchronize()
@@ -88,16 +91,18 @@ def slide_gpu(fn, roi, window, halo, dev, prep, batch=1, streams=1):
         [t.start() for t in ths], [t.join() for t in ths]
     else:
         work(0)
+    if not accs:  # nothing but air
+        return np.zeros(R.shape, np.float32)
     acc, wsum = accs[0], wsums[0]
     for a, w in zip(accs[1:], wsums[1:]):
         acc += a
         wsum += w
     del accs, wsums
     with torch.no_grad():
-        out = np.empty(R.shape, np.float32)
+        out = np.empty(tuple(acc.shape), np.float32)
         for z in range(0, Z, 64):  # a slab at a time keeps the float32 temporaries small
-            a, w, r = acc[z:z + 64].float(), wsum[z:z + 64].float(), R[z:z + 64]
-            out[z:z + 64] = torch.where((w > 0) & (r > 0), a / w.clamp_min(1e-6), torch.zeros_like(a)).cpu().numpy()
+            a, w, r = acc[..., z:z + 64, :, :].float(), wsum[z:z + 64].float(), R[z:z + 64]
+            out[..., z:z + 64, :, :] = torch.where((w > 0) & (r > 0), a / w.clamp_min(1e-6), torch.zeros_like(a)).cpu().numpy()
     del R, acc, wsum
     return out
 
@@ -193,12 +198,13 @@ def flips_vec(fn, n=8):
 HEADS = {"mean": lambda p: p.mean(1), "prod": lambda p: p.prod(1) ** (1 / p.shape[1]), "max": lambda p: p.max(1).values}
 
 
-def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, tta=0, luts=(), head=0, radial_sign=1.0):
+def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, tta=0, luts=(), head=0, radial_sign=1.0, batch=1):
     """Sliding-window recto probability (float32) over a box; returns (prob, checkpoint state).
     tta: number of axis flips to average; luts: intensity LUTs (uint8->float) whose predictions are averaged in;
     head: which head of a multi-teacher student (int), "mean" / "prod" / "max" over all heads, or "all" for a
     (heads, Z, Y, X) result. radial_sign=-1 negates the radial vector: a recto-trained student then places its
-    band on the other face of the sheet (the verso; see verso.py)."""
+    band on the other face of the sheet (the verso; see verso.py). batch > 1: windows batched on the GPU
+    (slide_gpu; CT + radial inputs only, no context channels / luts / tta)."""
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     st = torch.load(ckpt, map_location=dev)
     net = M.build(st["args"]["size"], verbose=False, cout=st["args"].get("cout", 1), cin=st["args"].get("cin", 4)).to(dev)
@@ -216,6 +222,17 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
     if tta > 1:
         assert head != "all", "tta and head=all do not combine"
         fn = flips_vec(fn, tta)
+    if batch > 1:
+        assert not ctx and not luts and tta <= 1, "batched inference: CT + radial inputs only"
+        R = torch.from_numpy(data.radial(ax, (z0, y0, x0), roi.shape) * r).to(dev)
+        norm = data.NORM
+
+        def prep_t(c, o):
+            x = c.float()
+            x = (x - norm[0]) / norm[1] if norm else (x - x.mean()) / (x.std() + 1e-3)
+            z, y, xx = o
+            return torch.cat([x[None], R[:, z:z + window, y:y + window, xx:xx + window]])
+        return slide_gpu(fn, roi, window, halo, dev, prep_t, batch=batch), st
     return sum(slide(fn, roi, window, halo, dev, pr) for pr in preps) / len(preps), st
 
 

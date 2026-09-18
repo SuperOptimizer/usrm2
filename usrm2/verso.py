@@ -132,7 +132,7 @@ def read_tile(arr, z, y, x, Z, Y, X):
     return np.asarray(arr[(0,) + s] if arr.ndim == 4 else arr[s])
 
 
-def run(stores, ckpt, window=128, halo=16, tile=512, margin=32, device=None, volume=None, force=False):
+def run(stores, ckpt, window=128, halo=16, tile=512, margin=32, device=None, volume=None, force=False, batch=1):
     """Write the verso target store of every teacher store in a comma-joined group (one lineage per store, head k
     of the student paired with store k). Returns the output paths. Skips outputs already marked done."""
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -164,7 +164,7 @@ def run(stores, ckpt, window=128, halo=16, tile=512, margin=32, device=None, vol
                     put(o_arrs[k], np.zeros(tuple(s.stop - s.start for s in core), np.uint8), 0, y0, x0)
                 continue
             flip, _ = probs(ckpt, vol, int(origin[0]), int(origin[1] + ya), int(origin[2] + xa), Z, yb - ya, xb - xa,
-                            window=window, halo=halo, device=dev, head="all", radial_sign=-1.0)
+                            window=window, halo=halo, device=dev, head="all", radial_sign=-1.0, batch=batch)
             if flip.ndim == 3:
                 flip = flip[None]
             rad = torch.from_numpy(data.radial(ax, (origin[0], origin[1] + ya, origin[2] + xa), ct.shape)).to(dev)
