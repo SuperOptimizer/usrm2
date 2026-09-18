@@ -63,3 +63,5 @@ def test_verso_path():
     assert verso.verso_path("/t/boxes7/box_1_2_3.zarr") == "/t/boxes7_v/box_1_2_3.zarr"
     assert verso.verso_path("/t/boxes7_m7/box_1_2_3.zarr") == "/t/boxes7_m7_v/box_1_2_3.zarr"
     assert verso.verso_path("/t/eval.zarr") == "/t/eval_v.zarr"
+    assert verso.verso_path("/t/boxes7/box_1.zarr", "raw") == "/t/boxes7_vraw/box_1.zarr"
+    assert verso.verso_path("/t/eval.zarr", "raw") == "/t/eval_vraw.zarr"

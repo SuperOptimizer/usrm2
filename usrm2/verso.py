@@ -25,13 +25,18 @@ from usrm2.predict import out_array, probs, put
 WEAK = 77  # uint8 value of an unanchored skin voxel: target 1 with loss weight 77/255 = 0.3
 
 
-def verso_path(store):
-    """Where a store's verso target lives: boxesN/box.zarr -> boxesN_v/box.zarr, eval.zarr -> eval_v.zarr."""
+MODES = ("skin", "raw")  # skin: anchored outer skin (above); raw: the flipped student's probability as it is
+
+
+def verso_path(store, mode="skin"):
+    """Where a store's verso target lives: boxesN/box.zarr -> boxesN_v/box.zarr, eval.zarr -> eval_v.zarr
+    (suffix _vraw for the raw mode)."""
+    suf = "_v" if mode == "skin" else f"_v{mode}"
     store = str(store).rstrip("/")
     d, n = os.path.split(store)
     if os.path.basename(d).startswith("boxes"):
-        return os.path.join(d + "_v", n)
-    return store[:-5] + "_v.zarr" if store.endswith(".zarr") else store + "_v"
+        return os.path.join(d + suf, n)
+    return store[:-5] + suf + ".zarr" if store.endswith(".zarr") else store + suf
 
 
 def gauss3(x, sigma):
@@ -132,26 +137,31 @@ def read_tile(arr, z, y, x, Z, Y, X):
     return np.asarray(arr[(0,) + s] if arr.ndim == 4 else arr[s])
 
 
-def run(stores, ckpt, window=128, halo=16, tile=512, margin=32, device=None, volume=None, force=False, batch=1):
-    """Write the verso target store of every teacher store in a comma-joined group (one lineage per store, head k
-    of the student paired with store k). Returns the output paths. Skips outputs already marked done."""
+def run(stores, ckpt, window=128, halo=16, tile=512, margin=32, device=None, volume=None, force=False, batch=1,
+        modes=("skin", "raw")):
+    """Write the verso target store(s) of every teacher store in a comma-joined group (one lineage per store, head k
+    of the student paired with store k), one per mode: "skin" (anchored outer skin, lossless 255/WEAK/0) and/or
+    "raw" (the flipped student's probability, volcomp like a teacher store). Returns the output paths (mode ->
+    list). Skips outputs already marked done."""
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     paths = [p for p in str(stores).split(",") if p]
     arrs = [data.open_zarr(p) for p in paths]
     origin, size = data.box(arrs[0])
     vol = data.local(volume or arrs[0].attrs.get("volume", data.CT))
     ax = data.axis(arrs[0].attrs.get("umbilicus", data.UMBILICUS))
-    outs = [verso_path(p) for p in paths]
-    todo = [k for k, o in enumerate(outs) if force or not (os.path.exists(o) and data.open_zarr(o).attrs.get("done"))]
+    outs = {m: [verso_path(p, m) for p in paths] for m in modes}
+    todo = [(m, k) for m in modes for k, o in enumerate(outs[m])
+            if force or not (os.path.exists(o) and data.open_zarr(o).attrs.get("done"))]
     if not todo:
         return outs
     ct_arr = data.open_zarr(vol)
     o_arrs = {}
-    for k in todo:
-        os.makedirs(os.path.dirname(outs[k]) or ".", exist_ok=True)
-        o_arrs[k] = out_array(outs[k], tuple(int(v) for v in size), origin, volcomp=False,  # lossless: 255 / WEAK / 0 exactly
-                              volume=arrs[0].attrs.get("volume", data.CT), umbilicus=arrs[0].attrs.get("umbilicus", data.UMBILICUS))
-        o_arrs[k].attrs.update({"channels": ["verso"], "source": paths[k], "student": str(ckpt), "weak": WEAK})
+    for m, k in todo:
+        o = outs[m][k]
+        os.makedirs(os.path.dirname(o) or ".", exist_ok=True)
+        o_arrs[m, k] = out_array(o, tuple(int(v) for v in size), origin, volcomp=(m == "raw"),  # skin: lossless 255 / WEAK / 0
+                                 volume=arrs[0].attrs.get("volume", data.CT), umbilicus=arrs[0].attrs.get("umbilicus", data.UMBILICUS))
+        o_arrs[m, k].attrs.update({"channels": ["verso"], "mode": m, "source": paths[k], "student": str(ckpt), "weak": WEAK})
     Z, Y, X = (int(v) for v in size)
     for y0 in range(0, Y, tile):
         for x0 in range(0, X, tile):
@@ -160,8 +170,8 @@ def run(stores, ckpt, window=128, halo=16, tile=512, margin=32, device=None, vol
             ct = read_tile(ct_arr, origin[0], origin[1] + ya, origin[2] + xa, Z, yb - ya, xb - xa)
             core = (slice(0, Z), slice(y0 - ya, min(y0 + tile, Y) - ya), slice(x0 - xa, min(x0 + tile, X) - xa))
             if not ct.any():
-                for k in todo:
-                    put(o_arrs[k], np.zeros(tuple(s.stop - s.start for s in core), np.uint8), 0, y0, x0)
+                for mk in todo:
+                    put(o_arrs[mk], np.zeros(tuple(s.stop - s.start for s in core), np.uint8), 0, y0, x0)
                 continue
             flip, _ = probs(ckpt, vol, int(origin[0]), int(origin[1] + ya), int(origin[2] + xa), Z, yb - ya, xb - xa,
                             window=window, halo=halo, device=dev, head="all", radial_sign=-1.0, batch=batch)
@@ -169,13 +179,17 @@ def run(stores, ckpt, window=128, halo=16, tile=512, margin=32, device=None, vol
                 flip = flip[None]
             rad = torch.from_numpy(data.radial(ax, (origin[0], origin[1] + ya, origin[2] + xa), ct.shape)).to(dev)
             ct_t = torch.from_numpy(ct.astype(np.float32)).to(dev)
-            for k in todo:
+            for m, k in todo:
+                fk = flip[min(k, len(flip) - 1)]
+                if m == "raw":
+                    put(o_arrs[m, k], np.clip(np.rint(fk[core] * 255), 0, 255).astype(np.uint8), 0, y0, x0)
+                    continue
                 band = torch.from_numpy(read_tile(arrs[k], 0, ya, xa, Z, yb - ya, xb - xa).astype(np.float32) / 255).to(dev)
-                t = targets(torch.from_numpy(flip[min(k, len(flip) - 1)]).to(dev), band, ct_t, rad)
-                put(o_arrs[k], t[core].cpu().numpy(), 0, y0, x0)
+                t = targets(torch.from_numpy(fk).to(dev), band, ct_t, rad)
+                put(o_arrs[m, k], t[core].cpu().numpy(), 0, y0, x0)
                 del band, t
             del ct_t, rad, flip
             torch.cuda.empty_cache() if dev.type == "cuda" else None
-    for k in todo:
-        o_arrs[k].attrs["done"] = True
+    for mk in todo:
+        o_arrs[mk].attrs["done"] = True
     return outs
