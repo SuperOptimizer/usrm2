@@ -57,8 +57,11 @@ def autocast(dev):
 
 @torch.no_grad()
 def evaluate(net, grid, dev, wtgt=()):
+    """bce / dice / mae over the val patches; with verso heads (>= 4 heads: recto..., verso...) also `overlap`,
+    the mean excess relu(p_recto + p_verso - 1) per lineage pair, measured only (no loss term; mutual
+    exclusivity is a possible later fine-tuning pass once the verso labels are sharper)."""
     net.eval()
-    m = torch.zeros(3)
+    m = torch.zeros(4)
     for ct, tg in grid:
         ct, tg = ct[None].to(dev).to(memory_format=torch.channels_last_3d), tg[None].to(dev)
         tg = weighted(tg, wtgt)[0]
@@ -66,12 +69,17 @@ def evaluate(net, grid, dev, wtgt=()):
             logit = net(ct).float()
         p = torch.sigmoid(logit)
         h, t = (p >= 0.5).float(), (tg >= 0.5).float()
+        C = p.shape[1]
+        ov = (p[:, :C // 2] + p[:, C // 2:] - 1).clamp_min(0).mean().item() if C >= 4 and C % 2 == 0 else 0.0
         m += torch.tensor([F.binary_cross_entropy_with_logits(logit, tg).item(),
                            (2 * (h * t).sum() / (h.sum() + t.sum() + 1)).item(),
-                           (p - tg).abs().mean().item()])
+                           (p - tg).abs().mean().item(), ov])
     net.train()
     m /= max(len(grid), 1)
-    return {"bce": m[0].item(), "dice": m[1].item(), "mae": m[2].item()}
+    out = {"bce": m[0].item(), "dice": m[1].item(), "mae": m[2].item()}
+    if grid and grid[0][1].shape[0] >= 4:
+        out["overlap"] = m[3].item()
+    return out
 
 
 def val_png(path, net, grid, dev):
