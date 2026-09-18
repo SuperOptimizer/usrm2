@@ -397,7 +397,9 @@ def intensity(c, cfg):
     for name, f in INTENS:
         k = cfg.get(name)
         if k:
-            c = torch.where(_m(c.shape[0], c.device, k["p"]).bool(), f(c, k), c)
+            m = _m(c.shape[0], c.device, k["p"]).bool()
+            if m.any():  # an aug that selected no sample of this batch costs nothing (half the time at p=0.3, B=2)
+                c = torch.where(m, f(c, k), c)
     return c
 
 

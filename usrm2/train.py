@@ -104,14 +104,16 @@ def val_png(path, net, grid, dev):
 
 def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=4, warmup=200,
           eval_every=500, val_patches=32, resume=False, device=None, aug="geo", no_radial=False, accum=1,
-          ema_decay=0.999, lr_floor=0.0, ridge_w=0.0, dense_pow=0.0, norm="patch", ctx=(), init_from=None, wtgt=(), **kw):
+          ema_decay=0.999, lr_floor=0.0, ridge_w=0.0, dense_pow=0.0, norm="patch", ctx=(), init_from=None, wtgt=(),
+          compile=False, **kw):
     """accum: gradient accumulation (micro-batches per optimizer step), for big models on small cards.
     lr_floor: the cosine decays to lr_floor * lr instead of 0. norm: "patch" (per-patch z-score) or "global"
     (fixed scan mean/std, stored in the checkpoint). dense_pow / ridge_w: see data.Patches / losses.
     wtgt: target channels that carry loss weights (verso targets from verso.py), e.g. (2, 3) for a 4-head student.
     Multi-GPU: launch with `torchrun --nproc_per_node N -m usrm2.cli train ...`; every rank draws its own patches
     (seed offset), gradients are all-reduced (DDP), rank 0 evaluates, logs and saves. One optimizer step then sees
-    N * batch * accum patches."""
+    N * batch * accum patches. compile: torch.compile the training forward/backward (1.4x on the 5m at 128^3;
+    the raw module keeps serving EMA, checkpoints and evaluation)."""
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
     main = rank == 0
     if world > 1:
@@ -178,6 +180,9 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
                      exclude=kw.get("val", data.VAL), seed=step + 7919 * rank, sym=cfg.get("sym", True), aug=cfg, dense_pow=dense_pow, ctx=ctx,
                      stores_file=kw.get("stores_file"))  # a stores file is re-read as it grows (data.Patches)
     model = torch.nn.parallel.DistributedDataParallel(net, device_ids=[dev.index]) if world > 1 else net
+    if compile:
+        model = torch.compile(model)
+        args["compile"] = True
 
     def save():  # atomic: an interrupted write never loses the last resumable state
         if not main:

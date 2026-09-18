@@ -185,3 +185,15 @@ def test_pool_keeps_the_extent_for_non_divisible_sizes():
     k = {**A.POOL["pool"], "ops": ["avg"], "k_lo": 3, "k_hi": 3, "aniso": 0.0, "nearest": 1.0}
     y = A._pool(x, k)
     assert y.shape == x.shape and y[..., 31].sum() > 0 and y[..., :27].sum() == 0
+
+
+def test_intensity_mask_guard_is_exact():
+    """Guarded intensity: p=1 applies every aug (same as before), p=0 returns the input untouched."""
+    import torch
+    from usrm2 import aug as A
+    torch.manual_seed(0)
+    c = torch.randn(2, 1, 16, 16, 16)
+    cfg1 = {"gamma": {"p": 1.0, "max": 1.8}, "bright": {"p": 1.0, "max": 0.3}}
+    cfg0 = {"gamma": {"p": 0.0, "max": 1.8}, "bright": {"p": 0.0, "max": 0.3}}
+    assert torch.equal(A.intensity(c, cfg0), c)
+    assert not torch.equal(A.intensity(c, cfg1), c)
