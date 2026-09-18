@@ -23,7 +23,8 @@ def main(argv=None):
     t.add_argument("--dense-pow", type=float, default=0.0, help="bias sampling towards sheet-dense patches (1-2)")
     t.add_argument("--norm", default="patch", choices=["patch", "global"], help="per-patch z-score or fixed scan mean/std")
     t.add_argument("--ctx", type=int, nargs="*", default=(), help="coarse context channels: pyramid levels, e.g. 1 2 3 = 4.8/9.6/19.2um cubes")
-    t.add_argument("--init-from", default=None, help="warm start from this checkpoint's EMA weights (new input channels start at zero)")
+    t.add_argument("--init-from", default=None, help="warm start from this checkpoint's EMA weights (new input channels start at zero, new heads copy old ones)")
+    t.add_argument("--wtgt", type=int, nargs="*", default=(), help="target channels that carry loss weights (verso targets), e.g. 2 3")
     t.add_argument("--resume", action="store_true")
     t.add_argument("--stores", nargs="+", default=None, help="teacher stores to train on (default: data.TRAIN); "
                    "'a.zarr,a_m7.zarr' = several teachers over one box, one head each")
@@ -61,6 +62,7 @@ def main(argv=None):
     p.add_argument("--ome", action="store_true", help="zarr v2 OME group at full volume shape (tracer drop-in)")
     p.add_argument("--tta", type=int, default=0, help="average over this many axis flips (8 = all)")
     p.add_argument("--head", default="0", help="head index of a multi-teacher student, or mean / prod / max")
+    p.add_argument("--radial-sign", type=float, default=1.0, help="-1 negates the radial vector (the student then predicts the verso face)")
     p.add_argument("--lut-to", nargs="*", default=(), metavar="REF", help="also average with the input histogram-matched to REF volumes")
     s = sub.add_parser("evalsurf", help="score a checkpoint or store against the published surfaces")
     s.add_argument("--box", type=int, nargs=6, default=None, metavar=("Z0", "Y0", "X0", "Z", "Y", "X"))
@@ -102,6 +104,15 @@ def main(argv=None):
     r.add_argument("--volume", default=None)
     r.add_argument("--png", default=None, help="also write before/after slice images into this directory")
     r.add_argument("--up", type=int, default=1, help="resample the grids this many times denser before refining (published = 1/20 voxel)")
+    v = sub.add_parser("verso", help="write verso targets (flipped-student skin anchored to CT edges) for teacher store groups")
+    v.add_argument("ckpt", help="student checkpoint (one head per store of a group)")
+    v.add_argument("--stores", nargs="+", required=True, help="teacher store groups, 'a.zarr,a_m7.zarr' each")
+    v.add_argument("--window", type=int, default=128)
+    v.add_argument("--halo", type=int, default=16)
+    v.add_argument("--tile", type=int, default=512)
+    v.add_argument("--margin", type=int, default=32)
+    v.add_argument("--shard", type=int, nargs=2, default=None, metavar=("I", "K"), help="process every K-th group starting at I")
+    v.add_argument("--force", action="store_true", help="rewrite outputs marked done")
     b = sub.add_parser("teacher-boxes", help="run the teacher over many random non-air boxes")
     b.add_argument("out_dir")
     b.add_argument("--n", type=int, default=50)
@@ -124,7 +135,7 @@ def main(argv=None):
         data.UMBILICUS = a.umbilicus
     if a.cmd == "train":
         T.train(a.out_dir, accum=a.accum, ema_decay=a.ema, lr_floor=a.lr_floor, ridge_w=a.ridge_w, dense_pow=a.dense_pow,
-                norm=a.norm, ctx=tuple(a.ctx), init_from=a.init_from, size=a.size, steps=a.steps, patch=a.patch, batch=a.batch, lr=a.lr,
+                norm=a.norm, ctx=tuple(a.ctx), init_from=a.init_from, wtgt=tuple(a.wtgt), size=a.size, steps=a.steps, patch=a.patch, batch=a.batch, lr=a.lr,
                 workers=a.workers, eval_every=a.eval_every, val_patches=a.val_patches, resume=a.resume,
                 aug=a.aug, no_radial=a.no_radial,
                 **{k: v for k, v in dict(stores=a.stores, val=a.val).items() if v})
@@ -187,11 +198,20 @@ def main(argv=None):
         else:
             teacher.run(a.out, *a.origin, *a.size, volume=vol, tta=a.tta, luts=[teacher.lut_to(vol, r) for r in a.lut_to], backend=a.backend,
                         gpu_acc=a.gpu_acc, batch=a.batch, streams=a.streams, **({"window": a.window} if a.window else {}))
+    elif a.cmd == "verso":
+        import time
+        from usrm2 import verso
+        groups = a.stores[a.shard[0]::a.shard[1]] if a.shard else a.stores
+        for i, g in enumerate(groups):
+            t0 = time.time()
+            outs = verso.run(g, a.ckpt, window=a.window, halo=a.halo, tile=a.tile, margin=a.margin, force=a.force)
+            print(f"verso {i + 1}/{len(groups)} {g} -> {outs} ({time.time() - t0:.0f} s)", flush=True)
     else:
         from usrm2 import teacher
         vol = a.volume or data.CT
         P.predict(a.ckpt, vol, *a.origin, *a.size, a.out, window=a.window, halo=a.halo, volcomp=not a.plain, ome=a.ome,
-                  tta=a.tta, luts=[teacher.lut_to(vol, r) for r in a.lut_to], head=a.head if a.head in P.HEADS else int(a.head))
+                  tta=a.tta, luts=[teacher.lut_to(vol, r) for r in a.lut_to], head=a.head if a.head in P.HEADS or a.head == "all" else int(a.head),
+                  radial_sign=a.radial_sign)
 
 
 if __name__ == "__main__":

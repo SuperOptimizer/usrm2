@@ -27,7 +27,7 @@ def slide(fn, roi, window, halo, dev, prep=None):
         roi = np.pad(roi, [(0, max(window - s, 0)) for s in S])
         return slide(fn, roi, window, halo, dev, prep)[:S[0], :S[1], :S[2]]
     Z, Y, X = roi.shape
-    acc, wsum, g = np.zeros(roi.shape, np.float32), np.zeros(roi.shape, np.float32), gauss(window)
+    acc, wsum, g = None, np.zeros(roi.shape, np.float32), gauss(window)
     stride = window - 2 * halo
     with torch.no_grad():
         for z in starts(Z, window, stride):
@@ -38,9 +38,13 @@ def slide(fn, roi, window, halo, dev, prep=None):
                         continue
                     t = torch.from_numpy(prep(c, (z, y, x)))[None].to(dev).to(memory_format=torch.channels_last_3d)
                     with autocast(dev):
-                        p = fn(t)[0].float().cpu().numpy()
-                    acc[z:z + window, y:y + window, x:x + window] += p * g
+                        p = fn(t)[0].float().cpu().numpy()  # (w,w,w) or (C,w,w,w): fn may return every head
+                    if acc is None:
+                        acc = np.zeros(p.shape[:-3] + roi.shape, np.float32)
+                    acc[..., z:z + window, y:y + window, x:x + window] += p * g
                     wsum[z:z + window, y:y + window, x:x + window] += g
+    if acc is None:
+        return np.zeros(roi.shape, np.float32)
     return np.where((wsum > 0) & (roi > 0), acc / np.maximum(wsum, 1e-6), 0)  # masked CT (0) -> no surface
 
 
@@ -189,31 +193,34 @@ def flips_vec(fn, n=8):
 HEADS = {"mean": lambda p: p.mean(1), "prod": lambda p: p.prod(1) ** (1 / p.shape[1]), "max": lambda p: p.max(1).values}
 
 
-def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, tta=0, luts=(), head=0):
+def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, tta=0, luts=(), head=0, radial_sign=1.0):
     """Sliding-window recto probability (float32) over a box; returns (prob, checkpoint state).
     tta: number of axis flips to average; luts: intensity LUTs (uint8->float) whose predictions are averaged in;
-    head: which head of a multi-teacher student (int), or "mean" / "prod" / "max" over all heads."""
+    head: which head of a multi-teacher student (int), "mean" / "prod" / "max" over all heads, or "all" for a
+    (heads, Z, Y, X) result. radial_sign=-1 negates the radial vector: a recto-trained student then places its
+    band on the other face of the sheet (the verso; see verso.py)."""
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     st = torch.load(ckpt, map_location=dev)
     net = M.build(st["args"]["size"], verbose=False, cout=st["args"].get("cout", 1), cin=st["args"].get("cin", 4)).to(dev)
     net.load_state_dict(st["ema"])
     net.eval()
     roi, ax = data.open_zarr(volume)[z0:z0 + Z, y0:y0 + Y, x0:x0 + X], data.axis()
-    r = 0.0 if st["args"].get("no_radial") else 1.0  # training zeroed the radial channels
+    r = 0.0 if st["args"].get("no_radial") else float(radial_sign)  # training zeroed the radial channels
     data.NORM = tuple(st["args"]["norm_stats"]) if st["args"].get("norm") == "global" else None  # as trained
     rad = lambda c, o: data.radial(ax, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape) * r
     ctx = tuple(st["args"].get("ctx") or ())
     cx = (lambda c, o: data.context(volume, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape, ctx)) if ctx else (lambda c, o: ())
     preps = [lambda c, o: data.inputs(c, rad(c, o), cx(c, o))] + [(lambda c, o, l=l: data.inputs(l[c], rad(c, o), cx(c, o))) for l in luts]
-    pick = HEADS[head] if isinstance(head, str) else (lambda p: p[:, int(head)])
-    fn = lambda t: pick(torch.sigmoid(net(t)))  # (B,C,...) -> (B,...)
+    pick = (lambda p: p) if head == "all" else HEADS[head] if isinstance(head, str) else (lambda p: p[:, int(head)])
+    fn = lambda t: pick(torch.sigmoid(net(t)))  # (B,C,...) -> (B,...)  (or (B,C,...) for "all")
     if tta > 1:
+        assert head != "all", "tta and head=all do not combine"
         fn = flips_vec(fn, tta)
     return sum(slide(fn, roi, window, halo, dev, pr) for pr in preps) / len(preps), st
 
 
-def predict(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=None, volcomp=True, ome=False, tta=0, luts=(), head=0):
-    prob, st = probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=window, halo=halo, device=device, tta=tta, luts=luts, head=head)
+def predict(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=None, volcomp=True, ome=False, tta=0, luts=(), head=0, radial_sign=1.0):
+    prob, st = probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=window, halo=halo, device=device, tta=tta, luts=luts, head=head, radial_sign=radial_sign)
     if ome:
         write_ome(out, u8(prob), (z0, y0, x0), full_shape=data.open_zarr(volume).shape[-3:],
                   meta={"checkpoint": str(ckpt), "step": int(st.get("step", 0)), "volume": volume})

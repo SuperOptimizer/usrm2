@@ -12,10 +12,28 @@ import torch.nn.functional as F
 from usrm2 import aug as A, data, model as M
 
 
-def losses(logit, tgt, ridge_w=0.0):
-    """BCE (+ ridge_w extra weight on the band's core, target >= 0.9: the student must commit there) + soft dice."""
-    if ridge_w > 0:
+def weighted(tgt, wtgt=()):
+    """Targets and per-voxel weights. Channels in `wtgt` (verso targets) store a WEIGHT where they are positive:
+    target 1 with weight = value (255 -> 1, verso.WEAK -> 0.3); zeros keep weight 1. Other channels: weight 1."""
+    if not wtgt:
+        return tgt, None
+    w = torch.ones_like(tgt)
+    t = tgt.clone()
+    for c in wtgt:
+        pos = tgt[:, c] > 0
+        w[:, c] = torch.where(pos, tgt[:, c], torch.ones_like(tgt[:, c]))
+        t[:, c] = pos.float()
+    return t, w
+
+
+def losses(logit, tgt, ridge_w=0.0, wtgt=()):
+    """BCE (+ ridge_w extra weight on the band's core, target >= 0.9: the student must commit there) + soft dice.
+    wtgt: channels whose stored value is a loss weight (verso targets, see `weighted`)."""
+    tgt, wv = weighted(tgt, wtgt)
+    if ridge_w > 0 or wv is not None:
         w = 1 + ridge_w * (tgt >= 0.9).float()
+        if wv is not None:
+            w = w * wv
         bce = (F.binary_cross_entropy_with_logits(logit, tgt, reduction="none") * w).sum() / w.sum()
     else:
         bce = F.binary_cross_entropy_with_logits(logit, tgt)
@@ -37,11 +55,12 @@ def autocast(dev):
 
 
 @torch.no_grad()
-def evaluate(net, grid, dev):
+def evaluate(net, grid, dev, wtgt=()):
     net.eval()
     m = torch.zeros(3)
     for ct, tg in grid:
         ct, tg = ct[None].to(dev).to(memory_format=torch.channels_last_3d), tg[None].to(dev)
+        tg = weighted(tg, wtgt)[0]
         with autocast(dev):
             logit = net(ct).float()
         p = torch.sigmoid(logit)
@@ -76,16 +95,17 @@ def val_png(path, net, grid, dev):
 
 def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=4, warmup=200,
           eval_every=500, val_patches=32, resume=False, device=None, aug="geo", no_radial=False, accum=1,
-          ema_decay=0.999, lr_floor=0.0, ridge_w=0.0, dense_pow=0.0, norm="patch", ctx=(), init_from=None, **kw):
+          ema_decay=0.999, lr_floor=0.0, ridge_w=0.0, dense_pow=0.0, norm="patch", ctx=(), init_from=None, wtgt=(), **kw):
     """accum: gradient accumulation (micro-batches per optimizer step), for big models on small cards.
     lr_floor: the cosine decays to lr_floor * lr instead of 0. norm: "patch" (per-patch z-score) or "global"
-    (fixed scan mean/std, stored in the checkpoint). dense_pow / ridge_w: see data.Patches / losses."""
+    (fixed scan mean/std, stored in the checkpoint). dense_pow / ridge_w: see data.Patches / losses.
+    wtgt: target channels that carry loss weights (verso targets from verso.py), e.g. (2, 3) for a 4-head student."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     cfg = dict(A.get(aug), **({"norad": True} if no_radial else {}))
     no_radial = bool(cfg.get("norad"))
     args = dict(size=size, steps=steps, patch=patch, batch=batch, lr=lr, aug=aug, aug_cfg=cfg,
-                no_radial=no_radial, accum=accum, ema_decay=ema_decay, lr_floor=lr_floor, ridge_w=ridge_w,
+                no_radial=no_radial, accum=accum, ema_decay=ema_decay, lr_floor=lr_floor, ridge_w=ridge_w, wtgt=list(wtgt),
                 dense_pow=dense_pow, norm=norm, ctx=list(ctx), **kw)
     if norm == "global":
         args["norm_stats"] = data.global_norm(kw.get("ct", data.CT))
@@ -104,6 +124,11 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
             w2 = torch.zeros(w.shape[0], cin, *w.shape[2:], device=w.device, dtype=w.dtype)
             w2[:, :w.shape[1] - 3], w2[:, cin - 3:] = w[:, :w.shape[1] - 3], w[:, w.shape[1] - 3:]  # image chans first, radial last
             src["enc.0.0.weight"] = w2
+        hw, hb = src["head.weight"], src["head.bias"]
+        if hw.shape[0] != cout:  # new heads start as copies of the source heads (head j <- source head j mod n)
+            assert hw.shape[0] < cout, "cannot drop heads on a warm start"
+            j = torch.arange(cout, device=hw.device) % hw.shape[0]
+            src["head.weight"], src["head.bias"] = hw[j].clone(), hb[j].clone()
         missing = net.load_state_dict(src, strict=False)
         print(f"warm start from {init_from}: {len(missing.missing_keys)} missing, {len(missing.unexpected_keys)} unexpected", flush=True)
         args["init_from"] = str(init_from)
@@ -150,7 +175,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         ct, tg = A.apply(ct.to(dev, non_blocking=True), tg.to(dev, non_blocking=True), cfg)
         ct = ct.to(memory_format=torch.channels_last_3d)
         with autocast(dev):
-            bce, dice = losses(net(ct).float(), tg, ridge_w)
+            bce, dice = losses(net(ct).float(), tg, ridge_w, wtgt)
         loss = bce + dice
         (loss / accum).backward()
         micro += 1
@@ -169,7 +194,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
             t0 = time.time()
         if step % eval_every == 0 or step == steps:
             evnet.load_state_dict(ema)
-            log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev)})
+            log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev, wtgt)})
             try:
                 val_png(out / f"val_{step:06d}.png", evnet, grid, dev)
             except Exception as e:  # a missing PIL must not stop training
