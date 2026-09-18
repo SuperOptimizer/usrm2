@@ -59,8 +59,10 @@ def read3(arr, o, p):
 def axis(path=None):
     """(z, y, x) arrays of the scroll axis control points, sorted by z (level-0 voxels).
     The default is read at call time, so `--umbilicus` (which rebinds UMBILICUS) is honoured."""
-    import json
-    pts = sorted((p["z"], p["y"], p["x"]) for p in json.load(open(path or UMBILICUS))["control_points"])
+    import json, os
+    path = path or UMBILICUS
+    assert os.path.exists(path), f"no umbilicus at {path}: every scroll needs one (create it, then pass --umbilicus)"
+    pts = sorted((p["z"], p["y"], p["x"]) for p in json.load(open(path))["control_points"])
     return np.array(pts, np.float64).T
 
 
