@@ -114,6 +114,7 @@ def main(argv=None):
     v.add_argument("--batch", type=int, default=1, help="windows per forward on the GPU-accumulated path (1 = unbatched; batching was slower on the 5080)")
     v.add_argument("--shard", type=int, nargs=2, default=None, metavar=("I", "K"), help="process every K-th group starting at I")
     v.add_argument("--force", action="store_true", help="rewrite outputs marked done")
+    v.add_argument("--reverse", action="store_true", help="take the groups from the end (a second machine working towards the first)")
     v.add_argument("--modes", nargs="+", default=["skin", "raw"], choices=["skin", "raw"], help="skin: anchored outer skin (_v); raw: flipped probability as is (_vraw)")
     b = sub.add_parser("teacher-boxes", help="run the teacher over many random non-air boxes")
     b.add_argument("out_dir")
@@ -203,7 +204,8 @@ def main(argv=None):
     elif a.cmd == "verso":
         import time
         from usrm2 import verso
-        groups = a.stores[a.shard[0]::a.shard[1]] if a.shard else a.stores
+        groups = a.stores[::-1] if a.reverse else a.stores
+        groups = groups[a.shard[0]::a.shard[1]] if a.shard else groups
         for i, g in enumerate(groups):
             t0 = time.time()
             outs = verso.run(g, a.ckpt, window=a.window, halo=a.halo, tile=a.tile, margin=a.margin, force=a.force, batch=a.batch, modes=tuple(a.modes))

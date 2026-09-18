@@ -148,7 +148,8 @@ def run(stores, ckpt, window=128, halo=16, tile=512, margin=32, device=None, vol
     arrs = [data.open_zarr(p) for p in paths]
     origin, size = data.box(arrs[0])
     vol = data.local(volume or arrs[0].attrs.get("volume", data.CT))
-    ax = data.axis(arrs[0].attrs.get("umbilicus", data.UMBILICUS))
+    umb = arrs[0].attrs.get("umbilicus", data.UMBILICUS)
+    ax = data.axis(umb if os.path.exists(umb) else None)  # a desk path read in the cloud -> the configured umbilicus
     outs = {m: [verso_path(p, m) for p in paths] for m in modes}
     todo = [(m, k) for m in modes for k, o in enumerate(outs[m])
             if force or not (os.path.exists(o) and data.open_zarr(o).attrs.get("done"))]

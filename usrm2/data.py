@@ -21,13 +21,20 @@ MARGIN = 16  # sliding-window predictions are worse at the teacher box edges
 LOCAL_VOLUMES = "/vesuvius/usrm/volcomp"  # mirror of dl.ash2txt.org/community-uploads/forrest/volcomp/<scroll>/volumes/
 
 
+STREAM_VOLUMES = "https://dl.ash2txt.org/community-uploads/forrest/volcomp"  # the mirror's origin
+
+
 def local(path):
-    """A streamed volume URL -> its local mirror when present (stores made in the cloud name the URL)."""
+    """A streamed volume URL -> its local mirror when present (stores made in the cloud name the URL), and a
+    mirror path that does not exist here -> the streamed URL (stores made on the desk, read in the cloud)."""
     import os
     if "://" in path and "/volcomp/" in path:
         scroll, _, rest = path.split("/volcomp/", 1)[1].partition("/volumes/")
         cand = f"{LOCAL_VOLUMES}/{scroll}/{rest}"
         return cand if os.path.exists(cand) else path
+    if path.startswith(LOCAL_VOLUMES + "/") and not os.path.exists(path):
+        scroll, _, rest = path[len(LOCAL_VOLUMES) + 1:].partition("/")
+        return f"{STREAM_VOLUMES}/{scroll}/volumes/{rest}"
     return path
 
 
