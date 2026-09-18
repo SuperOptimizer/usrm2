@@ -74,9 +74,28 @@ def radial(ax, origin, shape):
     return np.stack([np.zeros(shape, np.float32), (dy / n).astype(np.float32), (dx / n).astype(np.float32)])
 
 
+NORM = None  # None = per-patch z-score; (mean, std) = fixed scan-level normalization (set by `global_norm`)
+
+
 def zscore(x):
     x = x.astype(np.float32)
+    if NORM is not None:
+        return (x - NORM[0]) / NORM[1]
     return (x - x.mean()) / (x.std() + 1e-3)
+
+
+def global_norm(volume=None, n=200, seed=0):
+    """(mean, std) of the non-air voxels of `volume` from n random 128^3 patches; sets NORM."""
+    global NORM
+    a, rng, acc = open_zarr(volume or CT), np.random.default_rng(seed), []
+    while len(acc) < n:
+        o = rng.integers(0, np.array(a.shape) - 128)
+        c = a[o[0]:o[0] + 128, o[1]:o[1] + 128, o[2]:o[2] + 128]
+        if (c > 0).mean() >= 0.5:
+            acc.append(c[c > 0].astype(np.float32))
+    v = np.concatenate(acc)
+    NORM = (float(v.mean()), float(v.std()))
+    return NORM
 
 
 VOLCOMP_CHUNK = 128  # the codec encodes 128^3 uint8 blocks only; other shapes are padded and tiled
@@ -134,9 +153,13 @@ class Patches(torch.utils.data.IterableDataset):
     """Random (ct, teacher) patches; train patches never touch the val box."""
 
     def __init__(self, patch=128, ct=CT, stores=TRAIN, exclude=VAL, seed=0, air_keep=0.1, fg_min=0.05,
-                 fg_keep=0.25, sym=True, aug=None):
+                 fg_keep=0.25, sym=True, aug=None, dense_pow=0.0, dense_ref=0.2):
+        """dense_pow > 0 biases sampling towards sheet-dense patches: a patch whose target mean m is below
+        dense_ref is kept with probability (m / dense_ref) ** dense_pow (crushed windings are where students fail)."""
         super().__init__()
-        self.patch, self.ct_path, self.paths, self.exclude, self.seed = patch, ct, [str(s).split(",") for s in stores], exclude, seed
+        self.patch, self.ct_path, self.paths, self.seed = patch, ct, [str(s).split(",") for s in stores], seed
+        self.exclude = [e for e in (exclude if isinstance(exclude, (list, tuple)) else [exclude]) if e]
+        self.dense_pow, self.dense_ref = dense_pow, dense_ref
         self.sym = sym  # the 48 cube symmetries; the GPU augs are in aug.py
         self.aug = aug or {}  # the worker-side raw-uint8 stage: window / volcomp / blank
         self.air_keep, self.fg_min, self.fg_keep = air_keep, fg_min, fg_keep  # low-foreground patches are mostly skipped
@@ -158,8 +181,8 @@ class Patches(torch.utils.data.IterableDataset):
         self.boxes = [box(a) for a in self.arrs]
         self.w = np.array([np.prod(s) for _, s in self.boxes], np.float64)
         self.w /= self.w.sum()
-        ex = open_zarr(str(self.exclude).split(",")[0]) if self.exclude else None
-        self.ex, self.ex_vol = (box(ex), ex.attrs.get("volume", self.ct_path)) if ex is not None else (None, None)
+        exs = [open_zarr(str(e).split(",")[0]) for e in self.exclude]
+        self.ex = [(box(e), local(e.attrs.get("volume", self.ct_path))) for e in exs]  # boxes never sampled
 
     def __iter__(self):
         if self.arrs is None:
@@ -175,7 +198,7 @@ class Patches(torch.utils.data.IterableDataset):
             o, s = self.boxes[i]
             lo = rng.integers(MARGIN, s - MARGIN - p + 1)  # store-local corner
             g = o + lo  # global corner
-            if self.ex is not None and self.vols[i] == self.ex_vol and np.all(g < self.ex[0] + self.ex[1]) and np.all(g + p > self.ex[0]):
+            if any(local(self.vols[i]) == v and np.all(g < b[0] + b[1]) and np.all(g + p > b[0]) for b, v in self.ex):
                 continue
             bl = self.aug.get("blank")
             if bl and rng.random() < bl["p"]:  # an all-air patch (CT 0 = air) with target 0
@@ -185,7 +208,10 @@ class Patches(torch.utils.data.IterableDataset):
                 if (ct == 0).mean() > 0.9 and rng.random() > self.air_keep:
                     continue
                 tg = np.stack([read3(a, lo, p) for a in self.heads[i]]).astype(np.float32) / 255.0 * (ct > 0)  # masked CT -> no surface
-                if tg.mean() < self.fg_min and rng.random() > self.fg_keep:
+                m = tg.mean()
+                if m < self.fg_min and rng.random() > self.fg_keep:
+                    continue
+                if self.dense_pow > 0 and m < self.dense_ref and rng.random() > (m / self.dense_ref) ** self.dense_pow:
                     continue
                 ct = raw(rng, ct, self.aug)
             rejected, x = 0, inputs(ct, radial(self.axes[i], g, ct.shape))
@@ -195,7 +221,10 @@ class Patches(torch.utils.data.IterableDataset):
 
 
 def val_grid(patch=128, ct=CT, store=VAL, limit=32):
-    """Deterministic non-overlapping tiling of the val box -> list of (ct, tgt)."""
+    """Deterministic non-overlapping tiling of the val box(es) -> list of (ct, tgt). `store` may be a list of
+    boxes (each a comma-joined teacher group); `limit` patches are taken from each."""
+    if isinstance(store, (list, tuple)):
+        return [x for s in store for x in val_grid(patch, ct, s, limit)]
     heads = [open_zarr(q) for q in str(store).split(",")]
     tga = heads[0]
     cta, ax = open_zarr(tga.attrs.get("volume", ct)), axis(tga.attrs.get("umbilicus", UMBILICUS))

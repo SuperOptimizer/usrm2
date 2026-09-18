@@ -12,8 +12,13 @@ import torch.nn.functional as F
 from usrm2 import aug as A, data, model as M
 
 
-def losses(logit, tgt):
-    bce = F.binary_cross_entropy_with_logits(logit, tgt)
+def losses(logit, tgt, ridge_w=0.0):
+    """BCE (+ ridge_w extra weight on the band's core, target >= 0.9: the student must commit there) + soft dice."""
+    if ridge_w > 0:
+        w = 1 + ridge_w * (tgt >= 0.9).float()
+        bce = (F.binary_cross_entropy_with_logits(logit, tgt, reduction="none") * w).sum() / w.sum()
+    else:
+        bce = F.binary_cross_entropy_with_logits(logit, tgt)
     p, d = torch.sigmoid(logit), (0, 2, 3, 4)
     dice = (1 - (2 * (p * tgt).sum(d) + 1) / (p.sum(d) + tgt.sum(d) + 1)).mean()  # per head
     return bce, dice
@@ -70,14 +75,21 @@ def val_png(path, net, grid, dev):
 
 
 def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=4, warmup=200,
-          eval_every=500, val_patches=32, resume=False, device=None, aug="geo", no_radial=False, accum=1, **kw):
-    """accum: gradient accumulation (micro-batches per optimizer step), for big models on small cards."""
+          eval_every=500, val_patches=32, resume=False, device=None, aug="geo", no_radial=False, accum=1,
+          ema_decay=0.999, lr_floor=0.0, ridge_w=0.0, dense_pow=0.0, norm="patch", **kw):
+    """accum: gradient accumulation (micro-batches per optimizer step), for big models on small cards.
+    lr_floor: the cosine decays to lr_floor * lr instead of 0. norm: "patch" (per-patch z-score) or "global"
+    (fixed scan mean/std, stored in the checkpoint). dense_pow / ridge_w: see data.Patches / losses."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     cfg = dict(A.get(aug), **({"norad": True} if no_radial else {}))
     no_radial = bool(cfg.get("norad"))
     args = dict(size=size, steps=steps, patch=patch, batch=batch, lr=lr, aug=aug, aug_cfg=cfg,
-                no_radial=no_radial, accum=accum, **kw)
+                no_radial=no_radial, accum=accum, ema_decay=ema_decay, lr_floor=lr_floor, ridge_w=ridge_w,
+                dense_pow=dense_pow, norm=norm, **kw)
+    if norm == "global":
+        args["norm_stats"] = data.global_norm(kw.get("ct", data.CT))
+        print("global normalization", args["norm_stats"], flush=True)
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     grid = data.val_grid(patch=patch, ct=kw.get("ct", data.CT), store=kw.get("val", data.VAL), limit=val_patches)
     assert grid, f"validation store {kw.get('val', data.VAL)} is smaller than the patch ({patch})"
@@ -85,7 +97,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     net = M.build(size, cout=cout).to(dev)
     opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min((s + 1) / warmup, 1.0) *
-                                              0.5 * (1 + math.cos(math.pi * min(s / steps, 1.0))))
+                                              (lr_floor + (1 - lr_floor) * 0.5 * (1 + math.cos(math.pi * min(s / steps, 1.0)))))
     ema = {k: v.detach().clone() for k, v in net.state_dict().items()}
     step = 0
     ck = out / "ckpt.pt"
@@ -102,7 +114,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
             x[1:] = 0
     evnet = M.build(size, verbose=False, cout=cout).to(dev)
     dl = data.loader(patch, batch, workers, ct=kw.get("ct", data.CT), stores=kw.get("stores", data.TRAIN),
-                     exclude=kw.get("val", data.VAL), seed=step, sym=cfg.get("sym", True), aug=cfg)
+                     exclude=kw.get("val", data.VAL), seed=step, sym=cfg.get("sym", True), aug=cfg, dense_pow=dense_pow)
 
     def save():  # atomic: an interrupted write never loses the last resumable state
         torch.save({"model": net.state_dict(), "ema": ema, "opt": opt.state_dict(),
@@ -122,7 +134,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         ct, tg = A.apply(ct.to(dev, non_blocking=True), tg.to(dev, non_blocking=True), cfg)
         ct = ct.to(memory_format=torch.channels_last_3d)
         with autocast(dev):
-            bce, dice = losses(net(ct).float(), tg)
+            bce, dice = losses(net(ct).float(), tg, ridge_w)
         loss = bce + dice
         (loss / accum).backward()
         micro += 1
@@ -131,7 +143,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         micro = 0
         torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
         opt.step(), opt.zero_grad(set_to_none=True), sched.step()
-        ema_update(ema, net)
+        ema_update(ema, net, ema_decay)
         step += 1
         if step % 20 == 0:
             dt = time.time() - t0

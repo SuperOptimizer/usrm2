@@ -117,3 +117,34 @@ def test_procs_argv_strip(monkeypatch):
     except SystemExit:
         pass
     assert len(calls) == 3 and all("--procs" not in c and "3" not in c[:-2] and c[-3:-2] == ["--shard"] for c in calls)
+
+
+def test_ridge_weighted_loss_and_lr_floor_and_global_norm(monkeypatch):
+    import math, numpy as np, torch
+    from usrm2 import train as T, data
+    logit = torch.zeros(1, 1, 4, 4, 4); tgt = torch.zeros(1, 1, 4, 4, 4); tgt[..., :2] = 1.0
+    b0, _ = T.losses(logit, tgt); b1, _ = T.losses(logit, tgt, ridge_w=3.0)
+    assert abs(b0.item() - math.log(2)) < 1e-5 and abs(b1.item() - math.log(2)) < 1e-5  # uniform logits: same value, weights only reshuffle
+    logit[..., :2] = 3.0  # right on the core
+    assert T.losses(logit, tgt, ridge_w=3.0)[0] < T.losses(logit, tgt)[0]  # core weight rewards committing there
+    monkeypatch.setattr(data, "NORM", (100.0, 50.0))
+    x = np.full((2, 2, 2), 150, np.uint8)
+    assert np.allclose(data.zscore(x), 1.0)
+    monkeypatch.setattr(data, "NORM", None)
+    assert np.allclose(data.zscore(x), 0.0)
+
+
+def test_continuity_metric_prefers_unbroken_bands(tmp_path):
+    import json, numpy as np, tifffile
+    from usrm2 import evalsurf as E
+    Z, X = np.meshgrid(np.arange(4, 60, 4, dtype=np.float32), np.arange(4, 60, 4, dtype=np.float32), indexing="ij")
+    g = np.stack([Z, np.full_like(Z, 32.0), X], -1)
+    d = tmp_path / "s" / "surf"; d.mkdir(parents=True)
+    for i, c in enumerate("zyx"):
+        tifffile.imwrite(d / f"{c}.tif", g[..., i])
+    json.dump({"bbox": [[0, 0, 0], [64, 64, 64]]}, open(d / "meta.json", "w"))
+    ax = np.array([[0.0, 100.0], [-1000.0, -1000.0], [32.0, 32.0]])
+    full = np.zeros((64, 64, 64), np.uint8); full[:, 30:35, :] = 255
+    broken = full.copy(); broken[:, :, ::8] = 0  # a gap every 8 voxels along x
+    cf, cb = (E.continuity(v, (0, 0, 0), (64, 64, 64), tifxyz=str(tmp_path), ax=ax, min_pts=50) for v in (full, broken))
+    assert cf["continuity"] > 0.95 and cb["continuity"] < cf["continuity"] - 0.3 and cb["hit_frac"] < cf["hit_frac"]

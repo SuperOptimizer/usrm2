@@ -17,10 +17,15 @@ def main(argv=None):
     t.add_argument("--eval-every", type=int, default=500)
     t.add_argument("--val-patches", type=int, default=32)
     t.add_argument("--accum", type=int, default=1, help="gradient accumulation: micro-batches per optimizer step")
+    t.add_argument("--ema", type=float, default=0.999, help="EMA decay of the evaluated weights (0.9995 for 100k+ steps)")
+    t.add_argument("--lr-floor", type=float, default=0.0, help="cosine decays to this fraction of --lr instead of 0")
+    t.add_argument("--ridge-w", type=float, default=0.0, help="extra BCE weight on the band core (target >= 0.9)")
+    t.add_argument("--dense-pow", type=float, default=0.0, help="bias sampling towards sheet-dense patches (1-2)")
+    t.add_argument("--norm", default="patch", choices=["patch", "global"], help="per-patch z-score or fixed scan mean/std")
     t.add_argument("--resume", action="store_true")
     t.add_argument("--stores", nargs="+", default=None, help="teacher stores to train on (default: data.TRAIN); "
                    "'a.zarr,a_m7.zarr' = several teachers over one box, one head each")
-    t.add_argument("--val", default=None, help="teacher store for validation (default: data.VAL); same comma form")
+    t.add_argument("--val", nargs="+", default=None, help="validation box(es) (default: data.VAL); each a comma-joined teacher group; all are excluded from sampling")
     t.add_argument("--aug", default="geo", help="augmentation preset (see aug.PRESETS)")
     t.add_argument("--no-radial", action="store_true", help="zero the radial channels 1..3")
     b = sub.add_parser("ablate", help="train one run per augmentation preset, sequentially")
@@ -116,7 +121,8 @@ def main(argv=None):
     if a.umbilicus:
         data.UMBILICUS = a.umbilicus
     if a.cmd == "train":
-        T.train(a.out_dir, accum=a.accum, size=a.size, steps=a.steps, patch=a.patch, batch=a.batch, lr=a.lr,
+        T.train(a.out_dir, accum=a.accum, ema_decay=a.ema, lr_floor=a.lr_floor, ridge_w=a.ridge_w, dense_pow=a.dense_pow,
+                norm=a.norm, size=a.size, steps=a.steps, patch=a.patch, batch=a.batch, lr=a.lr,
                 workers=a.workers, eval_every=a.eval_every, val_patches=a.val_patches, resume=a.resume,
                 aug=a.aug, no_radial=a.no_radial,
                 **{k: v for k, v in dict(stores=a.stores, val=a.val).items() if v})

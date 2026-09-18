@@ -101,6 +101,40 @@ def metrics(p_u8, origin, pts, nrm, thr=0.5, far=40, win=16):
     return m
 
 
+def continuity(p_u8, origin, size, tifxyz=TIFXYZ, ax=None, thr=0.5, r=4, min_pts=200):
+    """Along-sheet continuity of the band: for every published surface crossing the box, a grid cell is HIT when
+    the probability along its normal reaches thr within +-r voxels; continuity = fraction of hit cells whose 8
+    grid neighbours are all hit (a broken or fragmented band scores low even at high recall). Also the mean run
+    length of hits along grid rows. Point-weighted over the surfaces."""
+    from usrm2 import refine as R
+    o, s = np.asarray(origin, np.float32), np.asarray(size, np.float32)
+    V, ax = np.asarray(p_u8, np.float32) / 255.0, ax if ax is not None else data.axis()
+    tot, cont, runs, n_hit = 0, 0.0, [], 0
+    for d in R.surfaces_in(tifxyz, o, s, min_pts):
+        g = read_surface(d)
+        n = R.normals(g, ax)
+        k = np.isfinite(g).all(-1) & ((g >= o) & (g < o + s)).all(-1) & np.isfinite(n).all(-1)
+        if k.sum() < min_pts:
+            continue
+        S = R.profile(V, g[k] - o, n[k], r)
+        hit = np.zeros(g.shape[:2], bool)
+        hit[k] = S.max(0) >= thr
+        inner = k.copy()
+        inner[:1], inner[-1:], inner[:, :1], inner[:, -1:] = False, False, False, False
+        nb = np.ones(g.shape[:2], bool)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                nb[1:-1, 1:-1] &= hit[1 + dy:hit.shape[0] - 1 + dy, 1 + dx:hit.shape[1] - 1 + dx]
+        c = inner & hit
+        cont += float(nb[c].sum()); n_hit += int(c.sum()); tot += int(k.sum())
+        for row in hit & k:  # run lengths along grid rows
+            if row.any():
+                edges = np.diff(np.concatenate([[0], row.astype(int), [0]]))
+                runs += (np.where(edges == -1)[0] - np.where(edges == 1)[0]).tolist()
+    return {"continuity": cont / max(n_hit, 1), "hit_frac": n_hit / max(tot, 1), "mean_run": float(np.mean(runs)) if runs else 0.0,
+            "n_points": tot}
+
+
 def read_box(path, origin, size):
     """A box of a probability store (uint8), by global origin."""
     a = data.open_zarr(path)
@@ -139,8 +173,9 @@ def run(origin=VAL_BOX[0], size=VAL_BOX[1], ckpt=None, store=None, teacher=None,
         p_u8, name = P.u8(prob), f"{ckpt}@{st.get('step')}" + (f"+tta{tta}" if tta > 1 else "") + (f"+lut{len(luts)}" if luts else "") + f"+head{head}"
     else:
         p_u8, name = read_box(store, o, s), store
-    print(json.dumps({"source": name, **metrics(p_u8, o, pts, nrm)}))
+    print(json.dumps({"source": name, **metrics(p_u8, o, pts, nrm), **continuity(p_u8, o, s, tifxyz)}))
     if teacher:
-        print(json.dumps({"source": teacher, **metrics(read_box(teacher, o, s), o, pts, nrm)}))
+        pt = read_box(teacher, o, s)
+        print(json.dumps({"source": teacher, **metrics(pt, o, pts, nrm), **continuity(pt, o, s, tifxyz)}))
     if png_path:
         print(json.dumps({"png": png(png_path, ct, p_u8, o, pts)[0]}))

@@ -199,6 +199,7 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
     net.eval()
     roi, ax = data.open_zarr(volume)[z0:z0 + Z, y0:y0 + Y, x0:x0 + X], data.axis()
     r = 0.0 if st["args"].get("no_radial") else 1.0  # training zeroed the radial channels
+    data.NORM = tuple(st["args"]["norm_stats"]) if st["args"].get("norm") == "global" else None  # as trained
     rad = lambda c, o: data.radial(ax, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape) * r
     preps = [lambda c, o: data.inputs(c, rad(c, o))] + [(lambda c, o, l=l: data.inputs(l[c], rad(c, o))) for l in luts]
     pick = HEADS[head] if isinstance(head, str) else (lambda p: p[:, int(head)])
