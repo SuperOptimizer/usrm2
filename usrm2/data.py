@@ -75,6 +75,11 @@ def axis(path=None):
     The default is read at call time, so `--umbilicus` (which rebinds UMBILICUS) is honoured."""
     import json, os
     path = path or UMBILICUS
+    if not os.path.exists(path) and os.path.exists(UMBILICUS):
+        # a store made on another machine records that machine's path: same scroll -> the configured file
+        scroll = os.path.basename(os.path.dirname(path))
+        if scroll and scroll in UMBILICUS:
+            path = UMBILICUS
     assert os.path.exists(path), f"no umbilicus at {path}: every scroll needs one (create it, then pass --umbilicus)"
     pts = sorted((p["z"], p["y"], p["x"]) for p in json.load(open(path))["control_points"])
     return np.array(pts, np.float64).T
