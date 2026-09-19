@@ -245,3 +245,14 @@ def test_non_cubic_patches(tmp_path, monkeypatch):
             eval_every=2, val_patches=2, device="cpu", ct=ct, stores=[tr], val=va)
     rec = json.loads((out / "eval.jsonl").read_text().splitlines()[-1])
     assert math.isfinite(rec["bce"])
+
+
+def test_patch_may_span_a_whole_axis(tmp_path, monkeypatch):
+    """A 128-deep store trains 128 x 64 x 64 patches (the margin is dropped on the full axis)."""
+    ct, (tr, va) = make(tmp_path)
+    umb = tmp_path / "umb.json"
+    umb.write_text(json.dumps({"control_points": [{"z": 0, "y": 128, "x": 128}, {"z": 256, "y": 128, "x": 128}]}))
+    monkeypatch.setattr(data, "UMBILICUS", str(umb))
+    ds = data.Patches(patch=(128, 64, 64), ct=ct, stores=[tr], exclude=va, air_keep=1.0, fg_keep=1.0)
+    x, t = next(iter(ds))
+    assert x.shape == (4, 128, 64, 64) and t.shape == (1, 128, 64, 64)

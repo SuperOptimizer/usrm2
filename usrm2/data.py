@@ -294,7 +294,9 @@ class Patches(torch.utils.data.IterableDataset):
                 served += 1
             i = rng.choice(len(self.arrs), p=self.w)
             o, s = self.boxes[i]
-            lo = rng.integers(MARGIN, s - MARGIN - p + 1)  # store-local corner
+            m = np.where(p > s - 2 * MARGIN, 0, MARGIN)  # a patch spanning a whole axis (384 z) may use the edges
+            assert (p <= s).all(), f"patch {tuple(p)} does not fit store box {tuple(s)}"
+            lo = rng.integers(m, s - m - p + 1)  # store-local corner
             g = o + lo  # global corner
             if any(local(self.vols[i]) == v and np.all(g < b[0] + b[1]) and np.all(g + p > b[0]) for b, v in self.ex):
                 continue
