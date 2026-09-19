@@ -10,6 +10,6 @@ VAL="$T/eval.zarr,$T/p4val256_m7_tta0.zarr,$T/eval_vraw.zarr,$T/p4val256_m7_tta0
 for v in $(sed "s#/vesuvius/usrm2/teacher#$T#g" ~/val_extra.txt); do a=${v%%,*}; b=${v##*,}; VAL="$VAL $a,$b,${a%/*}_vraw/${a##*/},${b%/*}_vraw/${b##*/}"; done
 mkdir -p ~/runs/$R
 usrm2 train ~/runs/$R --size $SIZE --steps $STEPS --patch $PATCH --batch ${BATCH:-1} --accum ${ACCUM:-2} --workers ${WORKERS:-7} \
-  --eval-every 500 --val-patches 8 --aug all3 --ctx ${CTX:-1 2 3 4 5 6 7} --dense-pow 1.5 --ridge-w 2.0 --norm global --ema 0.9995 --lr-floor 0.02 \
+  --eval-every 500 --val-patches 8 --aug all3 --ctx ${CTX:-1 2 3 4 5 6 7 8 9} --dense-pow 1.5 --ridge-w 2.0 --norm global --ema 0.9995 --lr-floor 0.02 \
   --compile --ckpt-act $CKPT --add-skip $ADDSKIP --deep ${DEEP:-3} ${INIT:+--init-from $INIT} --stores-file ~/groups_raw.txt --val $VAL ${EXTRA:-} > ~/runs/$R/nohup.log 2>&1
 echo "A100RUNDONE $R $(date)"
