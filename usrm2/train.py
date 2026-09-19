@@ -153,8 +153,12 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
             assert hw.shape[0] < cout, "cannot drop heads on a warm start"
             j = torch.arange(cout, device=hw.device) % hw.shape[0]
             src["head.weight"], src["head.bias"] = hw[j].clone(), hb[j].clone()
+        own = net.state_dict()
+        skipped = [k for k, v in src.items() if k in own and tuple(own[k].shape) != tuple(v.shape)]
+        src = {k: v for k, v in src.items() if k not in skipped}  # e.g. dec.0 under --add-skip, new deeper levels
         missing = net.load_state_dict(src, strict=False)
-        main and print(f"warm start from {init_from}: {len(missing.missing_keys)} missing, {len(missing.unexpected_keys)} unexpected", flush=True)
+        main and print(f"warm start from {init_from}: {len(missing.missing_keys)} missing, {len(missing.unexpected_keys)} unexpected, "
+                       f"{len(skipped)} shape-mismatched skipped", flush=True)
         args["init_from"] = str(init_from)
     opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min((s + 1) / warmup, 1.0) *
