@@ -147,3 +147,19 @@ ours), rung 3 from the whole scroll, rungs 4+ from two whole-scroll sources.
 Tests: pooling exactness (a 2x pool of a 0/255 mask equals the fraction), weight = 0 outside the box and
 in masked CT, rung sampling covers the range, the scale channel equals (k-2)/9, warm start from a 13-channel
 checkpoint, predict at rung k reproduces training-time inputs.
+
+## 8. Legacy 7.91 um scans (survey 2026-09-19, dl.ash2txt.org)
+
+The open-data bucket has no 7.91 um predictions; the older tree does. Raw CT: `full-scrolls/Scroll{1,2,5}/*.volpkg/
+volumes_zarr_standardized/54keV_7.91um_Scroll1A.zarr` (14376 x 7888 x 8096, u1, 128^3, blosc-zstd, levels 0..5),
+Scroll1B, Scroll2A (14428 x 10112 x 11984), Scroll5 (21000 x 6700 x 9100). Whole-scroll surface predictions on them,
+all u1:
+- `community-uploads/ryan/3d_predictions_scroll{1,2,3_invariant,4}.zarr` (flat zarr v2, 256^3 chunks, thresholded;
+  note the axis order in the metadata is y,x,z-like and must be checked against the CT).
+- `community-uploads/bruniss/scrolls/s1/surfaces/full_scroll/s1-surface-{regular,erode}.zarr` and
+  `mask-2ext-surface*_ome.zarr` (binary / argmax, 128^3), `s1_059_ome.zarr` (multiscale, possibly probabilities);
+  `s3/surfaces/s3-surface-{regular,erode}.zarr` (9778 x 3400 x 3550), `s4/surfaces/s4-surface-{regular,erode}.zarr`
+  and `s4_059_medial_ome.zarr` (11174 x 3440 x 3340), `s5/surfaces/090.zarr` (not characterised).
+These snap to rung 4 (x0.824 resample, 7.91 -> 9.6 um). Scroll 1A at rung 4 is 1.2e11 voxels resampled (~5 GB at
+volcomp q4); the masks resample by mean (fraction) at the same time. Phase 3 material, after the 2.4 um scrolls.
+No 3.24 um volumes or predictions exist on either server.
