@@ -6,7 +6,10 @@ import torch.nn.functional as F
 PRESETS = {"1m": (16, 32, 64, 128), "3m": (24, 48, 96, 192), "5m": (32, 64, 128, 256),
            # deeper nets for the 80 GB card and 256^3+ patches: one more level doubles the receptive field
            "12m": (32, 64, 128, 256, 384), "26m": (32, 64, 128, 256, 512), "45m": (48, 96, 192, 384, 640),
-           "30m6": (32, 64, 128, 256, 384, 384)}  # 6 levels: ~500-voxel theoretical receptive field
+           "30m6": (32, 64, 128, 256, 384, 384),  # 6 levels: ~500-voxel theoretical receptive field
+           # narrow full-resolution level for 512^3 patches: the level-0 tensors (and the level-0 decoder cat)
+           # are what does not fit in 80 GB; the depth and width live in the coarse levels
+           "n16": (16, 32, 64, 128, 256, 512), "n24": (24, 48, 96, 192, 384, 512)}
 
 
 def block(cin, cout):
