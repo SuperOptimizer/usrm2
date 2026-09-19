@@ -27,6 +27,38 @@ def weighted(tgt, wtgt=()):
     return t, w
 
 
+DEEP_W = (1.0, 0.5, 0.25, 0.125)  # loss weight of the level-0 head and the coarser (deep supervision) heads
+
+
+def deep_losses(logits, tgt, ridge_w=0.0, wtgt=()):
+    """`losses` summed over the multi-resolution outputs: level k is scored against the target average-pooled
+    2^k times (weights pooled alongside, so the pooled target stays a probability)."""
+    if not isinstance(logits, (list, tuple)):
+        return losses(logits, tgt, ridge_w, wtgt)
+    t, w = weighted(tgt, wtgt)
+    bce = dice = 0.0
+    for k, lg in enumerate(logits):
+        tk = F.avg_pool3d(t, 2 ** k) if k else t
+        wk = F.avg_pool3d(w, 2 ** k) if (k and w is not None) else w
+        b, d = losses_tw(lg, tk, wk, ridge_w)
+        bce, dice = bce + DEEP_W[k] * b, dice + DEEP_W[k] * d
+    return bce, dice
+
+
+def losses_tw(logit, tgt, wv, ridge_w=0.0):
+    """`losses` on an already-converted (target, weight) pair."""
+    if ridge_w > 0 or wv is not None:
+        w = 1 + ridge_w * (tgt >= 0.9).float()
+        if wv is not None:
+            w = w * wv
+        bce = (F.binary_cross_entropy_with_logits(logit, tgt, reduction="none") * w).sum() / w.sum()
+    else:
+        bce = F.binary_cross_entropy_with_logits(logit, tgt)
+    p, d = torch.sigmoid(logit), (0, 2, 3, 4)
+    dice = (1 - (2 * (p * tgt).sum(d) + 1) / (p.sum(d) + tgt.sum(d) + 1)).mean()
+    return bce, dice
+
+
 def losses(logit, tgt, ridge_w=0.0, wtgt=()):
     """BCE (+ ridge_w extra weight on the band's core, target >= 0.9: the student must commit there) + soft dice.
     wtgt: channels whose stored value is a loss weight (verso targets, see `weighted`)."""
@@ -105,7 +137,7 @@ def val_png(path, net, grid, dev):
 def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=4, warmup=200,
           eval_every=500, val_patches=32, resume=False, device=None, aug="geo", no_radial=False, accum=1,
           ema_decay=0.999, lr_floor=0.0, ridge_w=0.0, dense_pow=0.0, norm="patch", ctx=(), init_from=None, wtgt=(),
-          compile=False, ckpt_act=0, add_skip=0, **kw):
+          compile=False, ckpt_act=0, add_skip=0, deep=0, **kw):
     """accum: gradient accumulation (micro-batches per optimizer step), for big models on small cards.
     lr_floor: the cosine decays to lr_floor * lr instead of 0. norm: "patch" (per-patch z-score) or "global"
     (fixed scan mean/std, stored in the checkpoint). dense_pow / ridge_w: see data.Patches / losses.
@@ -138,8 +170,8 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     assert grid, f"validation store {kw.get('val', data.VAL)} is smaller than the patch ({patch})"
     args["cout"] = cout = grid[0][1].shape[0]  # one head per teacher store
     args["cin"] = cin = grid[0][0].shape[0]  # CT + context cubes + radial vector
-    net = M.build(size, cout=cout, cin=cin, ckpt_act=ckpt_act, add_skip=add_skip).to(dev)
-    args["ckpt_act"], args["add_skip"] = ckpt_act, add_skip
+    net = M.build(size, cout=cout, cin=cin, ckpt_act=ckpt_act, add_skip=add_skip, deep=deep).to(dev)
+    args["ckpt_act"], args["add_skip"], args["deep"] = ckpt_act, add_skip, deep
     if init_from:  # warm start from another run's EMA weights; extra input channels get zero weights (same output at step 0)
         src = torch.load(init_from, map_location=dev)["ema"]
         w = src["enc.0.0.weight"]
@@ -181,7 +213,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     if no_radial:
         for x, _ in grid:
             x[-3:] = 0
-    evnet = M.build(size, verbose=False, cout=cout, cin=cin, add_skip=add_skip).to(dev)
+    evnet = M.build(size, verbose=False, cout=cout, cin=cin, add_skip=add_skip, deep=deep).to(dev)
     dl = data.loader(patch, batch, workers, ct=kw.get("ct", data.CT), stores=kw.get("stores", data.TRAIN),
                      exclude=kw.get("val", data.VAL), seed=step + 7919 * rank, sym=cfg.get("sym", True), aug=cfg, dense_pow=dense_pow, ctx=ctx,
                      stores_file=kw.get("stores_file"))  # a stores file is re-read as it grows (data.Patches)
@@ -212,7 +244,8 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         ct, tg = A.apply(ct.to(dev, non_blocking=True), tg.to(dev, non_blocking=True), cfg)
         ct = ct.to(memory_format=torch.channels_last_3d)
         with autocast(dev):
-            bce, dice = losses(model(ct).float(), tg, ridge_w, wtgt)
+            pred = model(ct)
+            bce, dice = deep_losses([o.float() for o in pred] if isinstance(pred, (list, tuple)) else pred.float(), tg, ridge_w, wtgt)
         loss = bce + dice
         (loss / accum).backward()
         micro += 1

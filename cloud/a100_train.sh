@@ -11,5 +11,5 @@ for v in $(sed "s#/vesuvius/usrm2/teacher#$T#g" ~/val_extra.txt); do a=${v%%,*};
 mkdir -p ~/runs/$R
 usrm2 train ~/runs/$R --size $SIZE --steps $STEPS --patch $PATCH --batch ${BATCH:-1} --accum ${ACCUM:-2} --workers ${WORKERS:-7} \
   --eval-every 500 --val-patches 8 --aug all3 --ctx 1 2 3 --dense-pow 1.5 --ridge-w 2.0 --norm global --ema 0.9995 --lr-floor 0.02 \
-  --compile --ckpt-act $CKPT --add-skip $ADDSKIP ${INIT:+--init-from $INIT} --stores-file ~/groups_raw.txt --val $VAL ${EXTRA:-} > ~/runs/$R/nohup.log 2>&1
+  --compile --ckpt-act $CKPT --add-skip $ADDSKIP --deep ${DEEP:-3} ${INIT:+--init-from $INIT} --stores-file ~/groups_raw.txt --val $VAL ${EXTRA:-} > ~/runs/$R/nohup.log 2>&1
 echo "A100RUNDONE $R $(date)"

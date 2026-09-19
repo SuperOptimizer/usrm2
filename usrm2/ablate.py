@@ -15,7 +15,7 @@ def preview(ckpt, png, patch, ct, val, no_radial=False):
     from PIL import Image
     st = torch.load(ckpt, map_location="cpu")
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net = M.build(st["args"]["size"], verbose=False, cout=st["args"].get("cout", 1), cin=st["args"].get("cin", 4), add_skip=st["args"].get("add_skip", 0)).to(dev)
+    net = M.build(st["args"]["size"], verbose=False, cout=st["args"].get("cout", 1), cin=st["args"].get("cin", 4), add_skip=st["args"].get("add_skip", 0), deep=st["args"].get("deep", 0)).to(dev)
     net.load_state_dict({k: v.to(dev) for k, v in st["ema"].items()})
     net.eval()
     x, t = data.val_grid(patch=patch, ct=ct, store=val, limit=1)[0]

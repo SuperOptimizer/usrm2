@@ -20,14 +20,17 @@ def block(cin, cout):
 
 
 class UNet(nn.Module):
-    def __init__(self, widths=PRESETS["1m"], cin=4, cout=1, ckpt_act=0, add_skip=0):
+    def __init__(self, widths=PRESETS["1m"], cin=4, cout=1, ckpt_act=0, add_skip=0, deep=0):
         """ckpt_act: recompute the activations of the blocks at the first `ckpt_act` levels (the full-resolution
         ones hold most of the memory) in the backward pass (torch.utils.checkpoint); True/-1 = every level.
         Trades compute for a much smaller activation footprint (large patches on one card).
         add_skip: at the first `add_skip` levels the decoder ADDS the skip to a 1x1 projection of the upsampled
         tensor instead of concatenating: the widest full-resolution tensor is then w0 channels, not w0 + w1,
-        which is what keeps big patches under the ~2e9-element kernel cliff (352^3 at width 32)."""
+        which is what keeps big patches under the ~2e9-element kernel cliff (352^3 at width 32).
+        deep: also predict the cout maps at decoder levels 1..deep (2x, 4x, 8x coarser: 4.8/9.6/19.2 um for a
+        2.4 um patch); forward returns [logits_level0, logits_level1, ...] while training, level 0 otherwise."""
         super().__init__()
+        self.deep = int(deep)
         self.ckpt_act = len(widths) if ckpt_act is True or ckpt_act < 0 else int(ckpt_act)
         self.add_skip = int(add_skip)
         w = list(widths)
@@ -36,6 +39,7 @@ class UNet(nn.Module):
         self.dec = nn.ModuleList([block(w[i] if i < self.add_skip else w[i] + w[i + 1], w[i]) for i in range(len(w) - 1)])
         self.proj = nn.ModuleList([nn.Conv3d(w[i + 1], w[i], 1) if i < self.add_skip else nn.Identity() for i in range(len(w) - 1)])
         self.head = nn.Conv3d(w[0], cout, 1)
+        self.deep_heads = nn.ModuleList([nn.Conv3d(w[i], cout, 1) for i in range(1, self.deep + 1)])
 
     def _run(self, m, x, level):
         rg = any(t.requires_grad for t in (x if isinstance(x, tuple) else (x,)))
@@ -53,9 +57,15 @@ class UNet(nn.Module):
             if i < len(self.down):
                 skips.append(x)
                 x = self.down[i](x)
+        outs = {}
         for i in range(len(self.dec) - 1, -1, -1):
             x = self._run(self._stage(i), (x, skips[i]), i)  # upsample + concat inside the checkpointed segment:
-        return self.head(x)                                   # the (w_i + w_i+1)-channel concat is never stored
+            if 1 <= i <= self.deep:                          # the (w_i + w_i+1)-channel concat is never stored
+                outs[i] = self.deep_heads[i - 1](x)
+        y = self.head(x)
+        if self.deep and self.training:
+            return [y] + [outs[i] for i in range(1, self.deep + 1)]
+        return y
 
     def _stage(self, i):
         dec, proj, add = self.dec[i], self.proj[i], i < self.add_skip
@@ -67,8 +77,8 @@ class UNet(nn.Module):
         return f
 
 
-def build(size="1m", verbose=True, cout=1, cin=4, ckpt_act=0, add_skip=0):
-    m = UNet(PRESETS[size], cin=cin, cout=cout, ckpt_act=ckpt_act, add_skip=add_skip).to(memory_format=torch.channels_last_3d)
+def build(size="1m", verbose=True, cout=1, cin=4, ckpt_act=0, add_skip=0, deep=0):
+    m = UNet(PRESETS[size], cin=cin, cout=cout, ckpt_act=ckpt_act, add_skip=add_skip, deep=deep).to(memory_format=torch.channels_last_3d)
     n = sum(p.numel() for p in m.parameters())
     if verbose:
         print(f"usrm2 UNet {size} widths={PRESETS[size]} in={cin} heads={cout} params={n / 1e6:.2f}M")
