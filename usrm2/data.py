@@ -219,6 +219,7 @@ class Patches(torch.utils.data.IterableDataset):
         whenever its mtime changes (checked every `recheck` patches): a training run picks up new stores as
         they are generated, and keeps sampling the old ones (by voxel count) when nothing new arrived."""
         super().__init__()
+        self.norm, self.umbilicus = NORM, UMBILICUS  # module state the (spawned) workers must inherit explicitly
         self.stores_file, self.recheck, self.file_mtime = stores_file, recheck, None
         if stores_file:
             stores = self.read_groups()
@@ -244,6 +245,8 @@ class Patches(torch.utils.data.IterableDataset):
 
     def _open(self):
         """Each teacher store names its CT volume and scroll axis (attrs), so stores from several scrolls can mix."""
+        global NORM, UMBILICUS
+        NORM, UMBILICUS = self.norm, self.umbilicus  # forkserver workers start with fresh module globals
         if self.stores_file:
             self.paths = [g.split(",") for g in self.read_groups()]
             assert self.paths, f"{self.stores_file} lists no store groups"
@@ -333,7 +336,10 @@ def val_grid(patch=128, ct=CT, store=VAL, limit=32, ctx=()):
 
 
 def loader(patch, batch, workers, **kw):
+    """Workers start as fresh processes (forkserver), never forks: the parent has usually opened zarr already
+    (validation grid), whose asyncio loop thread does not survive a fork and breaks streamed (HTTP) reads."""
     ds = Patches(patch=patch, **kw)
     return torch.utils.data.DataLoader(ds, batch_size=batch, num_workers=workers,
                                        pin_memory=True, persistent_workers=workers > 0,
-                                       prefetch_factor=2 if workers else None)
+                                       prefetch_factor=2 if workers else None,
+                                       multiprocessing_context="forkserver" if workers else None)

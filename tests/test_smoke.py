@@ -215,3 +215,15 @@ def test_stores_file_is_reread_when_it_grows(tmp_path, monkeypatch):
     for _ in range(6):
         next(it)
     assert len(ds.paths) == 2 and ds.exclude == [va]
+
+
+def test_loader_workers_start_fresh(tmp_path, monkeypatch):
+    """Worker processes (forkserver) can open the stores and yield patches."""
+    ct, (tr, va) = make(tmp_path)
+    umb = tmp_path / "umb.json"
+    umb.write_text(json.dumps({"control_points": [{"z": 0, "y": 128, "x": 128}, {"z": 256, "y": 128, "x": 128}]}))
+    monkeypatch.setattr(data, "UMBILICUS", str(umb))
+    dl = data.loader(32, 1, 2, ct=ct, stores=[tr], exclude=va, air_keep=1.0, fg_keep=1.0)
+    it = iter(dl)
+    x, t = next(it)
+    assert x.shape == (1, 4, 32, 32, 32) and t.shape == (1, 1, 32, 32, 32)
