@@ -2,13 +2,19 @@ import argparse
 import os
 
 
+def model_presets():
+    from usrm2.model import PRESETS
+    return PRESETS
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser("usrm2")
     ap.add_argument("--umbilicus", default=None, help="scroll axis json (default: PHerc Paris 4)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     t = sub.add_parser("train")
     t.add_argument("out_dir")
-    t.add_argument("--size", default="1m", choices=["1m", "3m", "5m"])
+    t.add_argument("--size", default="1m", choices=list(model_presets()))
+    t.add_argument("--ckpt-act", action="store_true", help="activation checkpointing (big patches on one card)")
     t.add_argument("--steps", type=int, default=20000)
     t.add_argument("--patch", type=int, default=128)
     t.add_argument("--batch", type=int, default=1)  # 128^3 batch 2 needs >3.5 GiB
@@ -36,7 +42,7 @@ def main(argv=None):
     b = sub.add_parser("ablate", help="train one run per augmentation preset, sequentially")
     b.add_argument("out_dir")
     b.add_argument("--presets", default="geo,all")
-    b.add_argument("--size", default="1m", choices=["1m", "3m", "5m"])
+    b.add_argument("--size", default="1m", choices=list(model_presets()))
     b.add_argument("--steps", type=int, default=3000)
     b.add_argument("--patch", type=int, default=96)
     b.add_argument("--batch", type=int, default=4)
@@ -140,7 +146,7 @@ def main(argv=None):
         data.UMBILICUS = a.umbilicus
     if a.cmd == "train":
         T.train(a.out_dir, accum=a.accum, ema_decay=a.ema, lr_floor=a.lr_floor, ridge_w=a.ridge_w, dense_pow=a.dense_pow,
-                norm=a.norm, ctx=tuple(a.ctx), init_from=a.init_from, wtgt=tuple(a.wtgt), compile=a.compile, size=a.size, steps=a.steps, patch=a.patch, batch=a.batch, lr=a.lr,
+                norm=a.norm, ctx=tuple(a.ctx), init_from=a.init_from, wtgt=tuple(a.wtgt), compile=a.compile, ckpt_act=a.ckpt_act, size=a.size, steps=a.steps, patch=a.patch, batch=a.batch, lr=a.lr,
                 workers=a.workers, eval_every=a.eval_every, val_patches=a.val_patches, resume=a.resume,
                 aug=a.aug, no_radial=a.no_radial,
                 **{k: v for k, v in dict(stores=a.stores, stores_file=a.stores_file, val=a.val).items() if v})
