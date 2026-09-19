@@ -16,7 +16,7 @@ def main(argv=None):
     t.add_argument("--size", default="1m", choices=list(model_presets()))
     t.add_argument("--ckpt-act", type=int, default=0, help="activation checkpointing of the first N levels (-1 = all; the full-res levels hold most memory)")
     t.add_argument("--steps", type=int, default=20000)
-    t.add_argument("--patch", type=int, default=128)
+    t.add_argument("--patch", type=int, nargs="+", default=[128], help="patch size: one int (cube) or Z Y X (e.g. 384 512 512)")
     t.add_argument("--batch", type=int, default=1)  # 128^3 batch 2 needs >3.5 GiB
     t.add_argument("--lr", type=float, default=3e-4)
     t.add_argument("--workers", type=int, default=4)
@@ -146,7 +146,7 @@ def main(argv=None):
         data.UMBILICUS = a.umbilicus
     if a.cmd == "train":
         T.train(a.out_dir, accum=a.accum, ema_decay=a.ema, lr_floor=a.lr_floor, ridge_w=a.ridge_w, dense_pow=a.dense_pow,
-                norm=a.norm, ctx=tuple(a.ctx), init_from=a.init_from, wtgt=tuple(a.wtgt), compile=a.compile, ckpt_act=a.ckpt_act, size=a.size, steps=a.steps, patch=a.patch, batch=a.batch, lr=a.lr,
+                norm=a.norm, ctx=tuple(a.ctx), init_from=a.init_from, wtgt=tuple(a.wtgt), compile=a.compile, ckpt_act=a.ckpt_act, size=a.size, steps=a.steps, patch=a.patch if len(a.patch) > 1 else a.patch[0], batch=a.batch, lr=a.lr,
                 workers=a.workers, eval_every=a.eval_every, val_patches=a.val_patches, resume=a.resume,
                 aug=a.aug, no_radial=a.no_radial,
                 **{k: v for k, v in dict(stores=a.stores, stores_file=a.stores_file, val=a.val).items() if v})

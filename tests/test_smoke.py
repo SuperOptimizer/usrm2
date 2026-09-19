@@ -227,3 +227,21 @@ def test_loader_workers_start_fresh(tmp_path, monkeypatch):
     it = iter(dl)
     x, t = next(it)
     assert x.shape == (1, 4, 32, 32, 32) and t.shape == (1, 1, 32, 32, 32)
+
+
+def test_non_cubic_patches(tmp_path, monkeypatch):
+    """A (Z,Y,X) patch trains and evaluates; symmetries never swap z with y/x."""
+    ct, (tr, va) = make(tmp_path)
+    umb = tmp_path / "umb.json"
+    umb.write_text(json.dumps({"control_points": [{"z": 0, "y": 128, "x": 128}, {"z": 256, "y": 128, "x": 128}]}))
+    monkeypatch.setattr(data, "UMBILICUS", str(umb))
+    rng = np.random.default_rng(0)
+    x, t = np.zeros((4, 16, 32, 32), np.float32), np.zeros((1, 16, 32, 32), np.float32)
+    for _ in range(20):
+        xa, ta = data.augment(rng, x, t)
+        assert xa.shape == (4, 16, 32, 32) and ta.shape == (1, 16, 32, 32)
+    out = tmp_path / "run"
+    T.train(out, size="1m", steps=2, patch=[16, 32, 32], batch=1, lr=1e-3, workers=0, warmup=1,
+            eval_every=2, val_patches=2, device="cpu", ct=ct, stores=[tr], val=va)
+    rec = json.loads((out / "eval.jsonl").read_text().splitlines()[-1])
+    assert math.isfinite(rec["bce"])

@@ -5,6 +5,8 @@ attrs origin_zyx = the level-0 index of element 0. CT: uint8, 0 = air/masked.
 A store entry "a.zarr,a_m7.zarr" names several teachers over the SAME box: one target channel each
 (a multi-head student); the first one supplies the box, volume and umbilicus.
 """
+import itertools
+
 import numpy as np
 import torch
 
@@ -57,9 +59,14 @@ def box(arr):
     return np.array(arr.attrs["origin_zyx"], np.int64), np.array(arr.shape[-3:], np.int64)
 
 
+def shape3(p):
+    """A patch size: an int (cube) or a (Z, Y, X) triple -> np.int64[3]."""
+    return np.array([p, p, p] if np.isscalar(p) else p, np.int64)
+
+
 def read3(arr, o, p):
-    """Read a p^3 patch at store-local offset o, tolerating (1,Z,Y,X) stores."""
-    s = tuple(slice(int(a), int(a) + p) for a in o)
+    """Read a patch (cube or (Z,Y,X)) at store-local offset o, tolerating (1,Z,Y,X) stores."""
+    s = tuple(slice(int(a), int(a) + int(n)) for a, n in zip(o, shape3(p)))
     return arr[(0,) + s] if arr.ndim == 4 else arr[s]
 
 
@@ -144,8 +151,11 @@ def raw(rng, ct, cfg):
 
 def augment(rng, x, tg):
     """Random axis permutation + flips applied to the (C,Z,Y,X) input and (T,Z,Y,X) target; the radial
-    vector channels 1..3 of x are permuted/negated to match."""
-    perm, flip = rng.permutation(3), rng.random(3) < 0.5
+    vector channels 1..3 of x are permuted/negated to match. Only permutations that keep the patch shape are
+    drawn (a 384x512x512 patch may swap y and x, not z)."""
+    sh = np.array(x.shape[1:])
+    perms = [q for q in itertools.permutations(range(3)) if (sh[list(q)] == sh).all()]
+    perm, flip = np.array(perms[rng.integers(len(perms))]), rng.random(3) < 0.5
     sl = tuple(slice(None, None, -1 if f else 1) for f in flip)
     tg = np.ascontiguousarray(np.transpose(tg, (0,) + tuple(perm + 1))[(slice(None),) + sl])
     x = np.transpose(x, (0,) + tuple(perm + 1))[(slice(None),) + sl]
@@ -223,7 +233,7 @@ class Patches(torch.utils.data.IterableDataset):
         self.stores_file, self.recheck, self.file_mtime = stores_file, recheck, None
         if stores_file:
             stores = self.read_groups()
-        self.patch, self.ct_path, self.paths, self.seed = patch, ct, [str(s).split(",") for s in stores], seed
+        self.patch, self.ct_path, self.paths, self.seed = shape3(patch), ct, [str(s).split(",") for s in stores], seed
         self.exclude = [e for e in (exclude if isinstance(exclude, (list, tuple)) else [exclude]) if e]
         self.dense_pow, self.dense_ref, self.ctx = dense_pow, dense_ref, tuple(ctx)  # coarse context levels
         self.sym = sym  # the 48 cube symmetries; the GPU augs are in aug.py
@@ -290,9 +300,9 @@ class Patches(torch.utils.data.IterableDataset):
                 continue
             bl = self.aug.get("blank")
             if bl and rng.random() < bl["p"]:  # an all-air patch (CT 0 = air) with target 0
-                ct, tg = np.zeros((p, p, p), np.uint8), np.zeros((len(self.heads[i]), p, p, p), np.float32)
+                ct, tg = np.zeros(tuple(p), np.uint8), np.zeros((len(self.heads[i]),) + tuple(p), np.float32)
             else:
-                ct = self.cts[i][g[0]:g[0] + p, g[1]:g[1] + p, g[2]:g[2] + p]
+                ct = self.cts[i][g[0]:g[0] + p[0], g[1]:g[1] + p[1], g[2]:g[2] + p[2]]
                 if (ct == 0).mean() > 0.9 and rng.random() > self.air_keep:
                     continue
                 tg = np.stack([read3(a, lo, p) for a in self.heads[i]]).astype(np.float32) / 255.0 * (ct > 0)  # masked CT -> no surface
@@ -319,15 +329,16 @@ def val_grid(patch=128, ct=CT, store=VAL, limit=32, ctx=()):
     tga = heads[0]
     cta, ax = open_zarr(tga.attrs.get("volume", ct)), axis(tga.attrs.get("umbilicus", UMBILICUS))
     o, s = box(tga)
-    corners = [(z, y, x) for z in range(0, s[0] - patch + 1, patch)
-               for y in range(0, s[1] - patch + 1, patch)
-               for x in range(0, s[2] - patch + 1, patch)]
+    p3 = shape3(patch)
+    corners = [(z, y, x) for z in range(0, s[0] - p3[0] + 1, p3[0])
+               for y in range(0, s[1] - p3[1] + 1, p3[1])
+               for x in range(0, s[2] - p3[2] + 1, p3[2])]
     if limit and len(corners) > limit:  # deterministic even subsample
         corners = [corners[i] for i in np.linspace(0, len(corners) - 1, limit).astype(int)]
     out = []
     for lo in corners:
         g = o + np.array(lo)
-        c = cta[g[0]:g[0] + patch, g[1]:g[1] + patch, g[2]:g[2] + patch]
+        c = cta[g[0]:g[0] + p3[0], g[1]:g[1] + p3[1], g[2]:g[2] + p3[2]]
         t = np.stack([read3(a, lo, patch) for a in heads]).astype(np.float32) / 255.0 * (c > 0)
         vol = tga.attrs.get("volume", ct)
         cx = context(vol, g, c.shape, ctx) if ctx else ()

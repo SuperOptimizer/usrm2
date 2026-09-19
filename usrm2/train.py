@@ -126,6 +126,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     out.mkdir(parents=True, exist_ok=True)
     cfg = dict(A.get(aug), **({"norad": True} if no_radial else {}))
     no_radial = bool(cfg.get("norad"))
+    patch = int(patch[0]) if not np.isscalar(patch) and len(patch) == 1 else (patch if np.isscalar(patch) else [int(v) for v in patch])
     args = dict(size=size, steps=steps, patch=patch, batch=batch, lr=lr, aug=aug, aug_cfg=cfg,
                 no_radial=no_radial, accum=accum, ema_decay=ema_decay, lr_floor=lr_floor, ridge_w=ridge_w, wtgt=list(wtgt),
                 dense_pow=dense_pow, norm=norm, ctx=list(ctx), world=world, **kw)
@@ -221,7 +222,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         if step % 20 == 0:
             dt = time.time() - t0
             log("train.jsonl", {"step": step, "loss": loss.item(), "bce": bce.item(), "dice": dice.item(),
-                                "lr": sched.get_last_lr()[0], "vox_s": round(20 * accum * batch * world * patch ** 3 / dt),
+                                "lr": sched.get_last_lr()[0], "vox_s": round(20 * accum * batch * world * int(np.prod(data.shape3(patch))) / dt),
                                 "vram_MiB": round(torch.cuda.max_memory_allocated() / 2 ** 20) if dev.type == "cuda" else 0})
             t0 = time.time()
         if (step % eval_every == 0 or step == steps) and main:
