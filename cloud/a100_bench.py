@@ -31,7 +31,7 @@ def step(net, x, tg, n=4):
 print(f"{torch.cuda.get_device_name(0)}  {torch.cuda.get_device_properties(0).total_memory / 2**30:.0f} GiB")
 for s in sizes:
     for p in patches:
-        for ck in (False, True):
+        for ck in (0, 2, -1):  # no checkpointing / the two full-res levels / every level
             for b in (1, 2):
                 torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
                 try:
@@ -41,9 +41,9 @@ for s in sizes:
                     dt = step(net, x, tg)
                     peak = torch.cuda.max_memory_allocated() / 2**30
                     vox = b * p**3 / dt
-                    print(f"{s:5s} patch {p:3d} ckpt={int(ck)} batch {b}: {dt*1000:7.0f} ms/step  {vox/1e6:6.1f} Mvox/s  peak {peak:5.1f} GiB", flush=True)
+                    print(f"{s:5s} patch {p:3d} ckpt={ck:2d} batch {b}: {dt*1000:7.0f} ms/step  {vox/1e6:6.1f} Mvox/s  peak {peak:5.1f} GiB", flush=True)
                 except torch.OutOfMemoryError:
-                    print(f"{s:5s} patch {p:3d} ckpt={int(ck)} batch {b}: OOM", flush=True)
+                    print(f"{s:5s} patch {p:3d} ckpt={ck:2d} batch {b}: OOM", flush=True)
                 finally:
                     for v in ("net", "x", "tg"):
                         if v in dir(): pass

@@ -14,7 +14,7 @@ def main(argv=None):
     t = sub.add_parser("train")
     t.add_argument("out_dir")
     t.add_argument("--size", default="1m", choices=list(model_presets()))
-    t.add_argument("--ckpt-act", action="store_true", help="activation checkpointing (big patches on one card)")
+    t.add_argument("--ckpt-act", type=int, default=0, help="activation checkpointing of the first N levels (-1 = all; the full-res levels hold most memory)")
     t.add_argument("--steps", type=int, default=20000)
     t.add_argument("--patch", type=int, default=128)
     t.add_argument("--batch", type=int, default=1)  # 128^3 batch 2 needs >3.5 GiB
