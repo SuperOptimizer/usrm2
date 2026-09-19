@@ -51,7 +51,7 @@ async def main():
             if l >= 1:
                 rels += [f"{l}/c/{z}/{y}/{x}" for z in range(n[0]) for y in range(n[1]) for x in range(n[2])]
             else:
-                n0, c0 = n, chunks
+                n0, c0, shape0 = n, np.array(chunks), np.array(shape)
         # level 0: chunks covering every training/val box (+ margin)
         boxes = set()
         for line in open(groups):
@@ -59,7 +59,7 @@ async def main():
                 if not p or "_v" in os.path.basename(p.rstrip("/")):
                     continue
                 a = zarr.open(p, mode="r"); o = np.array(a.attrs["origin_zyx"]); sz = np.array(a.shape[-3:])
-                lo = np.maximum(o - margin, 0) // c0; hi = np.minimum(o + sz + margin, meta["shape"]) // c0
+                lo = np.maximum(o - margin, 0) // c0; hi = np.minimum(o + sz + margin, shape0) // c0
                 for z in range(lo[0], hi[0] + 1):
                     for y in range(lo[1], hi[1] + 1):
                         for x in range(lo[2], hi[2] + 1):
