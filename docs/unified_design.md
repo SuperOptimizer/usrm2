@@ -36,8 +36,14 @@ A sample is (scan, rung k, 256^3 corner). Model input channels, all 256^3:
 - 9 context cubes at rungs k+1 .. k+9, same size, same centre (as today; beyond the top of a scan's pyramid
   the cube keeps being pooled, so the scroll just shrinks inside it),
 - the radial unit vector (3),
-- a scale channel: constant plane (k - 2) / 9 (0 at 2.4 um). Explicit, so one trunk can behave differently
-  per rung without inferring the scale from sheet thickness.
+- a scale channel: constant plane (k - 2) / 9 (0 at 2.4 um, log scale in the rung index). It says "this cube
+  is 0.6 * 2^k um", and since the context cubes sit at k+1..k+9 by construction it fixes their scales too.
+
+The stack is anchored at the predicted rung: no finer-than-primary cubes exist in the input, so a 2.4 um
+sample carries no 0.6/1.2 slots and needs no ignore. The context count is fixed at 9 for every scroll; past
+the top of a scan's pyramid the loader keeps pooling, so a 9.6 um scroll's rungs 12 and 13 are the whole
+scroll at 1/2 and 1/4 size inside the cube (cheap: cached small arrays, one stem channel each). Nine is
+enough for the largest scroll (80k x 40k x 40k at 2.4 um -> 156 x 78 x 78 at rung 11).
 
 14 input channels; the warm start from round 3 (13 channels: CT + 9 ctx + radial) widens the stem and
 zero-fills the scale channel (train.py already does "image channels first, radial last"; the scale channel
@@ -58,8 +64,10 @@ rung becomes the fraction of surface voxels at every coarser rung: the dynamic r
 Attrs: `volume` (CT mirror base), `rung` (native), `kind` (binary | prob), `weight` (source weight),
 `box` (origin and size at the native rung; whole scroll = the full shape).
 
-At the native rung a binary mask is softened before use (Gaussian sigma 1 voxel, values clipped to 1
-inside the mask) so the loss does not chase a hard 1-voxel edge the mask itself does not know.
+Decisions 2026-09-19 (user): published masks are used AS PUBLISHED at their native rung, no softening, no
+CT gating, no medial-surface band, no thickness weighting; only our own 2x mean pooling above the native rung
+(their own pyramid levels are binary nearest/max and are not used). The loss sees a hard band at a mask's
+native rung and fractions above it.
 
 The loader returns (x, target, weight). The per-voxel weight is the product of
 - the source weight (published masks 1.0, our own probability stores 1.0, targets upsampled from a coarser
