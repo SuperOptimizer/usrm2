@@ -185,6 +185,6 @@ Lobster VMs, volume-compressor/tools/export, hot path in C), as continuous 0-255
   7-level ramp itself. The CT volumes get the same exact-grid resampling later.
 - levels 1..3 by 2x mean pooling per unit; levels 4..9 pooled offline from level 3.
 - q by PHYSICAL voxel size, one table for predictions and CT: 0.6 um q32, 1.2 q16, 2.4 q8, 4.8 q4, 9.6 q2,
-  19.2 and coarser q1 (so an m7 prediction native at 9.6 um is q2 at its level 0 and q1 above).
+  19.2 q1, 38.4 and coarser q0 lossless (so an m7 prediction native at 9.6 um is q2, q1, then lossless).
 Output mirrors the bucket keys under volcomp/<scroll>/representations/predictions/surfaces/<name>.zarr/<level>.
 The training loader then reads these directly as target pyramids (values / 255), no importer needed.
