@@ -105,7 +105,7 @@ def val_png(path, net, grid, dev):
 def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=4, warmup=200,
           eval_every=500, val_patches=32, resume=False, device=None, aug="geo", no_radial=False, accum=1,
           ema_decay=0.999, lr_floor=0.0, ridge_w=0.0, dense_pow=0.0, norm="patch", ctx=(), init_from=None, wtgt=(),
-          compile=False, ckpt_act=0, **kw):
+          compile=False, ckpt_act=0, add_skip=0, **kw):
     """accum: gradient accumulation (micro-batches per optimizer step), for big models on small cards.
     lr_floor: the cosine decays to lr_floor * lr instead of 0. norm: "patch" (per-patch z-score) or "global"
     (fixed scan mean/std, stored in the checkpoint). dense_pow / ridge_w: see data.Patches / losses.
@@ -138,8 +138,8 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     assert grid, f"validation store {kw.get('val', data.VAL)} is smaller than the patch ({patch})"
     args["cout"] = cout = grid[0][1].shape[0]  # one head per teacher store
     args["cin"] = cin = grid[0][0].shape[0]  # CT + context cubes + radial vector
-    net = M.build(size, cout=cout, cin=cin, ckpt_act=ckpt_act).to(dev)
-    args["ckpt_act"] = ckpt_act
+    net = M.build(size, cout=cout, cin=cin, ckpt_act=ckpt_act, add_skip=add_skip).to(dev)
+    args["ckpt_act"], args["add_skip"] = ckpt_act, add_skip
     if init_from:  # warm start from another run's EMA weights; extra input channels get zero weights (same output at step 0)
         src = torch.load(init_from, map_location=dev)["ema"]
         w = src["enc.0.0.weight"]
@@ -177,7 +177,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     if no_radial:
         for x, _ in grid:
             x[-3:] = 0
-    evnet = M.build(size, verbose=False, cout=cout, cin=cin).to(dev)
+    evnet = M.build(size, verbose=False, cout=cout, cin=cin, add_skip=add_skip).to(dev)
     dl = data.loader(patch, batch, workers, ct=kw.get("ct", data.CT), stores=kw.get("stores", data.TRAIN),
                      exclude=kw.get("val", data.VAL), seed=step + 7919 * rank, sym=cfg.get("sym", True), aug=cfg, dense_pow=dense_pow, ctx=ctx,
                      stores_file=kw.get("stores_file"))  # a stores file is re-read as it grows (data.Patches)

@@ -20,16 +20,21 @@ def block(cin, cout):
 
 
 class UNet(nn.Module):
-    def __init__(self, widths=PRESETS["1m"], cin=4, cout=1, ckpt_act=0):
+    def __init__(self, widths=PRESETS["1m"], cin=4, cout=1, ckpt_act=0, add_skip=0):
         """ckpt_act: recompute the activations of the blocks at the first `ckpt_act` levels (the full-resolution
         ones hold most of the memory) in the backward pass (torch.utils.checkpoint); True/-1 = every level.
-        Trades compute for a much smaller activation footprint (large patches on one card)."""
+        Trades compute for a much smaller activation footprint (large patches on one card).
+        add_skip: at the first `add_skip` levels the decoder ADDS the skip to a 1x1 projection of the upsampled
+        tensor instead of concatenating: the widest full-resolution tensor is then w0 channels, not w0 + w1,
+        which is what keeps big patches under the ~2e9-element kernel cliff (352^3 at width 32)."""
         super().__init__()
         self.ckpt_act = len(widths) if ckpt_act is True or ckpt_act < 0 else int(ckpt_act)
+        self.add_skip = int(add_skip)
         w = list(widths)
         self.enc = nn.ModuleList([block(cin if i == 0 else w[i - 1], w[i]) for i in range(len(w))])
         self.down = nn.ModuleList([nn.Conv3d(c, c, 3, stride=2, padding=1) for c in w[:-1]])
-        self.dec = nn.ModuleList([block(w[i] + w[i + 1], w[i]) for i in range(len(w) - 1)])
+        self.dec = nn.ModuleList([block(w[i] if i < self.add_skip else w[i] + w[i + 1], w[i]) for i in range(len(w) - 1)])
+        self.proj = nn.ModuleList([nn.Conv3d(w[i + 1], w[i], 1) if i < self.add_skip else nn.Identity() for i in range(len(w) - 1)])
         self.head = nn.Conv3d(w[0], cout, 1)
 
     def _run(self, m, x, level):
@@ -53,17 +58,17 @@ class UNet(nn.Module):
         return self.head(x)                                   # the (w_i + w_i+1)-channel concat is never stored
 
     def _stage(self, i):
-        dec = self.dec[i]
+        dec, proj, add = self.dec[i], self.proj[i], i < self.add_skip
 
         def f(pair):
             x, skip = pair
             x = F.interpolate(x, size=skip.shape[2:], mode="trilinear", align_corners=False)
-            return dec(torch.cat([x, skip], 1))
+            return dec(proj(x) + skip) if add else dec(torch.cat([x, skip], 1))
         return f
 
 
-def build(size="1m", verbose=True, cout=1, cin=4, ckpt_act=0):
-    m = UNet(PRESETS[size], cin=cin, cout=cout, ckpt_act=ckpt_act).to(memory_format=torch.channels_last_3d)
+def build(size="1m", verbose=True, cout=1, cin=4, ckpt_act=0, add_skip=0):
+    m = UNet(PRESETS[size], cin=cin, cout=cout, ckpt_act=ckpt_act, add_skip=add_skip).to(memory_format=torch.channels_last_3d)
     n = sum(p.numel() for p in m.parameters())
     if verbose:
         print(f"usrm2 UNet {size} widths={PRESETS[size]} in={cin} heads={cout} params={n / 1e6:.2f}M")

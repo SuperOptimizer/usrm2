@@ -207,7 +207,7 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
     (slide_gpu; CT + radial inputs only, no context channels / luts / tta)."""
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     st = torch.load(ckpt, map_location=dev)
-    net = M.build(st["args"]["size"], verbose=False, cout=st["args"].get("cout", 1), cin=st["args"].get("cin", 4)).to(dev)
+    net = M.build(st["args"]["size"], verbose=False, cout=st["args"].get("cout", 1), cin=st["args"].get("cin", 4), add_skip=st["args"].get("add_skip", 0)).to(dev)
     net.load_state_dict(st["ema"])
     net.eval()
     roi, ax = data.open_zarr(volume)[z0:z0 + Z, y0:y0 + Y, x0:x0 + X], data.axis()
