@@ -14,15 +14,21 @@ threads = int(sys.argv[sys.argv.index("--threads") + 1]) if "--threads" in sys.a
 a = zarr.open(f"{base}/{src}", mode="r")
 S = np.array(a.shape); T = (S + 1) // 2
 tmp = f"{base}/{dst}.new"
-shutil.rmtree(tmp, ignore_errors=True)
-out = zarr.create_array(tmp, shape=tuple(int(v) for v in T), chunks=(128, 128, 128), dtype="uint8", fill_value=0,
-                        overwrite=True, serializer=VolcompCodec(q=q))
+resume = os.path.exists(f"{tmp}/zarr.json") and "--fresh" not in sys.argv  # an interrupted build continues
+if resume:
+    out = zarr.open(tmp, mode="r+")
+else:
+    shutil.rmtree(tmp, ignore_errors=True)
+    out = zarr.create_array(tmp, shape=tuple(int(v) for v in T), chunks=(128, 128, 128), dtype="uint8", fill_value=0,
+                            overwrite=True, serializer=VolcompCodec(q=q))
 out.attrs.update(dict(a.attrs)); out.attrs.update({"level": dst, "pooled_from": src, "volcomp_q": q})
 jobs = [(z, y, x) for z in range(0, T[0], 128) for y in range(0, T[1], 128) for x in range(0, T[2], 128)]
 
 
 def one(j):
     z, y, x = j
+    if resume and os.path.exists(f"{tmp}/c/{z // 128}/{y // 128}/{x // 128}"):
+        return 0  # written by the interrupted run (all-air chunks are recomputed, they are cheap)
     lo = np.array([z, y, x]) * 2; hi = np.minimum(lo + 256, S)
     blk = np.asarray(a[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]], np.float32)
     if not blk.any():
