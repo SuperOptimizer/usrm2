@@ -171,3 +171,20 @@ all u1:
 These snap to rung 4 (x0.824 resample, 7.91 -> 9.6 um). Scroll 1A at rung 4 is 1.2e11 voxels resampled (~5 GB at
 volcomp q4); the masks resample by mean (fraction) at the same time. Phase 3 material, after the 2.4 um scrolls.
 No 3.24 um volumes or predictions exist on either server.
+
+## 9. Export of the published predictions (decided 2026-09-19, later in the day)
+
+Superseding the "as published" rule of section 3: the masks are exported ONCE, by the volcomp fleet (Blue
+Lobster VMs, volume-compressor/tools/export, hot path in C), as continuous 0-255 volumes on the exact ladder:
+- signed-distance ramp at the native resolution: s = signed distance to the mask boundary in voxels clipped to
+  [-3, 3] (positive inside), value = round(127.5 + 42.5 s): inside 170/213/255, outside 85/43/0, the 128
+  crossing exactly on the published edge. Continuous data compresses under volcomp; a 0/255 step does not.
+- then a trilinear resample of the ramp onto the exact rung grid (9.362 and 8.64 um -> 9.6, 2.215 -> 2.4,
+  1.129 -> 1.2, 0.55 -> 0.6, and 2.399/2.401/2.403 -> 2.400: 0.1 % is ~90 voxels of drift across Paris 4).
+  Resampling a ramp also blends sub-voxel positions, so the values become a little more continuous than the
+  7-level ramp itself. The CT volumes get the same exact-grid resampling later.
+- levels 1..3 by 2x mean pooling per unit; levels 4..9 pooled offline from level 3.
+- q by PHYSICAL voxel size, one table for predictions and CT: 0.6 um q32, 1.2 q16, 2.4 q8, 4.8 q4, 9.6 q2,
+  19.2 and coarser q1 (so an m7 prediction native at 9.6 um is q2 at its level 0 and q1 above).
+Output mirrors the bucket keys under volcomp/<scroll>/representations/predictions/surfaces/<name>.zarr/<level>.
+The training loader then reads these directly as target pyramids (values / 255), no importer needed.
