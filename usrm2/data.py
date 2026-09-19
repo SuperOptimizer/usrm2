@@ -174,7 +174,7 @@ def levels(volume):
     base = str(local(str(volume))).rstrip("/").rsplit("/", 1)[0]
     if base not in CTX_CACHE:
         d = {}
-        for l in range(1, 4):
+        for l in range(1, 8):  # 4.8 um .. 307 um (level 7: one 256^3 cube = the whole Paris 4 cross-section)
             if "://" not in base and not os.path.isdir(f"{base}/{l}"):
                 break  # a level missing from the local mirror is pooled from the one below, never streamed
             try:
