@@ -33,7 +33,8 @@ class UNet(nn.Module):
         self.head = nn.Conv3d(w[0], cout, 1)
 
     def _run(self, m, x, level):
-        if level < self.ckpt_act and self.training and x.requires_grad:
+        rg = any(t.requires_grad for t in (x if isinstance(x, tuple) else (x,)))
+        if level < self.ckpt_act and self.training and rg:
             from torch.utils.checkpoint import checkpoint
             return checkpoint(m, x, use_reentrant=False)
         return m(x)
@@ -48,9 +49,17 @@ class UNet(nn.Module):
                 skips.append(x)
                 x = self.down[i](x)
         for i in range(len(self.dec) - 1, -1, -1):
-            x = F.interpolate(x, size=skips[i].shape[2:], mode="trilinear", align_corners=False)
-            x = self._run(self.dec[i], torch.cat([x, skips[i]], 1), i)
-        return self.head(x)
+            x = self._run(self._stage(i), (x, skips[i]), i)  # upsample + concat inside the checkpointed segment:
+        return self.head(x)                                   # the (w_i + w_i+1)-channel concat is never stored
+
+    def _stage(self, i):
+        dec = self.dec[i]
+
+        def f(pair):
+            x, skip = pair
+            x = F.interpolate(x, size=skip.shape[2:], mode="trilinear", align_corners=False)
+            return dec(torch.cat([x, skip], 1))
+        return f
 
 
 def build(size="1m", verbose=True, cout=1, cin=4, ckpt_act=0):
