@@ -4,13 +4,15 @@ whole from dl.ash2txt.org (fast), level 0 only for the chunks the training boxes
 3-5 come from the desk. Layout mirrors the desk (/vesuvius/usrm/volcomp/<scroll>/<vol>.zarr/<level>) so
 data.local() maps the streamed URL onto it and data.levels() finds the pyramid.
     python cloud/a100_mirror.py ~/groups_raw.txt [--margin 256] [--jobs 32]
+    python cloud/a100_mirror.py --boxes ~/boxes_p4.txt          # boxes as "z y x Z Y X" lines instead of stores
 """
 import asyncio, glob, json, os, sys, time
 import aiohttp, numpy as np, zarr
 
 URL = "https://dl.ash2txt.org/community-uploads/forrest/volcomp/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr"
 DST = "/vesuvius/usrm/volcomp/PHercParis4/20260411134726-2.400um-0.2m-78keV-masked.zarr"
-groups = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/groups_raw.txt")
+groups = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else os.path.expanduser("~/groups_raw.txt")
+boxes_file = sys.argv[sys.argv.index("--boxes") + 1] if "--boxes" in sys.argv else None  # "z y x Z Y X" per line
 margin = int(sys.argv[sys.argv.index("--margin") + 1]) if "--margin" in sys.argv else 256
 jobs = int(sys.argv[sys.argv.index("--jobs") + 1]) if "--jobs" in sys.argv else 32
 os.makedirs(DST, exist_ok=True)
@@ -54,11 +56,20 @@ async def main():
                 n0, c0, shape0 = n, np.array(chunks), np.array(shape)
         # level 0: chunks covering every training/val box (+ margin)
         boxes = set()
-        for line in open(groups):
-            for p in line.strip().split(","):
-                if not p or "_v" in os.path.basename(p.rstrip("/")):
-                    continue
-                a = zarr.open(p, mode="r"); o = np.array(a.attrs["origin_zyx"]); sz = np.array(a.shape[-3:])
+        def box_list():
+            if boxes_file:
+                for line in open(boxes_file):
+                    v = [int(q) for q in line.split()]
+                    if len(v) == 6:
+                        yield np.array(v[:3]), np.array(v[3:])
+                return
+            for line in open(groups):
+                for p in line.strip().split(","):
+                    if not p or "_v" in os.path.basename(p.rstrip("/")):
+                        continue
+                    a = zarr.open(p, mode="r"); yield np.array(a.attrs["origin_zyx"]), np.array(a.shape[-3:])
+        for o, sz in box_list():
+            if True:
                 lo = np.maximum(o - margin, 0) // c0; hi = np.minimum(o + sz + margin, shape0) // c0
                 for z in range(lo[0], hi[0] + 1):
                     for y in range(lo[1], hi[1] + 1):

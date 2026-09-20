@@ -7,5 +7,5 @@ SRC="https://dl.ash2txt.org/community-uploads/forrest/volcomp/$S/representations
 DST="/vesuvius/usrm/volcomp/$S/representations/predictions/surfaces"
 mkdir -p "$DST" && cd "$DST" || exit 1
 # community-uploads/forrest/volcomp/<S>/representations/predictions/surfaces/ = 7 path components to cut
-wget -q -r -np -nH -N --cut-dirs=7 -R "index.html*" -e robots=off "$SRC"
+wget -q -r -l inf -np -nH -N --cut-dirs=7 -R "index.html*" -e robots=off "$SRC"
 echo "pulled $(find . -type f | wc -l) files, $(du -sh . | cut -f1) into $DST $(date)"
