@@ -378,3 +378,13 @@ the optimisation mid-run); pinning the loader batch harder (it is already `pin_m
 `non_blocking=True`, and on this proxied GPU pinned H2D is 2.35 GiB/s against 2.24 pageable, so the
 403 MB/step costs ~167 ms either way and does not overlap with compute); a bf16 loss (the loss is
 0.7% of the step).
+
+## 15. Other scrolls: lossless masks on the native grid (user, 2026-09-20)
+
+For every published prediction other than Paris 4: a new volcomp mask mode with NO internal 2x2x2 downscale
+(spatially lossless binary mask, same context coder, decode = the published 0/255 mask), and NO resampling onto
+the 0.6*2^k ladder: levels keep the source grid and are named by their true voxel size (e.g. "9.596", "19.192"
+for an m7 mask read at L2 of a 2.399 um scan; "9.362", "18.724" for a 9.362 um scan). The loader snaps a level to
+its nearest rung (nearest in log2) and the CT mirrors are on the same native grids, so nothing needs resampling
+up front; exact-grid resampling remains available (`--encoding mask`) if a scroll ever needs it. Paris 4 keeps
+its existing 2x-mode export (it is exactly 2.400 um and already training).
