@@ -11,7 +11,7 @@ import pytest
 import torch
 import zarr
 
-from usrm2 import data, model as M, predict as P, train as T
+from usrm2 import data, model as M, predict as P, prep, train as T
 
 P32 = 32  # patch
 
@@ -154,7 +154,10 @@ def test_a_sample_reads_ct_target_and_context_from_the_rung(tmp_path, monkeypatc
     for k in (2, 3):
         ds = data.Patches(patch=P32, stores=lines, exclude=[], rungs={k}, ctx=(1, 2), sym=False,
                           air_keep=1.0, fg_keep=1.0)
-        x, t, w, rung = next(iter(ds))
+        item = next(iter(ds))
+        assert item["ct"].dtype == item["tgt"].dtype == item["w"].dtype == torch.uint8
+        x, t, w = prep.prepare(prep.batch1(item), torch.device("cpu"))
+        x, t, w, rung = x[0], t[0], w[0], int(item["rung"])
         assert rung == k and x.shape == (1 + 2 + 1 + 3, P32, P32, P32)
         assert torch.allclose(x[0], torch.tensor(100.0 + 10 * (k - 2)))        # CT at rung k
         for d in (1, 2):  # the context cubes come from rungs k+1, k+2 (0 where the cube leaves the volume)
@@ -190,13 +193,15 @@ def test_weights_are_zero_outside_the_box_in_masked_ct_and_for_a_missing_channel
     ds._open_rungs()
     assert ds.channels == ["recto", "verso"]
     s = ds.srcs[0]
-    ctp = data.read_rung(s["ct_pyr"], 2, (48, 0, 0), P32).astype(np.uint8)
+    ctp = data.read_rung(s["ct_pyr"], 2, (48, 0, 0), P32, dtype=np.uint8)
     t, w = ds._rung_target(s, 2, np.array([48, 0, 0]), ctp)
-    assert np.allclose(w[0, :16], 0.5) and np.allclose(w[0, 16:], 0.0)  # the box ends at z = 64
-    assert np.allclose(w[1], 0.0) and np.allclose(t[1], 0.0)            # this source has no verso channel
+    assert t.dtype == w.dtype == np.uint8  # 255 = 1.0; the weight quantisation round trips to 1/255
+    assert np.allclose(w[0, :16] / 255, 0.5, atol=1 / 255) and np.all(w[0, 16:] == 0)  # the box ends at z = 64
+    assert np.all(w[1] == 0) and np.all(t[1] == 0)                     # this source has no verso channel
     ctp[:, :8] = 0  # masked CT
     t, w = ds._rung_target(s, 2, np.array([0, 0, 0]), ctp)
-    assert np.allclose(w[0][:, :8], 0.0) and np.allclose(t[0][:, :8], 0.0) and np.allclose(w[0][:, 8:], 0.5)
+    assert np.all(w[0][:, :8] == 0) and np.all(t[0][:, :8] == 0)
+    assert np.allclose(w[0][:, 8:] / 255, 0.5, atol=1 / 255)
 
 
 def test_the_partial_level_index_keeps_sampling_off_missing_chunks(tmp_path, monkeypatch):
@@ -212,8 +217,7 @@ def test_the_partial_level_index_keeps_sampling_off_missing_chunks(tmp_path, mon
                       air_keep=1.0, fg_keep=1.0)
     it = iter(ds)
     for _ in range(20):
-        x, t, w, k = next(it)
-        assert (x[0] > 0).all()  # a missing chunk would read as zeros (air) and must never be sampled
+        assert (next(it)["ct"][0] > 0).all()  # a missing chunk reads as zeros (air) and must never be sampled
 
 
 def test_the_val_box_is_excluded_at_every_rung(tmp_path, monkeypatch):
@@ -240,10 +244,12 @@ def test_val_grid_rungs_scores_every_rung(tmp_path, monkeypatch):
     monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
     ct, tg, lines = sources(tmp_path)
     grid = data.val_grid_rungs(P32, lines, ((0, 0, 0), (64, 64, 64)), rungs=(2, 3, 4), limit=2, ctx=(1,))
-    assert {g[3] for g in grid} == {2, 3, 4}
-    for x, t, w, k in grid:
-        assert x.shape == (1 + 1 + 1 + 3, P32, P32, P32) and t.shape == (1, P32, P32, P32)
-        assert torch.allclose(x[2], torch.tensor((k - 2) / 9))
+    assert {int(g["rung"]) for g in grid} == {2, 3, 4}
+    assert all(g["ct"].dtype == torch.uint8 for g in grid)  # compact: 8 patches x 3 rungs is ~1.6 GB at 256^3
+    for g in grid:
+        x, t, w = prep.prepare(prep.batch1(g), torch.device("cpu"))
+        assert x.shape == (1, 1 + 1 + 1 + 3, P32, P32, P32) and t.shape == (1, 1, P32, P32, P32)
+        assert torch.allclose(x[0, 2], torch.tensor((int(g["rung"]) - 2) / 9))
 
 
 def test_rung_mix_report(tmp_path, capsys):
@@ -310,7 +316,7 @@ def test_evaluate_reports_dice_per_rung(tmp_path, monkeypatch):
     monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
     ct, tg, lines = sources(tmp_path)
     grid = data.val_grid_rungs(P32, lines, ((0, 0, 0), (64, 64, 64)), rungs=(2, 3), limit=1, ctx=())
-    net = M.build("1m", verbose=False, cin=grid[0][0].shape[0], cout=1)
+    net = M.build("1m", verbose=False, cin=prep.shapes(grid[0])[0], cout=1)
     out = T.evaluate(net, grid, torch.device("cpu"))
     assert "dice_r2" in out and "dice_r3" in out
     assert out["dice"] == pytest.approx((out["dice_r2"] + out["dice_r3"]) / 2)
@@ -354,7 +360,7 @@ def test_train_at_rungs_and_predict_reproduces_the_loader_input(tmp_path, monkey
 
     ds = data.Patches(patch=P32, stores=lines, exclude=[], rungs={3}, ctx=(1, 2), sym=False,
                       air_keep=1.0, fg_keep=1.0)
-    x_loader = next(iter(ds))[0].numpy()
+    x_loader = prep.prepare(prep.batch1(next(iter(ds))), torch.device("cpu"))[0][0].numpy()
 
     seen = []
     real_inputs = data.inputs
@@ -394,13 +400,11 @@ def test_require_targets_skips_unpulled_windows(tmp_path, monkeypatch):
     seen_empty = False
     it = iter(data.Patches(**kw))
     for _ in range(60):
-        _, t, _, _ = next(it)
-        seen_empty |= float(t.max()) == 0.0
+        seen_empty |= float(next(it)["tgt"].max()) == 0.0
     assert seen_empty  # without the flag the missing shards read as zeros
     it = iter(data.Patches(require_targets=True, **kw))
     for _ in range(60):
-        _, t, _, _ = next(it)
-        assert float(t.max()) > 0.0
+        assert float(next(it)["tgt"].max()) > 0.0
 
 
 def test_mirror_json_marks_known_chunks(tmp_path, monkeypatch):

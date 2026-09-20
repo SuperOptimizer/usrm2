@@ -163,13 +163,29 @@ def raw(rng, ct, cfg):
     return ct
 
 
-def augment(rng, x, tg):
-    """Random axis permutation + flips applied to the (C,Z,Y,X) input and (T,Z,Y,X) target; the radial
-    vector channels 1..3 of x are permuted/negated to match. Only permutations that keep the patch shape are
-    drawn (a 384x512x512 patch may swap y and x, not z)."""
-    sh = np.array(x.shape[1:])
-    perms = [q for q in itertools.permutations(range(3)) if (sh[list(q)] == sh).all()]
-    perm, flip = np.array(perms[rng.integers(len(perms))]), rng.random(3) < 0.5
+SYM_PERMS = tuple(itertools.permutations(range(3)))  # the 6 axis permutations
+
+
+def sym_decode(sym):
+    """A cube symmetry index 0..47 -> (axis permutation, flips): sym = 8 * permutation index + flip bits."""
+    return np.array(SYM_PERMS[int(sym) // 8]), np.array([bool(int(sym) >> d & 1) for d in range(3)])
+
+
+def draw_sym(rng, shape):
+    """The cube symmetry of one patch, as an index 0..47. Only permutations that keep the patch shape are
+    drawn (a 384x512x512 patch may swap y and x, not z); the rng draws are the ones `augment` has always
+    made, so a seed gives the same stream as before. Index 0 is the identity."""
+    sh = np.array(shape)
+    perms = [q for q in SYM_PERMS if (sh[list(q)] == sh).all()]
+    perm, flip = perms[rng.integers(len(perms))], rng.random(3) < 0.5
+    return SYM_PERMS.index(perm) * 8 + int(flip[0]) + 2 * int(flip[1]) + 4 * int(flip[2])
+
+
+def sym_apply(sym, x, tg):
+    """Cube symmetry `sym` applied to the (C,Z,Y,X) input and the (T,Z,Y,X) target; the radial vector
+    channels (the last 3 of x) are permuted/negated to match. `prep.sym_apply_t` is the same map on the
+    GPU, and tests/test_prep.py checks the two agree for all 48 symmetries."""
+    perm, flip = sym_decode(sym)
     sl = tuple(slice(None, None, -1 if f else 1) for f in flip)
     tg = np.ascontiguousarray(np.transpose(tg, (0,) + tuple(perm + 1))[(slice(None),) + sl])
     x = np.transpose(x, (0,) + tuple(perm + 1))[(slice(None),) + sl]
@@ -178,18 +194,25 @@ def augment(rng, x, tg):
     return np.ascontiguousarray(x), tg
 
 
+def augment(rng, x, tg):
+    """Random axis permutation + flips applied to the (C,Z,Y,X) input and (T,Z,Y,X) target."""
+    return sym_apply(draw_sym(rng, x.shape[1:]), x, tg)
+
+
 # --------------------------------------------------------------------------------- the rung ladder
 # Rung k has voxel size 0.6 * 2^k um (docs/unified_design.md section 1): 2.4 um = rung 2, 1228.8 um = rung 11.
 # A pyramid group is either an exported prediction group (levels named by the exact voxel size in um, with
 # OME multiscales in the group's zarr.json) or a CT mirror (integer level names: level l of a <native> um
 # volume is rung l + um_rung(native)).
 
-CTX_CACHE = {}  # {group base: {rung: array}} and {f"{base}#{rung}": ndarray} for arrays small enough to keep
+CTX_CACHE = {}  # {group base: {rung: array}} and {f"{level dir}#{rung}": ndarray} for whole levels kept decoded
 
 RUNG0_UM = 0.6   # rung 0
 NRUNGS = 12      # rungs 0 .. 11
 NCTX = 9         # context cubes of a sample: rungs k+1 .. k+9
-SMALL_RUNG = 96 ** 3  # a rung this small is read once and kept in memory (the top of every pyramid)
+CACHE_VOX = 48 << 20     # a level of at most this many voxels is decoded once and kept whole in the worker
+CACHE_BUDGET = 192 << 20  # ... up to this many bytes of them per process
+SMALL_RUNG = CACHE_VOX   # backward-compatible name
 
 
 def rung_um(k):
@@ -275,39 +298,106 @@ def levels(volume):
 
 
 def read_block(pyr, k, lo, hi):
-    """pyr[k][lo:hi] as float32, keeping a small rung entirely in memory (CTX_CACHE)."""
-    a = pyr[k]
-    if int(np.prod(a.shape[-3:])) <= SMALL_RUNG:
-        key = f"{a.store_path}#{k}"
-        if key not in CTX_CACHE:
-            CTX_CACHE[key] = np.asarray(a[:] if a.ndim == 3 else a[0])
-        a = CTX_CACHE[key]
-        return a[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]].astype(np.float32)
-    s = (slice(int(lo[0]), int(hi[0])), slice(int(lo[1]), int(hi[1])), slice(int(lo[2]), int(hi[2])))
-    return np.asarray(a[(0,) + s] if a.ndim == 4 else a[s], np.float32)
+    """pyr[k][lo:hi] as uint8 (the whole level when it is cached)."""
+    a = full_level(pyr, k)
+    if a is None:
+        a = pyr[k]
+        s = (slice(int(lo[0]), int(hi[0])), slice(int(lo[1]), int(hi[1])), slice(int(lo[2]), int(hi[2])))
+        return np.asarray(a[(0,) + s] if a.ndim == 4 else a[s], np.uint8)
+    return a[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]]
 
 
-def read_rung(pyr, k, lo, p):
-    """The (Z,Y,X) float32 cube of a pyramid at rung k, corner `lo`, size `p` (both in rung-k voxels).
-    A rung above the top of the pyramid is made by 2x mean pooling the highest rung that exists -- the
-    physical extent is the same, so the scroll simply shrinks inside the cube. Outside the array = 0."""
+def _cache_bytes():
+    return sum(v.nbytes for v in CTX_CACHE.values() if isinstance(v, np.ndarray))
+
+
+def pool2(v):
+    """2x mean pooling of a uint8 volume, zero-padded to an even shape (as `read_rung` pools)."""
+    s = np.array(v.shape, np.int64)
+    n = -(-s // 2)
+    if (s % 2).any():
+        v = np.pad(v, [(0, int(q)) for q in n * 2 - s])
+    return v.reshape(n[0], 2, n[1], 2, n[2], 2).astype(np.float32).mean((1, 3, 5)).astype(np.uint8)
+
+
+def full_level(pyr, k):
+    """The WHOLE level at rung k as a cached uint8 array, or None when it is too big to keep (CACHE_VOX /
+    CACHE_BUDGET). Rungs above the top of the pyramid are pooled from the cached level below, so a sample's
+    nine context cubes do not re-read (and re-decode) the top of the pyramid once per rung: for a scroll
+    whose pyramid stops at rung 8 the coarse rungs 9..11 are a few MB each and become free after the first
+    sample. Pooling in 2x steps truncates to uint8 at each step, so a cached coarse rung may differ from a
+    direct pool by at most one grey level."""
+    src = max((r for r in pyr if r <= k), default=None)
+    if src is None:
+        return None
+    key = f"{array_dir(pyr[src])}#{k}"
+    if key in CTX_CACHE:
+        return CTX_CACHE[key]
+    n = int(np.prod(rung_shape(pyr, k)))
+    if n > CACHE_VOX or _cache_bytes() + n > CACHE_BUDGET:
+        return None
+    if k == src:
+        a = pyr[src]
+        v = np.ascontiguousarray(np.asarray(a[:] if a.ndim == 3 else a[0], np.uint8))
+    else:
+        below = full_level(pyr, k - 1)
+        if below is None:  # the level below is too big to keep: pool it in z slabs, keeping only the result
+            a, e = pyr[src], 1 << (k - 1 - src)
+            S = np.array(a.shape[-3:], np.int64)
+            below = np.zeros(tuple(-(-S // e)), np.uint8)
+            step = max(e, (1 << 24) // max(int(S[1] * S[2]), 1) // e * e)
+            for z in range(0, int(S[0]), step):
+                blk = np.asarray(a[z:z + step] if a.ndim == 3 else a[0, z:z + step], np.uint8)
+                if e > 1:
+                    m = -(-np.array(blk.shape, np.int64) // e)
+                    pad = m * e - np.array(blk.shape)
+                    if pad.any():
+                        blk = np.pad(blk, [(0, int(q)) for q in pad])
+                    blk = blk.reshape(m[0], e, m[1], e, m[2], e).astype(np.float32).mean((1, 3, 5)).astype(np.uint8)
+                below[z // e:z // e + blk.shape[0]] = blk
+        v = pool2(below)
+    CTX_CACHE[key] = v
+    return v
+
+
+def read_rung(pyr, k, lo, p, dtype=np.float32):
+    """The (Z,Y,X) cube of a pyramid at rung k, corner `lo`, size `p` (both in rung-k voxels).
+    A rung above the top of the pyramid is made by 2^d mean pooling the highest rung that exists -- the
+    physical extent is the same, so the scroll simply shrinks inside the cube. Outside the array = 0.
+    Only the part of the source that overlaps the array is read: a rung far above the top would otherwise
+    address (p * 2^d)^3 voxels (a 256^3 cube five rungs above the top is 8192^3)."""
     src = max((r for r in pyr if r <= k), default=None)
     assert src is not None, f"pyramid has no rung at or below {k} (has {sorted(pyr)})"
+    p, lo = shape3(p), np.asarray(lo, np.int64)
+    cube = np.zeros(tuple(p), dtype)
+    full = full_level(pyr, k)
+    if full is not None:
+        S = np.array(full.shape, np.int64)
+        a, b = np.maximum(lo, 0), np.minimum(lo + p, S)
+        if (b > a).all():
+            s = a - lo
+            blk = full[a[0]:b[0], a[1]:b[1], a[2]:b[2]]
+            cube[s[0]:s[0] + blk.shape[0], s[1]:s[1] + blk.shape[1], s[2]:s[2] + blk.shape[2]] = blk
+        return cube
     e = 1 << (k - src)
-    p = shape3(p)
-    n, slo = p * e, np.asarray(lo, np.int64) * e
-    cube = np.zeros(tuple(n), np.float32)
-    lo_c, hi = np.maximum(slo, 0), np.minimum(slo + n, np.array(pyr[src].shape[-3:], np.int64))
-    if (hi > lo_c).all():
-        blk = read_block(pyr, src, lo_c, hi)
-        s = lo_c - slo
-        cube[s[0]:s[0] + blk.shape[0], s[1]:s[1] + blk.shape[1], s[2]:s[2] + blk.shape[2]] = blk
+    S = np.array(pyr[src].shape[-3:], np.int64)
+    jlo = np.maximum(-lo, 0)                      # the rung-k voxels of the cube that touch the array
+    jhi = np.minimum(-(-S // e) - lo, p)
+    if (jhi <= jlo).any():
+        return cube
+    a, b = (lo + jlo) * e, np.minimum((lo + jhi) * e, S)
+    blk = read_block(pyr, src, a, b)
     if e > 1:
-        cube = cube.reshape(p[0], e, p[1], e, p[2], e).mean((1, 3, 5))
+        n = jhi - jlo
+        pad = n * e - (b - a)
+        if pad.any():                             # past the end of the array: pooled against air
+            blk = np.pad(blk, [(0, int(q)) for q in pad])
+        blk = blk.reshape(n[0], e, n[1], e, n[2], e).astype(np.float32).mean((1, 3, 5))
+    cube[jlo[0]:jhi[0], jlo[1]:jhi[1], jlo[2]:jhi[2]] = blk.astype(dtype, copy=False)
     return cube
 
 
-def context(volume, origin, shape, ctx, rung=None):
+def context(volume, origin, shape, ctx, rung=None, dtype=np.uint8):
     """Coarse cubes of the SAME size centred on the same point as the patch at `origin`/`shape`:
     one (Z,Y,X) uint8 cube per OFFSET in `ctx` (1 = one rung coarser, 2 = two rungs, ...), read from the
     pyramid of `volume`. `origin`/`shape` are voxels of rung `rung` (default: the rung `volume` names).
@@ -317,7 +407,7 @@ def context(volume, origin, shape, ctx, rung=None):
     c0 = np.asarray(origin, np.int64) + shape3(shape) // 2  # centre, rung-k0 voxels
     for d in ctx:
         lo = c0 // (1 << int(d)) - shape3(shape) // 2  # the same centre, in rung-(k0+d) voxels
-        out.append(read_rung(pyr, k0 + int(d), lo, shape).astype(np.uint8))
+        out.append(read_rung(pyr, k0 + int(d), lo, shape, dtype=dtype))
     return out
 
 
@@ -332,6 +422,32 @@ def inputs(ct, rad, ctx=(), rung=None):
     plane sits right before the radial channels, so warm-starting a 13-channel checkpoint zero-fills it."""
     sc = [scale_plane(rung, ct.shape)[None]] if rung is not None else []
     return np.concatenate([zscore(ct)[None]] + [zscore(c)[None] for c in ctx] + sc + [rad])
+
+
+def rung_item(ct, tg, w, k, lo, ax, sym=0, norm=None):
+    """The compact sample the rung loader yields: everything uint8, so a 256^3 sample is ~200 MB instead
+    of the ~1 GB of float32 `inputs` + `augment` used to build in the worker. `usrm2.prep.prepare` turns a
+    collated batch of these into the model input on the GPU.
+
+    ct  (1 + len(ctx), Z, Y, X) uint8: the CT cube and the context cubes as read, not z-scored
+    tgt (channels, Z, Y, X) uint8: the decoded mask field, masked-CT zeroing applied
+    w   (channels, Z, Y, X) uint8: the per-voxel weight, 255 = 1.0
+    lo  (3,) int64: the corner, in rung-k voxels
+    cyx (2, Z) float64: the scroll axis (y, x) at each z of the cube -- what `radial` interpolates
+    sym (): the cube symmetry index drawn by the worker (0 = identity), applied on the GPU
+    rung (), norm (2,): the rung k and the (mean, std) of the z-score (std 0 = per-patch)"""
+    lo = np.asarray(lo, np.int64)
+    a = axis_at(ax, k)
+    z = np.arange(ct.shape[-3]) + lo[0]
+    cyx = np.stack([np.interp(z, a[0], a[1]), np.interp(z, a[0], a[2])])
+    nm = (0.0, 0.0) if (norm or NORM) is None else tuple(float(v) for v in (norm or NORM))
+    return {"ct": torch.from_numpy(np.ascontiguousarray(ct)),
+            "tgt": torch.from_numpy(np.ascontiguousarray(tg)),
+            "w": torch.from_numpy(np.ascontiguousarray(w)),
+            "lo": torch.from_numpy(np.ascontiguousarray(lo)),
+            "cyx": torch.from_numpy(np.ascontiguousarray(cyx)),
+            "sym": torch.tensor(int(sym)), "rung": torch.tensor(int(k)),
+            "norm": torch.tensor(nm, dtype=torch.float32)}
 
 
 # ------------------------------------------------------------- which chunks of a level exist locally
@@ -496,7 +612,8 @@ class Patches(torch.utils.data.IterableDataset):
         `stores_file` is then `ct_base,target_group[,target_group...]`: a CT pyramid plus one whole-scroll
         target pyramid per output channel, both addressed by rung (rung k = 0.6 * 2^k um). A sample is
         (source, rung k, corner): the CT and the targets are read at rung k, the context cubes at rungs
-        k + ctx[0] .. k + ctx[-1], and the loader yields (x, target, weight, rung). `rungs` is the set of
+        k + ctx[0] .. k + ctx[-1], and the loader yields a COMPACT uint8 sample (`rung_item`) that
+        `usrm2.prep.prepare` turns into (x, target, weight) on the GPU. `rungs` is the set of
         allowed rungs (None inside rung mode = every usable one), `rung_boost` {rung: multiplier} skews the
         rung mix, `channels` fixes the output channel order (default: order of first appearance).
 
@@ -566,7 +683,7 @@ class Patches(torch.utils.data.IterableDataset):
         self.arrs = self.srcs
 
     def _rung_sample(self, rng):
-        """One (x, tgt, w, rung) draw, or None when the corner is rejected."""
+        """One compact sample (see `rung_item`), or None when the corner is rejected."""
         p = self.patch
         i = rng.choice(len(self.srcs), p=self.w)
         s = self.srcs[i]
@@ -595,47 +712,44 @@ class Patches(torch.utils.data.IterableDataset):
         bl = self.aug.get("blank")
         if bl and rng.random() < bl["p"]:  # an all-air patch (CT 0 = air) with target 0
             ct = np.zeros(tuple(p), np.uint8)
-            tg = np.zeros((len(self.channels),) + tuple(p), np.float32)
+            tg = np.zeros((len(self.channels),) + tuple(p), np.uint8)
             w = np.zeros_like(tg)
         else:
-            ct = read_rung(cpyr, k, lo, p).astype(np.uint8)
+            ct = read_rung(cpyr, k, lo, p, dtype=np.uint8)
             if (ct == 0).mean() > 0.9 and rng.random() > self.air_keep:
                 return None
             tg, w = self._rung_target(s, k, lo, ct)
-            m = float((tg * (w > 0)).sum() / max((w > 0).sum(), 1))
+            sel = w > 0
+            m = float(np.sum(tg, where=sel, dtype=np.int64)) / 255.0 / max(int(sel.sum()), 1)
             if m < self.fg_min and rng.random() > self.fg_keep:
                 return None
             if self.dense_pow > 0 and m < self.dense_ref and rng.random() > (m / self.dense_ref) ** self.dense_pow:
                 return None
             ct = raw(rng, ct, self.aug)
         cx = context(s["ct"], lo, ct.shape, self.ctx, rung=k) if self.ctx else ()
-        rad = radial(axis_at(s["axis"], k), lo, ct.shape)
-        x = inputs(ct, rad, cx, rung=k)
-        if self.sym:
-            x, tw = augment(rng, x, np.concatenate([tg, w]))
-            tg, w = tw[:len(self.channels)], tw[len(self.channels):]
-        return x, tg, w, k
+        sym = draw_sym(rng, ct.shape) if self.sym else 0  # applied on the GPU (usrm2.prep), not here
+        return rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, s["axis"], sym)
 
     def _rung_target(self, s, k, lo, ct):
-        """(target, weight) at rung k: one channel per output channel, 0 (weight 0) for a channel this
-        source does not provide; weight 1 inside the target's box and where CT > 0, times its source weight."""
+        """(target, weight) at rung k as uint8 (255 = 1.0): one channel per output channel, 0 (weight 0) for
+        a channel this source does not provide; weight 1 inside the target's box and where CT > 0, times its
+        source weight."""
         p = self.patch
-        tg = np.zeros((len(self.channels),) + tuple(p), np.float32)
+        tg = np.zeros((len(self.channels),) + tuple(p), np.uint8)
         w = np.zeros_like(tg)
-        inside_ct = (ct > 0).astype(np.float32)
+        inside_ct = ct > 0
         for c, chan in enumerate(self.channels):
             t = s["targets"].get(chan)
             if t is None:
                 continue  # per-channel ignore: this source says nothing about that channel
-            tg[c] = np.clip(read_rung(t["pyr"], k, lo, p) / 255.0, 0, 1)
+            ins = np.zeros(tuple(p), bool)
             blo, bs = target_box(t, k)
-            ins = np.zeros(tuple(p), np.float32)
             a = np.maximum(blo - lo, 0)
             b = np.minimum(blo + bs - lo, p)
             if (b > a).all():
-                ins[a[0]:b[0], a[1]:b[1], a[2]:b[2]] = 1.0
-            w[c] = ins * inside_ct * t["weight"]
-            tg[c] *= inside_ct  # masked CT (0) carries no surface
+                ins[a[0]:b[0], a[1]:b[1], a[2]:b[2]] = True
+            np.copyto(tg[c], read_rung(t["pyr"], k, lo, p, dtype=np.uint8), where=inside_ct)  # masked CT: no surface
+            w[c] = np.where(ins & inside_ct, np.uint8(round(255 * t["weight"])), np.uint8(0))
         return tg, w
 
     def _open(self):
@@ -683,10 +797,8 @@ class Patches(torch.utils.data.IterableDataset):
                 got = self._rung_sample(rng)
                 if got is None:
                     continue
-                x, tg, w, k = got
                 rejected, served = 0, served + 1
-                yield torch.from_numpy(np.ascontiguousarray(x)), torch.from_numpy(np.ascontiguousarray(tg)), \
-                    torch.from_numpy(np.ascontiguousarray(w)), k
+                yield got
                 continue
             i = rng.choice(len(self.arrs), p=self.w)
             o, s = self.boxes[i]
@@ -797,7 +909,8 @@ VAL_RUNGS = (2, 3, 4, 6)  # the rungs the held-out box is scored at
 
 def val_grid_rungs(patch, stores, box2, rungs=VAL_RUNGS, limit=8, ctx=(), channels=None):
     """Per-rung validation: the held-out box (given at rung 2) read at each rung from the same pyramids
-    as training. Returns [(x, target, weight, rung)] -- the same tuples the rung loader yields."""
+    as training. Returns the same compact uint8 items the rung loader yields (`rung_item`), so 8 patches x
+    3 rungs at 256^3 cost ~1.6 GB of host memory instead of the ~22 GB of 14-channel float32 they used to."""
     srcs = source_groups(stores)
     if channels is None:
         channels = list(dict.fromkeys(c for s in srcs for c in s["targets"]))
@@ -817,12 +930,10 @@ def val_grid_rungs(patch, stores, box2, rungs=VAL_RUNGS, limit=8, ctx=(), channe
         for s in ds.srcs[:1]:  # the first source supplies the validation CT and targets
             for c in corners:
                 lo = org + np.array(c, np.int64)
-                ct = read_rung(s["ct_pyr"], k, lo, p3).astype(np.uint8)
+                ct = read_rung(s["ct_pyr"], k, lo, p3, dtype=np.uint8)
                 tg, w = ds._rung_target(s, k, lo, ct)
                 cx = context(s["ct"], lo, ct.shape, ctx, rung=k) if ctx else ()
-                x = inputs(ct, radial(axis_at(s["axis"], k), lo, ct.shape), cx, rung=k)
-                out.append((torch.from_numpy(np.ascontiguousarray(x)), torch.from_numpy(tg),
-                            torch.from_numpy(w), k))
+                out.append(rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, s["axis"]))
     assert out, "the validation box is smaller than one patch at every rung"
     return out
 

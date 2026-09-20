@@ -218,3 +218,36 @@ exported pyramids are read directly).
 
 Not done here: the target importer / exporter side (volume-compressor does it), `cloud/mirror_scroll.py` and
 the fine-scan resampler (section 7.5), and the verso head.
+
+## 12. The loader stays uint8 (2026-09-20)
+
+Measured on the A100, one 256^3 rung-2 sample in a worker while training: CT read 0.07 s, 9 context cubes
+3.2 s, target + weight 1.1 s, `inputs()` (z-score 10 cubes to float32 and stack 14 channels, 940 MB) 6.6 s,
+`augment()` (the cube symmetry on the 16-channel float32 stack) 6.1 s -- ~17 s per sample, so four workers
+fed the card 3.2 Mvox/s instead of the 10.8 it can do. Each worker also held ~5 GB of float32 batches and
+`val_grid_rungs` held 14-channel float32 patches (8 x 3 rungs = 22 GB at 256^3).
+
+The worker now only READS. `data.rung_item` is the sample it yields: `ct` uint8 (1 + len(ctx), Z, Y, X) --
+the CT cube and the context cubes as read, not z-scored -- `tgt` and `w` uint8 (255 = 1.0), the corner, the
+scroll axis (y, x) per z slice (what `radial` interpolates), the rung, the (mean, std) of the z-score and
+the cube symmetry index 0..47 the worker draws (`data.draw_sym`, the same rng draws as before, so a seed
+still reproduces a run). ~200 MB per 256^3 sample instead of ~1 GB.
+
+`usrm2/prep.py` rebuilds the input on the device: `prepare(batch, dev)` z-scores each cube (global norm or
+per-patch, the semantics of `data.zscore`), adds the scale plane, computes the radial unit vector from the
+corner and the axis, applies the symmetry to x, target and weight together -- the radial channels are a
+vector and are permuted AND negated -- and returns floats. `aug.apply` runs after, unchanged. `evaluate`,
+`val_png` and the validation grid use the same path, so a 256^3 val patch costs 12 bytes per voxel (10 cubes
++ target + weight) instead of 56 (14 float32 channels + target + weight): 8 patches x 3 rungs is 4.8 GB
+instead of 22 GB, and the 4 default `--val-rungs` at `--val-patches 8` 6.4 GB instead of 30 GB.
+`tests/test_prep.py` checks prepare against the CPU path (`data.inputs` + `data.sym_apply`) for all 48
+symmetries and both normalizations; `predict.py` still builds its inputs on the host with `data.inputs`,
+and `tests/test_rungs.py` asserts the two agree.
+
+Reading was fixed where it was cheap: `read_rung` reads only the part of the source that overlaps the array
+(a 256^3 cube five rungs above the top of a pyramid used to allocate 8192^3 float32 first), returns uint8
+without a float32 round trip, and `data.full_level` keeps a whole level decoded in the worker when it is
+small (<= `CACHE_VOX`, 48 Mvox, within a 192 MB budget), pooling the rungs above the top of a pyramid from
+the cached level below instead of re-reading the top once per rung. Measured here on a synthetic pyramid
+(rungs 2..11 on disk, 1024^3 at rung 2, patch 256^3, 9 context cubes): 4.2-4.8 s -> 0.14 s per sample
+worker-side, 1024 MB -> 192 MB; the context read alone 0.063 s -> 0.021 s from the whole-level cache.

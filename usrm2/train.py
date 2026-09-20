@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from usrm2 import aug as A, data, model as M
+from usrm2 import aug as A, data, model as M, prep
 
 
 def weighted(tgt, wtgt=()):
@@ -86,25 +86,29 @@ def autocast(dev):
 
 
 @torch.no_grad()
-def evaluate(net, grid, dev, wtgt=()):
+def evaluate(net, grid, dev, wtgt=(), norad=False):
     """bce / dice / mae over the val patches. A grid entry is (x, tgt) -- the old convention, optionally with
-    `wtgt` weight channels -- or (x, tgt, weight[, rung]) as the rung loader yields it; weights then scale
-    every metric and each rung is also scored on its own (`dice_r2`, `dice_r3`, ...), `dice` being the mean
-    over the rungs present. With verso heads (>= 4 heads: recto..., verso...) also `overlap`, the mean excess
-    relu(p_recto + p_verso - 1) per lineage pair, measured only (no loss term)."""
+    `wtgt` weight channels -- or a compact rung sample (data.rung_item), whose input is built on the device
+    by `prep.prepare`; its weights then scale every metric and each rung is also scored on its own
+    (`dice_r2`, `dice_r3`, ...), `dice` being the mean over the rungs present. With verso heads (>= 4 heads:
+    recto..., verso...) also `overlap`, the mean excess relu(p_recto + p_verso - 1) per lineage pair,
+    measured only (no loss term)."""
     net.eval()
     m = torch.zeros(4)
     per = {}
     for item in grid:
-        ct, tg = item[0], item[1]
-        w = item[2] if len(item) > 2 else None
-        rung = item[3] if len(item) > 3 else None
-        ct, tg = ct[None].to(dev).to(memory_format=torch.channels_last_3d), tg[None].to(dev)
-        if w is None:
+        if isinstance(item, dict):
+            ct, tg, ww = prep.prepare(prep.batch1(item), dev, norad=norad)
+            ct, rung = ct.to(memory_format=torch.channels_last_3d), int(item["rung"])
+        else:
+            ct, tg = item[0], item[1]
+            w = item[2] if len(item) > 2 else None
+            rung = item[3] if len(item) > 3 else None
+            ct, tg = ct[None].to(dev).to(memory_format=torch.channels_last_3d), tg[None].to(dev)
+            ww = None if w is None else w[None].to(dev)
+        if ww is None:
             tg = weighted(tg, wtgt)[0]
             ww = torch.ones_like(tg)
-        else:
-            ww = w[None].to(dev)
         with autocast(dev):
             logit = net(ct).float()
         p = torch.sigmoid(logit)
@@ -124,19 +128,32 @@ def evaluate(net, grid, dev, wtgt=()):
         for k in sorted(per):
             out[f"dice_r{k}"] = float(np.mean(per[k]))
         out["dice"] = float(np.mean([out[f"dice_r{k}"] for k in sorted(per)]))  # every rung counts the same
-    if grid and grid[0][1].shape[0] >= 4:
+    if grid and grid_cout(grid[0]) >= 4:
         out["overlap"] = m[3].item()
     return out
 
 
-def val_png(path, net, grid, dev):
+def grid_cin_cout(item):
+    """(input channels, output channels) of a validation grid entry, compact (dict) or legacy (tuple)."""
+    return prep.shapes(item) if isinstance(item, dict) else (item[0].shape[0], item[1].shape[0])
+
+
+def grid_cout(item):
+    return grid_cin_cout(item)[1]
+
+
+def val_png(path, net, grid, dev, norad=False):
     """Middle z-slice of the first 4 val patches: CT (gray), each teacher target and each student head as a red
     opacity overlay (no threshold), tiled patches x [CT, targets..., heads...]."""
     from PIL import Image
     rows = []
     with torch.no_grad():
         for item in grid[:4]:
-            x, t = item[0], item[1]
+            if isinstance(item, dict):
+                xd, td = prep.prepare(prep.batch1(item), dev, norad=norad)[:2]
+                x, t = xd[0].cpu(), td[0].cpu()
+            else:
+                x, t = item[0], item[1]
             with autocast(dev):
                 y = net(x[None].to(dev).to(memory_format=torch.channels_last_3d))
                 y = y[0] if isinstance(y, (list, tuple)) else y  # deep supervision returns [main, coarse...]
@@ -222,8 +239,8 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     else:
         grid = data.val_grid(patch=patch, ct=kw.get("ct", data.CT), store=kw.get("val", data.VAL), limit=val_patches, ctx=ctx)
     assert grid, f"validation store {kw.get('val', data.VAL)} is smaller than the patch ({patch})"
-    args["cout"] = cout = grid[0][1].shape[0]  # one head per teacher store
-    args["cin"] = cin = grid[0][0].shape[0]  # CT + context cubes + radial vector
+    cin, cout = grid_cin_cout(grid[0])  # CT + context cubes (+ scale plane) + radial vector; one head per store
+    args["cin"], args["cout"] = cin, cout
     net = M.build(size, cout=cout, cin=cin, ckpt_act=ckpt_act, add_skip=add_skip, deep=deep).to(dev)
     args["ckpt_act"], args["add_skip"], args["deep"] = ckpt_act, add_skip, deep
     if init_from:  # warm start from another run's EMA weights; extra input channels get zero weights (same output at step 0)
@@ -253,9 +270,10 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         ema, step = {k: v.to(dev) for k, v in st["ema"].items()}, st["step"]
         for _ in range(step):
             sched.step()
-    if no_radial:
+    if no_radial:  # compact grid entries get their radial channels zeroed by prep.prepare(norad=True)
         for item in grid:
-            item[0][-3:] = 0
+            if not isinstance(item, dict):
+                item[0][-3:] = 0
     evnet = M.build(size, verbose=False, cout=cout, cin=cin, add_skip=add_skip, deep=deep).to(dev)
     dl = data.loader(patch, batch, workers, ct=kw.get("ct", data.CT), stores=kw.get("stores", data.TRAIN),
                      exclude=kw.get("val", data.VAL), seed=step + 7919 * rank, sym=cfg.get("sym", True), aug=cfg, dense_pow=dense_pow, ctx=ctx,
@@ -285,13 +303,15 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     for item in dl:
         if step >= steps:
             break
-        ct, tg, wt = item[0], item[1], None
-        if len(item) > 2:  # rung mode: (x, target, weight, rung); the weights ride along as extra target
-            wt, rg = item[2], item[3]  # channels so every geometric aug transforms them identically
-            for r in rg.tolist():
+        wt = None
+        if isinstance(item, dict):  # rung mode: uint8 cubes + metadata; the input is built on the device
+            for r in item["rung"].tolist():
                 rung_n[r] = rung_n.get(r, 0) + 1
-            tg = torch.cat([tg, wt], 1)
-        ct, tg = A.apply(ct.to(dev, non_blocking=True), tg.to(dev, non_blocking=True), cfg)
+            ct, tg, wt = prep.prepare(item, dev, norad=no_radial)
+            tg = torch.cat([tg, wt], 1)  # the weights ride along as extra target channels so every
+        else:                            # geometric aug transforms them identically
+            ct, tg = item[0].to(dev, non_blocking=True), item[1].to(dev, non_blocking=True)
+        ct, tg = A.apply(ct, tg, cfg)
         if wt is not None:
             tg, wt = tg[:, :cout], tg[:, cout:]
         ct = ct.to(memory_format=torch.channels_last_3d)
@@ -318,9 +338,9 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
             t0 = time.time()
         if (step % eval_every == 0 or step == steps) and main:
             evnet.load_state_dict(ema)
-            log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev, wtgt)})
+            log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev, wtgt, norad=no_radial)})
             try:
-                val_png(out / f"val_{step:06d}.png", evnet, grid, dev)
+                val_png(out / f"val_{step:06d}.png", evnet, grid, dev, norad=no_radial)
             except Exception as e:  # a missing PIL must not stop training
                 print("val_png:", repr(e))
             save()
