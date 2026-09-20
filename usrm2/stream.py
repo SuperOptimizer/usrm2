@@ -117,6 +117,7 @@ class Fetcher:
 
     def __init__(self, session, jobs=48, retries=4):
         self.session, self.sem, self.retries = session, asyncio.Semaphore(jobs), retries
+        self.lock = {}  # one download per shard: concurrent windows wanting the same object wait for it
         self.bytes = self.fetched = self.absent = self.have = self.failed = self.requests = 0
 
     async def get(self, path):
@@ -124,6 +125,21 @@ class Fetcher:
         `have` counts the buffer hits -- a shard some earlier window already pulled -- and `fetched` the
         misses, which is what the hit rate in the report is made of."""
         if os.path.exists(path):
+            self.have += 1
+            return "have", 0
+        if os.path.exists(path + ".absent"):
+            self.have += 1
+            return "absent", 0
+        lk = self.lock.setdefault(path, asyncio.Lock())
+        async with lk:
+            try:
+                return await self._get(path)
+            finally:
+                if not lk.locked():
+                    self.lock.pop(path, None)
+
+    async def _get(self, path):
+        if os.path.exists(path):  # another window pulled this shard while we waited for the lock
             self.have += 1
             return "have", 0
         if os.path.exists(path + ".absent"):
