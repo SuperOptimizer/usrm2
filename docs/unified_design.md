@@ -495,3 +495,25 @@ CT volume named `...-9.362um-...` has level l on rung 4 + l. Two things had to b
   the desk's is compiled for a Ryzen 9950X (AVX-512) and dies with SIGILL on the Xeon E5-2683 v4 that
   serves the A6000s. `gcc -O3 -shared -fPIC -o libvolcomp.so python/volcomp_shim.c -lm` (no arch flags --
   the header dispatches AVX2 at runtime) is the portable build.
+
+**Measured, 5 scrolls, region mode** (A6000, 12m at 256^3, batch 1, ckpt_act 1, deep 3, compile, ctx 1..9,
+rungs 2-11 with the usual boosts, `--require-targets`, `--region 1024 --windows-per-region 64`,
+`--cache-gb 20 --ahead 300 --workers 4`, stores: Paris 4 recto + Paris 4 m7 + PHerc0139 m7 (9.362 um) +
+PHerc0332 m7 (9.596) + PHerc0343 m7 (8.64) + PHercMANB m7 (9.596)):
+
+- planner: cache hit rate 0.979, 1.37 bytes fetched per training voxel, 13.4 GB fetched for 584 windows,
+  buffer 12.5 GiB, 0 failed requests; the four new scrolls' axes were derived from their own CT in
+  1.9 / 12.1 / 2.3 / 22.0 s.
+- training: 6.5-9.0 Mvox/s, `stream_wait_ms` 8-127 per 20 steps (i.e. ~0.5-6 ms per step: the trainer never
+  waits for the network), 26.1 GiB of VRAM.
+- composition after 584 windows: Paris 4 89 %, PHerc0139 11 %, rungs 2/3/4/6 = 83/3/11/3 %, 12 region
+  visits of 48.7 windows each. Region mode draws the source and the rung ONCE PER REGION, so the source
+  and rung mix is correct in expectation but coarse-grained: a few hundred windows are a dozen draws, and
+  the per-scroll balance only converges over thousands of windows. `--windows-per-region` is the knob.
+- a region whose windows carry no weight at all (masked CT, or outside the target box) used to deliver 64
+  zero-loss windows in a row; `_rung_draw` now rejects a window with no weighted voxel outright, after the
+  existing draws so the rng stream is unchanged.
+
+The A6000s are served by a proxied GPU (Thunder Compute): twice during these runs the trainer's main thread
+parked on a futex with the GPU at 0 % and 33 GiB still allocated, and did not recover. That is an
+infrastructure hang, not the loader -- the loader workers had items ready and the machine was idle.

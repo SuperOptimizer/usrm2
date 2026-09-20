@@ -857,6 +857,8 @@ class Patches(torch.utils.data.IterableDataset):
                 return None, None
             if self.dense_pow > 0 and m < self.dense_ref and rng.random() > (m / self.dense_ref) ** self.dense_pow:
                 return None, None
+            if not sel.any():  # every voxel masked or outside the target box: no gradient, so no sample.
+                return None, None  # (after the draws above, so the rng stream is the one it always was)
             prm = raw_params(rng, self.aug)
             ct = raw_apply(ct, prm)
         sym = int(draw_sym(rng, tuple(p))) if self.sym else 0  # applied on the GPU (usrm2.prep), not here

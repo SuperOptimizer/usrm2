@@ -430,3 +430,16 @@ def test_rungs_include_levels_built_after_the_export(tmp_path, monkeypatch):
     plain_level(pathlib.Path(base) / "4", (16, 16, 16), 7)
     data.CTX_CACHE.pop(base, None)
     assert 6 in data.rungs(ct)
+
+
+def test_a_window_with_no_weighted_voxel_is_not_sampled(tmp_path, monkeypatch):
+    """A window whose CT is all masked (or which falls outside the target's box) carries no gradient: the
+    loss is exactly 0. Region mode makes those arrive 64 at a time, so they are rejected outright."""
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    ct = ct_pyramid(tmp_path, base=128, nlev=2, value=lambda l: 0)  # the whole CT is air -> weight 0
+    tg = pred_pyramid(tmp_path, base=128, nlev=2)
+    ds = data.Patches(patch=P32, stores=[f"{ct},{tg}"], exclude=[], rungs={2}, sym=False,
+                      air_keep=1.0, fg_keep=1.0, fg_min=0.0)
+    ds._open_rungs()
+    rng = np.random.default_rng(0)
+    assert all(ds._rung_draw(rng, build=False)[0] is None for _ in range(50))
