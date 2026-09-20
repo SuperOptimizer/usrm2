@@ -188,3 +188,9 @@ Lobster VMs, volume-compressor/tools/export, hot path in C), as continuous 0-255
   19.2 q1, 38.4 and coarser q0 lossless (so an m7 prediction native at 9.6 um is q2, q1, then lossless).
 Output mirrors the bucket keys under volcomp/<scroll>/representations/predictions/surfaces/<name>.zarr/<level>.
 The training loader then reads these directly as target pyramids (values / 255), no importer needed.
+
+## 10. Bootstrap scope (user, 2026-09-19 evening)
+
+The first training of the unified model uses ONLY the exported upstream predictions (the Paris 4 recto and m7 mask
+pyramids, then the other scrolls' m7), not our own teacher probability stores and not the verso stores. Those come
+back in later rounds. Every rung 2..11 of Paris 4 is covered by the upstream masks alone.
