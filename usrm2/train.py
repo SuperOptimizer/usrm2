@@ -138,7 +138,9 @@ def val_png(path, net, grid, dev):
         for item in grid[:4]:
             x, t = item[0], item[1]
             with autocast(dev):
-                p = torch.sigmoid(net(x[None].to(dev).to(memory_format=torch.channels_last_3d)).float())[0].cpu()
+                y = net(x[None].to(dev).to(memory_format=torch.channels_last_3d))
+                y = y[0] if isinstance(y, (list, tuple)) else y  # deep supervision returns [main, coarse...]
+                p = torch.sigmoid(y.float())[0].cpu()
             z = x.shape[1] // 2
             c = x[0, z].numpy()
             c = (c - c.min()) / (c.max() - c.min() + 1e-6) * 255 * 0.9
