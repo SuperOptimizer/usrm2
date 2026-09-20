@@ -103,8 +103,20 @@ class UNet(nn.Module):
         return f
 
 
+# Memory format of the weights and of the input. channels_last_3d gives the convolutions cudnn's NDHWC
+# tensor-core kernels, but at 256^3 this net is bound by the normalisations and activations, and those
+# are far slower in that layout: measured on an A100 (2 x 32 x 256^3, bf16, torch.compile), GroupNorm+SiLU
+# forward+backward is 96 ms in channels_last_3d and 16 ms contiguous, and the whole 30m6 step is 1152 ms
+# channels_last vs 679 ms contiguous (cloud/a100_gn.py). So the net runs in the plain NCDHW layout.
+CHANNELS_LAST = False
+
+
+def memfmt():
+    return torch.channels_last_3d if CHANNELS_LAST else torch.contiguous_format
+
+
 def build(size="1m", verbose=True, cout=1, cin=4, ckpt_act=0, add_skip=0, deep=0):
-    m = UNet(PRESETS[size], cin=cin, cout=cout, ckpt_act=ckpt_act, add_skip=add_skip, deep=deep).to(memory_format=torch.channels_last_3d)
+    m = UNet(PRESETS[size], cin=cin, cout=cout, ckpt_act=ckpt_act, add_skip=add_skip, deep=deep).to(memory_format=memfmt())
     n = sum(p.numel() for p in m.parameters())
     if verbose:
         print(f"usrm2 UNet {size} widths={PRESETS[size]} in={cin} heads={cout} params={n / 1e6:.2f}M")

@@ -326,3 +326,55 @@ Rejected, with the measurement: `torch.backends.cudnn.benchmark = True` (no spee
 0.5% of the step); `max-autotune-no-cudagraphs` (not reached before the win above made it moot).
 `TORCH_LOGS=recompiles,graph_breaks` over real steps prints nothing: the rung mode varies tensor VALUES
 (the scale plane, the symmetry index), not shapes, so the compiled graph is entered once and kept.
+
+### 14b. The memory format was the other half (2026-09-20, same day)
+
+With `up2x` in place the step was 1429 ms and the backward still 651 ms of it. `cloud/a100_gn.py`
+measured GroupNorm + SiLU at each level shape and then the whole net with the norms removed:
+
+| 2 x 32 x 256^3, bf16, GroupNorm(8) + SiLU | eager fwd | eager fwd+bwd | compiled fwd | compiled fwd+bwd | `x + x` |
+|---|---|---|---|---|---|
+| channels_last_3d | 119.5 | 191.5 | 24.6 | **96.2** | 2.56 ms (2348 GiB/s) |
+| contiguous (NCDHW) | 82.7 | 107.1 | 4.0 | **15.7** | 2.51 ms (2386 GiB/s) |
+
+Compiled and contiguous, the norm costs about six passes over the tensor -- near the bandwidth bound.
+Compiled and channels_last it costs about thirty-eight. The whole 30m6 step (batch 2, 256^3, synthetic
+input, no loader) then measures:
+
+| | ms/step | Mvox/s | peak GiB |
+|---|---|---|---|
+| channels_last, GroupNorm as is | 1152 | 29.1 | 43.1 |
+| channels_last, GroupNorm -> Identity (SiLU kept) | 755 | 44.4 | 37.1 |
+| channels_last, a fused `group_norm+silu` written in torch ops | 1479 | 22.7 | 39.1 |
+| **contiguous, GroupNorm as is** | **679** | **49.4** | 45.1 |
+| contiguous, GroupNorm -> Identity | 601 | 55.8 | 39.1 |
+
+So `channels_last_3d` -- which this net has used since the beginning for cudnn's NDHWC convolution
+kernels -- costs more in the normalisations than it saves in the convolutions at these shapes, and
+normalisation goes from 397 ms of the step to 78 ms just by dropping it. `usrm2.model.CHANNELS_LAST`
+is now False and `model.memfmt()` is what train/predict convert to.
+
+Full step with the real loader, 40 steps, ckpt_act 0, `--eval-every 1000`:
+
+| phase | ms | % |
+|---|---|---|
+| loader wait | 0.4 | 0.0 |
+| `prep.prepare` (H2D 403 MB at 2.4 GiB/s + z-score + radial + symmetry) | 269.7 | 25.8 |
+| `aug.apply` | 0.1 | 0.0 |
+| memory-format conversion | 3.0 | 0.3 |
+| forward | 235.0 | 22.5 |
+| loss (4 heads) | 7.5 | 0.7 |
+| backward | 512.9 | 49.0 |
+| clip + optimizer | 13.7 | 1.3 |
+| EMA | 3.8 | 0.4 |
+| **total** | **1046** | **32.1 Mvox/s** |
+
+peak allocated 45.4 GiB, reserved 56.8 GiB. Validation at step 8500 is unchanged by the layout:
+dice 0.65838 / r2 0.68366 / r3 0.67219 / r4 0.61929 against 0.65862 / 0.68365 / 0.67235 / 0.61987.
+
+Still rejected, with the measurement: a hand-written fused `group_norm+silu` (above); `--batch 3`
+(2% better per voxel at 64.7 GiB, and `batch` is not in the resume `grow` list, so it would change
+the optimisation mid-run); pinning the loader batch harder (it is already `pin_memory=True` +
+`non_blocking=True`, and on this proxied GPU pinned H2D is 2.35 GiB/s against 2.24 pageable, so the
+403 MB/step costs ~167 ms either way and does not overlap with compute); a bf16 loss (the loss is
+0.7% of the step).

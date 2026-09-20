@@ -108,12 +108,12 @@ def evaluate(net, grid, dev, wtgt=(), norad=False):
     for item in grid:
         if isinstance(item, dict):
             ct, tg, ww = prep.prepare(prep.batch1(item), dev, norad=norad)
-            ct, rung = ct.to(memory_format=torch.channels_last_3d), int(item["rung"])
+            ct, rung = ct.to(memory_format=M.memfmt()), int(item["rung"])
         else:
             ct, tg = item[0], item[1]
             w = item[2] if len(item) > 2 else None
             rung = item[3] if len(item) > 3 else None
-            ct, tg = ct[None].to(dev).to(memory_format=torch.channels_last_3d), tg[None].to(dev)
+            ct, tg = ct[None].to(dev).to(memory_format=M.memfmt()), tg[None].to(dev)
             ww = None if w is None else w[None].to(dev)
         if ww is None:
             tg = weighted(tg, wtgt)[0]
@@ -164,7 +164,7 @@ def val_png(path, net, grid, dev, norad=False):
             else:
                 x, t = item[0], item[1]
             with autocast(dev):
-                y = net(x[None].to(dev).to(memory_format=torch.channels_last_3d))
+                y = net(x[None].to(dev).to(memory_format=M.memfmt()))
                 y = y[0] if isinstance(y, (list, tuple)) else y  # deep supervision returns [main, coarse...]
                 p = torch.sigmoid(y.float())[0].cpu()
             z = x.shape[1] // 2
@@ -324,7 +324,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         ct, tg = A.apply(ct, tg, cfg)
         if wt is not None:
             tg, wt = tg[:, :cout], tg[:, cout:]
-        ct = ct.to(memory_format=torch.channels_last_3d)
+        ct = ct.to(memory_format=M.memfmt())
         with autocast(dev):
             pred = model(ct)
             bce, dice = deep_losses([o.float() for o in pred] if isinstance(pred, (list, tuple)) else pred.float(), tg, ridge_w, wtgt, wt)

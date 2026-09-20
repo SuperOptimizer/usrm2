@@ -36,7 +36,7 @@ def slide(fn, roi, window, halo, dev, prep=None):
                     c = roi[z:z + window, y:y + window, x:x + window]
                     if not c.any():
                         continue
-                    t = torch.from_numpy(prep(c, (z, y, x)))[None].to(dev).to(memory_format=torch.channels_last_3d)
+                    t = torch.from_numpy(prep(c, (z, y, x)))[None].to(dev).to(memory_format=M.memfmt())
                     with autocast(dev):
                         p = fn(t)[0].float().cpu().numpy()  # (w,w,w) or (C,w,w,w): fn may return every head
                     if acc is None:
@@ -76,7 +76,7 @@ def slide_gpu(fn, roi, window, halo, dev, prep, batch=1, streams=1):
                 offs = mine[i:i + batch]
                 t = torch.stack([prep(R[z:z + window, y:y + window, x:x + window], o) for o in offs for z, y, x in [o]])
                 with autocast(dev):
-                    p = fn(t.contiguous(memory_format=torch.channels_last_3d))  # (B,w,w,w) or (B,C,w,w,w)
+                    p = fn(t.contiguous(memory_format=M.memfmt()))  # (B,w,w,w) or (B,C,w,w,w)
                 if acc is None:
                     acc = torch.zeros(tuple(p.shape[1:-3]) + tuple(R.shape), dtype=torch.float16, device=dev)
                     accs.append(acc)
