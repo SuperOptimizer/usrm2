@@ -251,3 +251,12 @@ small (<= `CACHE_VOX`, 48 Mvox, within a 192 MB budget), pooling the rungs above
 the cached level below instead of re-reading the top once per rung. Measured here on a synthetic pyramid
 (rungs 2..11 on disk, 1024^3 at rung 2, patch 256^3, 9 context cubes): 4.2-4.8 s -> 0.14 s per sample
 worker-side, 1024 MB -> 192 MB; the context read alone 0.063 s -> 0.021 s from the whole-level cache.
+
+## 13. First results (2026-09-20)
+
+Desk proof of concept `u1_5m_p4` (5m, 128^3, 60k steps, upstream masks only: Paris 4 recto + m7, warm start r3 raw):
+val dice r2/r3/r4 = 0.64/0.69/0.62 (from 0.62/0.56/0.33 at step 500). Surface metrics on the val box, head 0,
+window 128: recall@4 0.753, continuity 0.600, merge_frac 0.44 (round-3 raw student: 0.729 / 0.584 / 0.42; skin run:
+0.722 / 0.548 / 0.47; teacher reference recall@4 0.843). Visually the student's band is broader and softer than the
+recto face target at 2.4 um: the one-head compromise between the recto face (rungs 2-3) and the m7 whole-sheet band
+(rungs 4+). A100 `u1_30m6_p4` (30m6, 256^3) runs at 12.6 Mvox/s, ~44 h for 60k steps.
