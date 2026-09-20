@@ -410,7 +410,8 @@ def apply(x, tg, cfg):
         return x, tg
     ni = x.shape[1] - 3
     x, tg = spatial(x.float(), tg.float(), cfg)
-    x = torch.cat([intensity(x[:, :ni], cfg), x[:, ni:]], 1)
+    if any(cfg.get(name) for name, _ in INTENS):  # no intensity aug configured (e.g. "geo"): the cat below
+        x = torch.cat([intensity(x[:, :ni], cfg), x[:, ni:]], 1)  # would only copy the whole batch
     if cfg.get("cor"):  # needs the radial channels for the shift direction, so not in `intensity`
         x = _cor(x, cfg["cor"], _m(x.shape[0], x.device, cfg["cor"]["p"]))
     if cfg.get("norad"):

@@ -260,3 +260,69 @@ window 128: recall@4 0.753, continuity 0.600, merge_frac 0.44 (round-3 raw stude
 0.722 / 0.548 / 0.47; teacher reference recall@4 0.843). Visually the student's band is broader and softer than the
 recto face target at 2.4 um: the one-head compromise between the recto face (rungs 2-3) and the m7 whole-sheet band
 (rungs 4+). A100 `u1_30m6_p4` (30m6, 256^3) runs at 12.6 Mvox/s, ~44 h for 60k steps.
+
+## 14. Where the A100 step goes, and what was fixed (2026-09-20)
+
+Profiled at the live configuration (30m6, 256^3, batch 2, add_skip 1, deep 3, compile, 9 context rungs,
+6 loader workers) with `cloud/a100_profile.py` (the real loader, the real checkpoint), the micro-probes in
+`cloud/a100_micro.py` and the upsample study in `cloud/a100_up.py`.
+
+Per-step wall clock, ms (12-20 steps after warm-up, each phase synchronised):
+
+| phase | ckpt_act 2 (before) | ckpt_act 1 | ckpt_act 0 | ckpt_act 0 + `up2x` |
+|---|---|---|---|---|
+| loader wait | 0.3 | 0.3 | 0.3 | 0.3 |
+| `prep.prepare` (H2D + z-score + radial + symmetry) | 219 | 247 | 247 | 248 |
+| `aug.apply` ("geo" = symmetry only) | 2.7 | 2.7 | 2.7 | 0.2 |
+| `channels_last_3d` | 3.0 | 3.0 | 3.3 | 3.0 |
+| forward | 532 | 420 | 333 | 510 |
+| loss (4 deep heads) | 7.5 | 7.1 | 7.1 | 8.2 |
+| backward | 2163 | 2023 | 1762 | **651** |
+| clip + optimizer | 8.2 | 6.0 | 7.6 | 7.1 |
+| EMA | 6.1 | 3.6 | 4.5 | 1.8 |
+| **total** | **2942** | **2712** | **2368** | **1429** |
+| Mvox/s | 11.4 | 12.4 | 14.2 | **23.5** |
+| peak allocated / reserved (GiB) | 40.6 / 47.5 | 44.8 / 50.5 | 41.4 / 51.4 | 43.4 / 48.4 |
+
+Periodic costs (`--eval-every 500`, 21 validation patches): `evaluate` 17-19 s, `val_png` 8.4 s, checkpoint
+save 1.6 s -- 27 s per 500 steps, 54 ms/step amortised, i.e. 2% of the old step and 4% of the new one.
+
+The card is NOT starved: during a step `nvidia-smi` reports 100% utilisation, and a bf16 GEMM reaches
+290 TFLOPS. The step was memory-traffic bound, and two probes say where:
+
+- `F.interpolate(mode="trilinear")` at the decoder's widest stage (2 x 64 x 256^3 output, 2^31 elements):
+  forward 91 ms, **forward+backward 1194 ms**. Its backward is a scatter-add (`_unsafe_index_put`, atomics).
+  The 128-channel stage costs another 295 ms. That was ~60% of the whole step.
+- eager `GroupNorm+SiLU` on 2 x 32 x 256^3 runs at 50 GiB/s (a plain add on the same tensor runs at
+  2300 GiB/s); under `torch.compile` Inductor fuses them into `triton_red_fused_..._native_group_norm_silu_...`
+  kernels, which is why compiling matters so much here.
+- `conv3d` is fine: 120-137 TFLOPS at 32 channels x 2 x 256^3 (the >1.6e9-element shape), 245-273 TFLOPS at
+  every smaller level. Convolutions are only ~320 ms of the step.
+- the host->device link is 2.4-2.5 GiB/s (pinned or pageable -- this is a proxied GPU, not a PCIe slot), so
+  the ~400 MB of uint8 cubes per step costs ~150 ms. It does NOT overlap with compute: copying the next
+  batch on a second CUDA stream made the step 3% SLOWER, so the idea was dropped.
+
+Changes made (all keep the checkpoint format and the model's parameters):
+
+1. `model.up2x` replaces `F.interpolate(..., trilinear)` at an exact factor of 2 with the same arithmetic
+   written as gathers (per axis, `0.75 in[m] + 0.25 in[m-+1]` interleaved by `stack`+`flatten`), so the
+   backward is a gather. Any other ratio still calls `F.interpolate`. Backward 1762 -> 651 ms.
+   Numerics: exact to 2e-7 relative in float32 (`tests/test_smoke.py` checks it in float64); under bf16
+   autocast the per-axis rounding differs by up to one bf16 ulp (9e-3 relative on the activation) because
+   aten sums all eight corners in float before rounding once. Measured effect on the step-8000 validation:
+   dice 0.65403 vs 0.65416, dice_r2/r3/r4 0.68090/0.66978/0.61140 vs 0.68101/0.66995/0.61153.
+2. `--ckpt-act 0`: no activation recomputation. It is both faster (no recompute) and, with `torch.compile`,
+   no more expensive in memory (Inductor reuses buffers better than the checkpoint boundaries allow).
+   NB without `--compile` the same configuration needs 67 GiB and OOMs: compiling is what makes it fit.
+3. `aug.apply` no longer concatenates the whole batch back together when no intensity augmentation is
+   configured (the "geo" preset): 1.9 GiB of allocation and a full copy per step for nothing.
+4. `losses_tw` no longer builds `1 + 0 * (tgt >= 0.9)` when `ridge_w` is 0; the weight tensor is used as is.
+5. `ema_update` uses `torch._foreach_mul_`/`_foreach_add_` (same arithmetic, two kernel launches instead of
+   two per tensor).
+
+Rejected, with the measurement: `torch.backends.cudnn.benchmark = True` (no speed change, peak allocated
+41 -> 71 GiB -- the algorithm search picks huge workspaces); the H2D prefetch stream (above); batch 3
+(changes the optimisation, and `--batch` is not in the resume `grow` list); fused AdamW (the optimizer is
+0.5% of the step); `max-autotune-no-cudagraphs` (not reached before the win above made it moot).
+`TORCH_LOGS=recompiles,graph_breaks` over real steps prints nothing: the rung mode varies tensor VALUES
+(the scale plane, the symmetry index), not shapes, so the compiled graph is entered once and kept.

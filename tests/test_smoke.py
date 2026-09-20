@@ -256,3 +256,20 @@ def test_patch_may_span_a_whole_axis(tmp_path, monkeypatch):
     ds = data.Patches(patch=(128, 64, 64), ct=ct, stores=[tr], exclude=va, air_keep=1.0, fg_keep=1.0)
     x, t = next(iter(ds))
     assert x.shape == (4, 128, 64, 64) and t.shape == (1, 128, 64, 64)
+
+
+def test_up2x_matches_interpolate_exactly_at_a_factor_of_two():
+    """`model.up2x` is the trilinear 2x upsample written as gathers; in float32 it must agree with
+    `F.interpolate` to round-off, including at the clamped borders, and fall back for other ratios."""
+    import torch
+    import torch.nn.functional as F
+    from usrm2 import model as M
+    for shape in [(2, 3, 8, 6, 4), (1, 1, 5, 5, 5), (1, 2, 1, 4, 3)]:
+        x = torch.randn(*shape, dtype=torch.float64)
+        want = F.interpolate(x, size=tuple(2 * s for s in shape[2:]), mode="trilinear", align_corners=False)
+        got = M.up2x(x, tuple(2 * s for s in shape[2:]))
+        assert got.shape == want.shape
+        assert torch.allclose(got, want, atol=1e-12), (got - want).abs().max()
+    x = torch.randn(1, 2, 3, 3, 3)
+    assert torch.equal(M.up2x(x, (5, 5, 5)),
+                       F.interpolate(x, size=(5, 5, 5), mode="trilinear", align_corners=False))

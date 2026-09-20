@@ -51,8 +51,8 @@ def losses_tw(logit, tgt, wv, ridge_w=0.0):
     """`losses` on an already-converted (target, weight) pair. The weight scales the BCE and masks the soft
     dice (a voxel with weight 0 contributes to neither, so it carries no gradient)."""
     if ridge_w > 0 or wv is not None:
-        w = 1 + ridge_w * (tgt >= 0.9).float()
-        if wv is not None:
+        w = wv if ridge_w == 0 else (1 + ridge_w * (tgt >= 0.9).float())  # ridge_w 0: 1 * wv is wv
+        if ridge_w > 0 and wv is not None:
             w = w * wv
         bce = (F.binary_cross_entropy_with_logits(logit, tgt, reduction="none") * w).sum() / w.sum().clamp_min(1e-6)
     else:
@@ -75,9 +75,18 @@ def losses(logit, tgt, ridge_w=0.0, wtgt=(), w=None):
 
 @torch.no_grad()
 def ema_update(ema, model, decay=0.999):
+    """Same update as `e.mul_(decay).add_(v, alpha=1-decay)` per tensor, batched with the foreach kernels:
+    one pair of kernel launches for the whole 45M-parameter state instead of two per tensor."""
+    es, vs = [], []
     for k, v in model.state_dict().items():
         e = ema[k]
-        e.mul_(decay).add_(v.detach(), alpha=1 - decay) if e.is_floating_point() else e.copy_(v)
+        if e.is_floating_point():
+            es.append(e), vs.append(v.detach())
+        else:
+            e.copy_(v)
+    if es:
+        torch._foreach_mul_(es, decay)
+        torch._foreach_add_(es, vs, alpha=1 - decay)
 
 
 def autocast(dev):

@@ -12,6 +12,32 @@ PRESETS = {"1m": (16, 32, 64, 128), "3m": (24, 48, 96, 192), "5m": (32, 64, 128,
            "n16": (16, 32, 64, 128, 256, 512), "n24": (24, 48, 96, 192, 384, 512)}
 
 
+def up2x(x, size):
+    """Trilinear upsample of (B,C,Z,Y,X) to `size`, taking a fast path at an exact factor of 2.
+
+    `F.interpolate(..., mode="trilinear", align_corners=False)` at 2x is, per axis,
+        out[2m] = 0.75 in[m] + 0.25 in[m-1],  out[2m+1] = 0.75 in[m] + 0.25 in[m+1]
+    with the out-of-range neighbour clamped to the edge. Written that way -- two weighted sums and an
+    interleave per axis -- every operation is a GATHER, so the backward is a gather too. aten's
+    upsample_trilinear3d_backward is a scatter-add (`_unsafe_index_put`, atomics) and at the decoder's
+    widest stage (2 x 64 x 256^3, 2e9 elements) it costs about 1.1 s per call on an A100; this form,
+    compiled, costs about 0.1 s (measured, cloud/a100_up.py). The values agree with `F.interpolate` to
+    2e-7 relative in float32; under bf16 autocast the per-axis rounding differs by up to one bf16 ulp
+    (9e-3 relative) because aten sums all eight corners in float before rounding once.
+
+    Any other ratio (an odd patch size, where a stride-2 encoder level rounds up) falls back to
+    `F.interpolate`, so the semantics are unchanged everywhere.
+    """
+    if tuple(int(v) for v in size) != tuple(2 * int(v) for v in x.shape[2:]):
+        return F.interpolate(x, size=size, mode="trilinear", align_corners=False)
+    for d in range(3):
+        a, n = 2 + d, x.shape[2 + d]
+        prev = torch.cat([x.narrow(a, 0, 1), x.narrow(a, 0, n - 1)], a)
+        nxt = torch.cat([x.narrow(a, 1, n - 1), x.narrow(a, n - 1, 1)], a)
+        x = torch.stack([0.75 * x + 0.25 * prev, 0.75 * x + 0.25 * nxt], a + 1).flatten(a, a + 1)
+    return x
+
+
 def block(cin, cout):
     layers = []
     for c in (cin, cout):
@@ -72,7 +98,7 @@ class UNet(nn.Module):
 
         def f(pair):
             x, skip = pair
-            x = F.interpolate(x, size=skip.shape[2:], mode="trilinear", align_corners=False)
+            x = up2x(x, skip.shape[2:])
             return dec(proj(x) + skip) if add else dec(torch.cat([x, skip], 1))
         return f
 
