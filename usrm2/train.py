@@ -294,7 +294,11 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     dl = data.loader(patch, batch, workers, ct=kw.get("ct", data.CT), stores=kw.get("stores", data.TRAIN),
                      exclude=kw.get("val", data.VAL), seed=step + 7919 * rank, sym=cfg.get("sym", True), aug=cfg, dense_pow=dense_pow, ctx=ctx,
                      stores_file=kw.get("stores_file"),  # a stores file is re-read as it grows (data.Patches)
-                     **(dict(rungs=rungs, rung_boost=rung_boost, channels=args.get("channels"), require_targets=require_targets) if rungs is not None else {}),
+                     # region mode / the region teacher stores reach the DATASET, not just the args record
+                     **(dict(rungs=rungs, rung_boost=rung_boost, channels=args.get("channels"),
+                             require_targets=require_targets,
+                             **{q: kw[q] for q in ("region", "windows_per_region", "region_fails",
+                                                   "teacher_regions") if kw.get(q)}) if rungs is not None else {}),
                      **(dict(stream=stream) if stream else {}))
     model = torch.nn.parallel.DistributedDataParallel(net, device_ids=[dev.index]) if world > 1 else net
     if compile:

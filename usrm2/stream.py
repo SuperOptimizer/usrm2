@@ -206,6 +206,33 @@ async def fetch_group_meta(f, base):
 
 # ------------------------------------------------------------------ the no-repeat walk
 
+def region_walk(stores, rungs=True, seed=0, patch=256, region=1024, boost=None, exclude=(), records=False):
+    """THE region walk, as a plain list -- the contract between the stream planner and anything else that
+    has to visit the same regions in the same order (cloud/teacher_regions.py runs the upstream teacher
+    over them and writes `data.teacher_region_path` stores, which the loader then prefers as the rung-2/3
+    target; see `data.read_teacher`).
+
+        [(source line, rung, (z, y, x) origin in rung-k voxels), ...]   in VISIT order
+
+    with `records=True` the full dicts instead (adding "size", the tile edge, and "w", the draw weight).
+    Both sides MUST pass the same stores, rungs, boost, patch, region, exclude and seed: the list is
+    enumerated by `data.region_list` (shard-aligned tiles of each target box, all-air ones dropped) and
+    ordered by `data.walk_order`, and every one of those is an input to both. At rung 2 an origin is a
+    multiple of 1024 (the CT and the export are both 1024^3-sharded there), which is the region name.
+
+    `stores` is a stores file path or the lines themselves; `rungs` True or the allowed set."""
+    if isinstance(stores, str) and os.path.exists(stores):
+        stores = [l.strip() for l in open(stores) if l.strip() and not l.startswith("#")]
+    lines = [stores] if isinstance(stores, str) else list(stores)
+    ex = [e if isinstance(e, (tuple, list)) and len(e) == 2 and not isinstance(e[0], str) else data.val_box(e)
+          for e in ([exclude] if isinstance(exclude, str) else list(exclude or []))]
+    regs = data.region_list(data.source_groups(lines), patch=patch, region=region,
+                            allowed=None if rungs is True else set(rungs), boost=boost, exclude=ex)
+    order = data.walk_order([r["w"] for r in regs], seed)
+    out = [regs[int(j)] for j in order]
+    return out if records else [(lines[r["s"]], r["k"], tuple(r["lo"])) for r in out]
+
+
 class Walk:
     """The region list and a cursor over it: every region visited ONCE, in the weighted-shuffled order
     `data.walk_order` gives (see the walk section of usrm2/data.py).
@@ -298,7 +325,8 @@ class Planner:
     def __init__(self, stores_file, queue, patch=256, rungs=True, rung_boost=None, seed=0, workers=4,
                  ahead=400, cache_gb=20.0, ctx=(), aug="geo", dense_pow=0.0, require_targets=False,
                  val=None, jobs=48, report=30.0, limit=0, val_rungs=data.VAL_RUNGS, val_patches=32,
-                 region=0, windows_per_region=64, walk=None, active_regions=4, epochs=1, region_fails=0):
+                 region=0, windows_per_region=64, walk=None, active_regions=4, epochs=1, region_fails=0,
+                 teacher_regions=None):
         from usrm2 import aug as A
         self.dir = str(queue)
         self.stores_file, self.seed, self.W, self.ahead = str(stores_file), int(seed), int(workers), int(ahead)
@@ -309,7 +337,7 @@ class Planner:
                        aug=self.cfg, sym=self.cfg.get("sym", True), dense_pow=dense_pow,
                        require_targets=bool(require_targets), seed=int(seed),
                        region=int(region or 0), windows_per_region=int(windows_per_region),
-                       region_fails=int(region_fails or 0))
+                       region_fails=int(region_fails or 0), teacher_regions=teacher_regions)
         self.walk_mode = None if not walk else str(walk)
         assert self.walk_mode in (None, "once"), f"--walk {walk}: only 'once' exists"
         assert not self.walk_mode or region, "--walk needs --region (the walk is over regions)"
@@ -474,6 +502,7 @@ class Planner:
                 "require_targets": self.require_targets, "channels": self.ds.channels,
                 "region": self.kw["region"], "windows_per_region": self.kw["windows_per_region"],
                 "walk": self.walk_mode, "active_regions": self.K, "epochs": self.epochs,
+                "teacher_regions": self.kw["teacher_regions"],
                 "regions": len(self.walk.regions) if self.walk else 0,
                 "val": _val_meta(self.val),
                 "dirs": self.dirs, "whole": sorted(self.whole)}

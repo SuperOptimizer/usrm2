@@ -51,6 +51,9 @@ def main(argv=None):
     t.add_argument("--region", type=int, default=0, help="region mode: visit one REGION^3 region of one "
                    "source at one rung, take --windows-per-region windows inside it, then move on")
     t.add_argument("--windows-per-region", type=int, default=64)
+    t.add_argument("--teacher-regions", default=None, help="prefer a region's teacher probability store "
+                   "(usrm2.data.teacher_region_path under this root) over the exported mask as the rung-2/3 "
+                   "target; rung 3 is its 2x mean pool")
     t.add_argument("--stream", default=None, help="replay a `usrm2 stream-plan` queue directory instead of "
                    "sampling: the windows come from the rolling local buffer the planner fills")
     sp = sub.add_parser("stream-plan", help="plan and stream the training windows into a rolling disk buffer "
@@ -80,6 +83,7 @@ def main(argv=None):
                     "are emitted round robin, so consecutive queue entries come from different regions")
     sp.add_argument("--epochs", type=int, default=1, help="walk the region list this many times (a fresh "
                     "permutation each time)")
+    sp.add_argument("--teacher-regions", default=None, help="see `train --teacher-regions`")
     sp.add_argument("--region-fails", type=int, default=0, help="consecutive rejected draws that abandon a "
                     "region (0 = 8 x --windows-per-region)")
     sp.add_argument("--val-rungs", default="2,3,4,6", help="rungs the held-out box is scored at (prefetched and pinned)")
@@ -239,7 +243,8 @@ def main(argv=None):
                 aug=a.aug, no_radial=a.no_radial,
                 **({"rungs": parse_rungs(a.rungs), "rung_boost": parse_boost(a.rung_boost),
                     "val_rungs": [int(q) for q in a.val_rungs.split(",")], "require_targets": a.require_targets,
-                    "region": a.region, "windows_per_region": a.windows_per_region} if a.rungs else {}),
+                    "region": a.region, "windows_per_region": a.windows_per_region,
+                    "teacher_regions": a.teacher_regions} if a.rungs else {}),
                 **{k: v for k, v in dict(stores=a.stores, stores_file=a.stores_file, val=a.val).items() if v})
     elif a.cmd == "umbilicus":
         from usrm2 import umbilicus as U
@@ -259,7 +264,8 @@ def main(argv=None):
                require_targets=a.require_targets, val=a.val, jobs=a.jobs, report=a.report, limit=a.limit,
                val_rungs=[int(q) for q in a.val_rungs.split(",")], val_patches=a.val_patches,
                region=a.region, windows_per_region=a.windows_per_region, walk=a.walk,
-               active_regions=a.active_regions, epochs=a.epochs, region_fails=a.region_fails)
+               active_regions=a.active_regions, epochs=a.epochs, region_fails=a.region_fails,
+               teacher_regions=a.teacher_regions)
     elif a.cmd == "ablate":
         from usrm2 import ablate
         ablate.sweep(a.out_dir, a.presets.split(","), size=a.size, steps=a.steps, patch=a.patch,

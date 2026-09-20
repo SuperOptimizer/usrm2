@@ -762,6 +762,54 @@ def region_list(srcs, patch=256, region=1024, allowed=None, boost=None, exclude=
     return out
 
 
+# ------------------------------------------------------------- the region teacher stores
+# A separate service (cloud/teacher_regions.py) walks the SAME region list in the same order and runs the
+# upstream teacher over each rung-2 region, writing a probability store per region:
+#
+#     <TEACHER_REGIONS>/<channel>/region_<z>_<y>_<x>.zarr   (z, y, x = the region origin in RUNG-2 voxels,
+#                                                            attrs origin_zyx and `done`)
+#
+# A rung-2 region origin is a multiple of REGION (1024): both the CT level and the target export are
+# 1024^3-sharded there, so the walk's tiles are the shard grid. When a window lies inside ONE finished
+# store, the loader takes its target from that store instead of the exported mask pyramid -- soft teacher
+# probability instead of a thresholded mask -- and rung 3 is the 2x mean pool of it. Anything else (no
+# store, not `done`, a window straddling two regions, any other rung) falls back to the mask pyramid.
+
+TEACHER_REGIONS = _os.environ.get("USRM2_TEACHER_REGIONS", "/vesuvius/usrm2/teacher_regions")
+REGION = 1024  # the rung-2 region edge the walk and the teacher service agree on
+
+
+def teacher_region_path(lo2, channel="recto", root=None):
+    """Where the region teacher service writes the store of the region at rung-2 origin `lo2`."""
+    z, y, x = (int(v) for v in lo2)
+    return f"{root or TEACHER_REGIONS}/{channel}/region_{z}_{y}_{x}.zarr"
+
+
+def read_teacher(a, k, lo, p):
+    """(cube, inside) of a region teacher store read at rung k (2, or 3 = its 2x mean pool): the uint8
+    probability over the window at corner `lo` (rung-k voxels) and the mask of the voxels the store
+    actually covers. The store's own grid is rung 2, its corner `origin_zyx`."""
+    d, p3 = int(k) - 2, shape3(p)
+    o, S = np.array(a.attrs["origin_zyx"], np.int64), np.array(a.shape[-3:], np.int64)
+    lo2, n2 = (np.asarray(lo, np.int64) << d) - o, p3 << d
+    out = np.zeros(tuple(n2), np.uint8)
+    aa, bb = np.maximum(lo2, 0), np.minimum(lo2 + n2, S)
+    if (bb > aa).all():
+        sl = tuple(slice(int(x), int(y)) for x, y in zip(aa, bb))
+        blk = np.asarray(a[(0,) + sl] if a.ndim == 4 else a[sl], np.uint8)
+        st = aa - lo2
+        out[st[0]:st[0] + blk.shape[0], st[1]:st[1] + blk.shape[1], st[2]:st[2] + blk.shape[2]] = blk
+    for _ in range(d):
+        out = pool2(out)
+    e = 1 << d                                   # a rung-k voxel counts only if its whole footprint is stored
+    ins = np.zeros(tuple(p3), bool)
+    jlo = np.clip(-(-np.maximum(-lo2, 0) // e), 0, p3)
+    jhi = np.clip((np.minimum(S - lo2, n2)) // e, 0, p3)
+    if (jhi > jlo).all():
+        ins[jlo[0]:jhi[0], jlo[1]:jhi[1], jlo[2]:jhi[2]] = True
+    return out, ins
+
+
 def walk_order(w, seed=0):
     """A weighted shuffle WITHOUT replacement (Efraimidis-Spirakis): key = Exp(1) / w, ascending. The first
     item is i with probability w_i / sum(w), and every item appears exactly once."""
@@ -776,7 +824,7 @@ class Patches(torch.utils.data.IterableDataset):
     def __init__(self, patch=128, ct=CT, stores=TRAIN, exclude=VAL, seed=0, air_keep=0.1, fg_min=0.05,
                  fg_keep=0.25, sym=True, aug=None, dense_pow=0.0, dense_ref=0.2, ctx=(), stores_file=None,
                  recheck=200, rungs=None, rung_boost=None, channels=None, require_targets=False, stream=None,
-                 region=0, windows_per_region=64, region_fails=0):
+                 region=0, windows_per_region=64, region_fails=0, teacher_regions=None):
         """dense_pow > 0 biases sampling towards sheet-dense patches: a patch whose target mean m is below
         dense_ref is kept with probability (m / dense_ref) ** dense_pow (crushed windings are where students fail).
         stores_file: instead of `stores`, a text file with one comma-joined group per line that is re-read
@@ -819,6 +867,10 @@ class Patches(torch.utils.data.IterableDataset):
         # so a visit touches one shard footprint per level and the buffer serves the whole visit.
         self.region, self.windows_per_region = int(region or 0), int(windows_per_region)
         self.region_fails = int(region_fails or 8 * max(self.windows_per_region, 1))
+        # the region teacher stores (see `read_teacher`): soft probability instead of the exported mask,
+        # for any rung-2/3 window that lies inside one finished region store
+        self.teacher_regions = None if teacher_regions in (None, "") else str(teacher_regions)
+        self._tstore = {}
         self.rungs, self.rung_boost, self.channels = rungs, dict(rung_boost or {}), channels
         self.norm, self.umbilicus = NORM, UMBILICUS  # module state the (spawned) workers must inherit explicitly
         self.stores_file, self.recheck, self.file_mtime = stores_file, recheck, None
@@ -854,6 +906,7 @@ class Patches(torch.utils.data.IterableDataset):
         global NORM, UMBILICUS
         NORM, UMBILICUS = self.norm, self.umbilicus
         CTX_CACHE.clear(); CHUNK_INDEX.clear()  # a re-open (stores file changed) must see levels/shards added since
+        self._tstore = {}                       # ... and region teacher stores finished since
         if self.stores_file:
             self.paths = [g.split(",") for g in self.read_groups()]
             assert self.paths, f"{self.stores_file} lists no store groups"
@@ -952,7 +1005,7 @@ class Patches(torch.utils.data.IterableDataset):
                         return None, None
         elif not hook.data(s, k, lo):
             return None, None
-        bl, blank, prm = self.aug.get("blank"), False, {}
+        bl, blank, prm, tea = self.aug.get("blank"), False, {}, None
         if bl and rng.random() < bl["p"]:  # an all-air patch (CT 0 = air) with target 0
             blank = True
             ct = np.zeros(tuple(p), np.uint8)
@@ -962,7 +1015,8 @@ class Patches(torch.utils.data.IterableDataset):
             ct = read_rung(cpyr, k, lo, p, dtype=np.uint8)
             if (ct == 0).mean() > 0.9 and rng.random() > self.air_keep:
                 return None, None
-            tg, w = self._rung_target(s, k, lo, ct)
+            tea = self._teacher_store(s, k, lo)
+            tg, w = self._rung_target(s, k, lo, ct, teacher=tea)
             sel = w > 0
             m = float(np.sum(tg, where=sel, dtype=np.int64)) / 255.0 / max(int(sel.sum()), 1)
             if m < self.fg_min and rng.random() > self.fg_keep:
@@ -977,6 +1031,8 @@ class Patches(torch.utils.data.IterableDataset):
         if self.region and st is not None:
             st["left"], st["fails"] = st.get("left", 0) - 1, 0  # an accepted window ends the failure run
         desc = {"s": int(i), "k": k, "lo": [int(v) for v in lo], "y": sym, "b": int(blank), "r": prm}
+        if not blank and tea:  # the replaying worker reads the same teacher store, not the mask pyramid
+            desc["t"] = tea
         if hook is not None and self.ctx:
             hook.ctx(s, k, lo)
         if not build:
@@ -995,20 +1051,53 @@ class Patches(torch.utils.data.IterableDataset):
             w = np.zeros_like(tg)
         else:
             ct = read_rung(s["ct_pyr"], k, lo, p, dtype=np.uint8)
-            tg, w = self._rung_target(s, k, lo, ct)
+            tg, w = self._rung_target(s, k, lo, ct, teacher=d.get("t"))
             ct = raw_apply(ct, d.get("r") or {})
         cx = context(s["ct"], lo, ct.shape, self.ctx, rung=k) if self.ctx else ()
         return rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, s["axis"], int(d.get("y", 0)))
 
-    def _rung_target(self, s, k, lo, ct):
+    def _teacher_store(self, s, k, lo):
+        """The finished region teacher store that covers this whole window, or None. Only rungs 2 and 3
+        (the store's own grid is rung 2 and rung 3 is its 2x pool), only a window inside ONE region, and
+        only for the FIRST source: the regions are named by rung-2 origin, which is one scroll's grid."""
+        if not self.teacher_regions or int(k) not in (2, 3) or s is not self.srcs[0]:
+            return None
+        d = int(k) - 2
+        lo2, hi2 = np.asarray(lo, np.int64) << d, ((np.asarray(lo, np.int64) + self.patch) << d) - 1
+        a, b = lo2 // REGION, hi2 // REGION
+        if not np.array_equal(a, b) or (lo2 < 0).any():
+            return None                                    # the window straddles two region stores
+        p = teacher_region_path(a * REGION, self.channels[0], self.teacher_regions)
+        return p if self._teacher_arr(p) is not None else None
+
+    def _teacher_arr(self, path):
+        """The opened store, or None when it does not exist or the service has not finished it."""
+        a = self._tstore.get(path)
+        if a is None:
+            try:
+                a = open_zarr(path)
+                a = a if a.attrs.get("done") else False
+            except Exception:  # noqa: BLE001  (not written yet)
+                a = False
+            self._tstore[path] = a
+        return a or None
+
+    def _rung_target(self, s, k, lo, ct, teacher=None):
         """(target, weight) at rung k as uint8 (255 = 1.0): one channel per output channel, 0 (weight 0) for
         a channel this source does not provide; weight 1 inside the target's box and where CT > 0, times its
-        source weight."""
+        source weight. `teacher`: a region teacher store whose soft probability replaces the exported mask
+        for the first channel (the window is inside it; rung 3 is its 2x mean pool)."""
         p = self.patch
         tg = np.zeros((len(self.channels),) + tuple(p), np.uint8)
         w = np.zeros_like(tg)
         inside_ct = ct > 0
+        ta = self._teacher_arr(teacher) if teacher else None
         for c, chan in enumerate(self.channels):
+            if ta is not None and chan == (ta.attrs.get("channel") or self.channels[0]):
+                v, ins = read_teacher(ta, k, lo, p)
+                np.copyto(tg[c], v, where=inside_ct)
+                w[c] = np.where(ins & inside_ct, np.uint8(255), np.uint8(0))
+                continue
             t = s["targets"].get(chan)
             if t is None:
                 continue  # per-channel ignore: this source says nothing about that channel
@@ -1031,6 +1120,7 @@ class Patches(torch.utils.data.IterableDataset):
             f"--stream was planned at patch {m['patch']}, not {[int(v) for v in self.patch]}"
         assert tuple(m["ctx"]) == tuple(self.ctx), f"--stream was planned with --ctx {m['ctx']}"
         self.paths, self.stores_file = [g.split(",") for g in m["stores"]], None
+        self.teacher_regions = self.teacher_regions or m.get("teacher_regions")
         if self.channels is None:
             self.channels = list(m["channels"])
         assert list(self.channels) == list(m["channels"]), f"--stream was planned for channels {m['channels']}"

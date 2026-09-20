@@ -569,3 +569,30 @@ absent file means air) is a hit that is never fetched, never charged against `--
 Only planner-fetched shards are the rolling buffer. `plan.jsonl` reports `mirror` (such hits) and folds
 them into `hit_rate`, plus `regions` / `regions_left` / `regions_total` / `epoch` / `active` and
 `region_MiB` (bytes fetched per region, which is what `--cache-gb` has to hold K of).
+
+### 18.1 The region contract with the teacher service (2026-09-20, coordinator)
+
+`usrm2.stream.region_walk(stores, rungs, seed, patch, region, boost, exclude)` IS the walk, as a plain list:
+
+    [(source line, rung, (z, y, x) origin in rung-k voxels), ...]        # visit order
+
+(`records=True` gives the dicts, with the tile size and the draw weight). The stream planner walks exactly
+this list, and `cloud/teacher_regions.py` -- the service that runs the upstream teacher over the regions --
+walks it too. Both sides must pass the SAME stores, rungs, rung boosts, patch, region, exclude (the
+held-out box) and seed: every one of them is an input to `data.region_list` (which tiles and drops the air)
+or to `data.walk_order` (which orders). At rung 2 a region origin is a multiple of 1024: the CT level and
+the export are both 1024^3-sharded there, so the walk's tiles ARE the shard grid.
+
+The service writes one probability store per rung-2 region,
+
+    <TEACHER_REGIONS>/<channel>/region_<z>_<y>_<x>.zarr      (z, y, x = the rung-2 origin)
+    attrs: origin_zyx (rung-2 voxels), channel, done
+
+and `--teacher-regions DIR` (on `train` and `stream-plan`, recorded in the queue's `meta.json` so a
+replaying worker uses the same root) makes the loader PREFER it: a rung-2 or rung-3 window of the first
+source that lies inside ONE finished (`done`) store takes its target from that store -- the teacher's soft
+probability instead of the thresholded export -- with weight 1 wherever the store covers the voxel and the
+CT is not masked. Rung 3 is the 2x mean pool of the same store (`data.read_teacher`). Everything else
+falls back to the exported mask pyramid: no store, not `done` yet, a window straddling two regions, another
+source, or any other rung. The queue entry records the store path (`t`), so the replaying worker reads what
+the planner decided rather than racing the service.

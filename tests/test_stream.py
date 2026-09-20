@@ -688,3 +688,96 @@ def test_a_mirrored_shard_is_a_hit_and_is_never_evicted(tmp_path, origin, monkey
     json.dump({"i": 10 ** 6, "margin": 0}, open(q / S.CONSUMED, "w"))
     pl.evict()
     assert {str(p) for p in pathlib.Path(mct).rglob("*") if p.is_file()} >= before
+
+
+# ------------------------------------------------------------------ the shared walk + region teachers
+
+def test_region_walk_is_the_same_list_the_planner_walks(tmp_path, origin, monkeypatch):
+    """`stream.region_walk` is the contract the region teacher service walks: the same regions, in the
+    same order, as the planner's own walk."""
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    mct, mtg, _, _, _ = origin
+    q = tmp_path / "q"
+    walk_plan(tmp_path, mct, mtg, q, workers=1)
+    data.CTX_CACHE.clear(), data.CHUNK_INDEX.clear()
+    regs = [json.loads(l) for l in open(q / S.REGIONS)]
+    order = data.walk_order([r["w"] for r in regs], 0)
+    want = [(f"{mct},{mtg}", regs[int(j)]["k"], tuple(regs[int(j)]["lo"])) for j in order]
+    got = S.region_walk([f"{mct},{mtg}"], rungs={2, 3}, seed=0, patch=P32, region=64)
+    assert got == want
+    assert len(set(got)) == len(got)
+    # the queue's regions come out in that order
+    gs = list(dict.fromkeys(r["g"] for r in queue_of(q)))
+    assert [want[g] for g in gs] == [want[g] for g in sorted(gs)] or len(gs) > 1
+
+
+def teacher_store(path, lo2, shape=(64, 64, 64), value=90, done=True, channel="recto"):
+    import zarr
+    a = zarr.create_array(str(path), shape=shape, chunks=(32, 32, 32), dtype="uint8", fill_value=0,
+                          overwrite=True)
+    a[:] = np.full(shape, value, np.uint8)
+    a.attrs["origin_zyx"] = [int(v) for v in lo2]
+    a.attrs["channel"] = channel
+    if done:
+        a.attrs["done"] = True
+    return str(path)
+
+
+def test_a_finished_region_teacher_store_replaces_the_mask_target(tmp_path, monkeypatch):
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    monkeypatch.setattr(data, "REGION", 64)
+    ct = ct_pyramid(tmp_path, base=256, nlev=4)
+    tg = pred_pyramid(tmp_path, base=256, nlev=4)          # the exported mask: 220 - 30 k
+    root = tmp_path / "treg"
+    teacher_store(root / "recto" / "region_64_64_64.zarr", (64, 64, 64), value=90)
+    data.CTX_CACHE.clear()
+    ds = data.Patches(patch=P32, stores=[f"{ct},{tg}"], exclude=[], rungs={2, 3}, sym=False,
+                      teacher_regions=str(root))
+    ds._open_rungs()
+    s = ds.srcs[0]
+    for k, lo, want in ((2, (64, 64, 64), 90),        # inside the store: its probability
+                        (3, (32, 32, 32), 90),        # rung 3 = its 2x pool (a constant pools to itself)
+                        (2, (0, 0, 0), 160)):         # no store there: the exported mask
+        c = data.read_rung(s["ct_pyr"], k, lo, ds.patch, dtype=np.uint8)
+        t = ds._teacher_store(s, k, lo)
+        tgt, w = ds._rung_target(s, k, lo, c, teacher=t)
+        assert int(tgt[0].max()) == want == int(tgt[0].min()), (k, lo, t)
+        assert bool((w[0] > 0).all())
+    assert ds._teacher_store(s, 2, (48, 64, 64)) is None, "a window straddling two regions must fall back"
+    assert ds._teacher_store(s, 4, (64, 64, 64)) is None, "only rungs 2 and 3 come from the store"
+
+
+def test_an_unfinished_region_teacher_store_is_ignored(tmp_path, monkeypatch):
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    monkeypatch.setattr(data, "REGION", 64)
+    ct = ct_pyramid(tmp_path, base=256, nlev=4)
+    tg = pred_pyramid(tmp_path, base=256, nlev=4)
+    root = tmp_path / "treg"
+    teacher_store(root / "recto" / "region_64_64_64.zarr", (64, 64, 64), value=90, done=False)
+    data.CTX_CACHE.clear()
+    ds = data.Patches(patch=P32, stores=[f"{ct},{tg}"], exclude=[], rungs={2, 3}, sym=False,
+                      teacher_regions=str(root))
+    ds._open_rungs()
+    assert ds._teacher_store(ds.srcs[0], 2, (64, 64, 64)) is None
+
+
+def test_the_queue_carries_the_teacher_store_so_the_replay_reads_it(tmp_path, origin, monkeypatch):
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    monkeypatch.setattr(data, "REGION", 64)
+    mct, mtg, _, _, _ = origin
+    root = tmp_path / "treg"
+    for z in (0, 64, 128, 192):
+        for y in (0, 64, 128, 192):
+            for x in (0, 64, 128, 192):
+                teacher_store(root / "recto" / f"region_{z}_{y}_{x}.zarr", (z, y, x), value=90)
+    q = tmp_path / "q"
+    walk_plan(tmp_path, mct, mtg, q, workers=1, teacher_regions=str(root))
+    recs = queue_of(q)
+    assert any("t" in r for r in recs), "no window used a region teacher store"
+    data.CTX_CACHE.clear(), data.CHUNK_INDEX.clear()
+    ds = data.Patches(patch=P32, stores=[f"{mct},{mtg}"], exclude=[], rungs={2, 3}, ctx=(1,), stream=str(q))
+    ds._open()
+    assert ds.teacher_regions == str(root)          # the queue's meta carries it to the replaying worker
+    rec = [r for r in recs if "t" in r and not r.get("b")][0]
+    item = ds._rung_build(rec)
+    assert int(item["tgt"].max()) == 90, "the replay did not read the region teacher store"
