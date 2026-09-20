@@ -245,7 +245,7 @@ class Planner:
         self.index = 0                           # the next queue index to emit
         self.pending = [[] for _ in range(self.W)]
         self.states = [None] * self.W
-        self.lines, self.dirty = [], False
+        self.lines, self.dirty, self.full = [], False, False
 
     # ---- bookkeeping -------------------------------------------------------
 
@@ -476,6 +476,7 @@ class Planner:
             self.stop = False
             tasks = [asyncio.create_task(self.stream(w, loop)) for w in range(self.W)]
             tasks.append(asyncio.create_task(self.emitter(lines)))
+            tasks.append(asyncio.create_task(self.keeper()))
             try:
                 await asyncio.gather(*tasks)
             finally:
@@ -484,6 +485,16 @@ class Planner:
                     t.cancel()
                 self.report_line(t0, 0, 0)
 
+    async def keeper(self):
+        """Evict, and decide whether the buffer is full. A shard is ~17-56 MB, so `--cache-gb` -- not
+        `--ahead` -- is usually what stops the planner: the streams and the emitter both park while the
+        buffer is over budget and nothing more is evictable (nothing else would keep the disk bounded
+        before the trainer has consumed its first window)."""
+        while not self.stop:
+            self.evict()
+            self.full = self.cache_bytes > self.cache_max or self.index - self.consumed() > self.ahead
+            await asyncio.sleep(0.5)
+
     async def stream(self, w, loop):
         """One loader worker's rng stream: draw, fetch, reject, park the accepted windows for the emitter."""
         rng = np.random.default_rng(self.seed + 1000 * w)
@@ -491,7 +502,7 @@ class Planner:
             rng.bit_generator.state = _unjson_state(self.states[w])
         hi = max(4, self.ahead // self.W)
         while not self.stop:
-            if len(self.pending[w]) >= hi:
+            if self.full or len(self.pending[w]) >= hi:
                 await asyncio.sleep(0.05)
                 continue
             hook = Hook(self, loop)
@@ -508,7 +519,7 @@ class Planner:
             if self.limit and self.index >= self.limit:
                 self.stop = True
                 return
-            if self.index - self.consumed() > self.ahead:  # the buffer is full: wait for the trainer
+            if self.full:  # over --cache-gb, or --ahead windows in front of the trainer: wait for it
                 await asyncio.sleep(0.2)
                 continue
             w = self.index % self.W
@@ -519,13 +530,12 @@ class Planner:
             self.emit(desc, keys)
             self.states[w] = state
             self.save_state()
-            self.evict()
 
     def report_line(self, t0, b0, n0):
         dt = max(time.time() - t0, 1e-6)
         rec = {"t": round(time.time()), "index": self.index, "consumed": self.consumed(),
                "MB_s": round((self.f.bytes - b0) / 1e6 / dt, 1), "chunks_s": round((self.f.fetched - n0) / dt, 1),
-               "cache_GiB": round(self.cache_bytes / 2 ** 30, 3), "chunks": self.f.fetched,
+               "cache_GiB": round(self.cache_bytes / 2 ** 30, 3), "chunks": self.f.fetched, "full": self.full,
                "GB_total": round(self.f.bytes / 1e9, 3), "absent": self.f.absent, "failed": self.f.failed,
                "evicted": self.evicted, "whole_MiB": round(sum(self.whole.values()) / 2 ** 20, 1),
                "requests": self.f.requests, "pinned": len(self.pin),
