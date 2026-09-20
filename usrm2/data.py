@@ -666,6 +666,7 @@ class Patches(torch.utils.data.IterableDataset):
         held-out boxes (given at rung 2 and scaled to every rung)."""
         global NORM, UMBILICUS
         NORM, UMBILICUS = self.norm, self.umbilicus
+        CTX_CACHE.clear(); CHUNK_INDEX.clear()  # a re-open (stores file changed) must see levels/shards added since
         if self.stores_file:
             self.paths = [g.split(",") for g in self.read_groups()]
             assert self.paths, f"{self.stores_file} lists no store groups"
