@@ -30,7 +30,7 @@ class UNet(nn.Module):
         deep: also predict the cout maps at decoder levels 1..deep (2x, 4x, 8x coarser: 4.8/9.6/19.2 um for a
         2.4 um patch); forward returns [logits_level0, logits_level1, ...] while training, level 0 otherwise."""
         super().__init__()
-        self.deep = int(deep)
+        self.deep = min(int(deep), len(w) - 2)  # a coarse head per decoder stage above the finest; a 4-level net has 2
         self.ckpt_act = len(widths) if ckpt_act is True or ckpt_act < 0 else int(ckpt_act)
         self.add_skip = int(add_skip)
         w = list(widths)
