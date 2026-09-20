@@ -451,3 +451,47 @@ DataLoader); a consumer started first waits instead of skipping and reports the 
 budget and never touches an unconsumed window's chunks; a restarted planner continues the index and the rng;
 404s become absent markers; `--require-targets` drops a rung whose export the origin does not serve; and a
 20-step `train --stream` run logs `stream_wait_ms` and writes `consumed`.
+
+
+## 17. Region mode, and the other scrolls (2026-09-20, evening)
+
+**Region mode** (`--region 1024 --windows-per-region N`, on `train` and `stream-plan`). A shard is the unit
+of streaming, and a 1024^3 shard covers 64 windows' worth of volume at 256^3; drawing corners uniformly
+over a whole scroll therefore touches a new shard almost every window. Region mode keeps the sampler's own
+seeded draws but changes their scope: draw a source and a rung as usual, then ONE 1024^3 region inside the
+target's box, snapped to the shard grid of the level the CT is read from (so the visit is one shard
+footprint per level), take N windows inside it under the usual rejection rules -- with a cap on failed
+draws per region -- and then move on. The region visit is per rng stream, not per dataset: the planner
+drives one dataset from four threads, one stream each.
+
+Measured on the A6000 against dl.ash2txt.org, same model and flags, whole-shard streaming both times:
+
+| | cache hit rate | bytes fetched per training voxel | buffer for ~50-300 windows |
+|---|---|---|---|
+| plain (uniform corners) | 0.24 | 39.5 | 20 GiB, 52 windows |
+| region 1024, 64 windows | **0.97** | **1.47** | 6.9 GiB, 300 windows |
+
+So region mode is what makes whole-shard streaming affordable: a 27x drop in bytes per training voxel, and
+the buffer holds hundreds of windows instead of fifty.
+
+**Other scrolls.** Their predictions are exported on their NATIVE grids (levels named by true voxel size,
+`native_voxel_size_um` in the group attrs, `surface-mask-lossless` encoding), and their CT mirrors are the
+usual integer levels of a volume whose name carries its voxel size. `data.rungs` snaps both by the
+nearest-rung rule: 9.362 / 9.596 / 8.64 um all land on rung 4, their pooled levels on rungs 5..11, and a
+CT volume named `...-9.362um-...` has level l on rung 4 + l. Two things had to be added:
+
+- **an axis per scroll.** The radial channel comes from `data.axis`, and a stores file that mixes scrolls
+  must not give PHerc0139 Paris 4's umbilicus. `data.source_groups` now takes each source's axis from
+  `<UMBILICUS_DIR>/<scroll>/umbilicus-full-resolution.json`, and `usrm2/umbilicus.py` (`usrm2 umbilicus`)
+  puts one there: a published file when the origin serves one (the loader's json, or the volpkg
+  `umbilicus.txt` with its 1-based `x, y, z` lines), otherwise DERIVED from the scroll's own CT as the
+  per-z centroid of the non-air voxels at rung 9 -- a scroll is a roll, so the centroid of its
+  cross-section is the umbilicus to the accuracy the radial channel needs. The points are written in
+  RUNG-2 voxels, which is what `data.axis_at` expects. The stream planner pulls that one coarse level and
+  derives the axis before it opens the pyramids: measured 1.9-22 s per scroll.
+- **the lossless mask codec.** The new exports use volcomp mode 5 (`surface-mask-lossless`), which needs a
+  volcomp newer than the desk's build; an instance provisioned from the desk's `libvolcomp.so` opens the
+  Paris 4 pyramids and fails on every other scroll's. The library also has to be built ON the instance:
+  the desk's is compiled for a Ryzen 9950X (AVX-512) and dies with SIGILL on the Xeon E5-2683 v4 that
+  serves the A6000s. `gcc -O3 -shared -fPIC -o libvolcomp.so python/volcomp_shim.c -lm` (no arch flags --
+  the header dispatches AVX2 at runtime) is the portable build.

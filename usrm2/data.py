@@ -323,16 +323,16 @@ def rungs(base):
     names = [str(d["path"]) for d in ms["datasets"]] if ms else []
     names += [d for d in sorted(os.listdir(base)) if d not in names]  # levels built locally after the export (6-9)
     nat = float(group_native_um(at) or native_um(base))
-    out = {}
+    out, why = {}, []
     for n in names:
         if not re.fullmatch(r"[0-9]+(\.[0-9]+)?", n) or not os.path.isdir(f"{base}/{n}"):
             continue
         k = um_rung(float(n)) if "." in n else um_rung(nat) + int(n)  # um name vs integer level name
         try:
             out[k] = open_zarr(f"{base}/{n}")
-        except Exception:
-            pass
-    assert out, f"{base}: no pyramid levels on disk"
+        except Exception as e:  # noqa: BLE001  (a level whose codec this build cannot open)
+            why.append(f"{n}: {e!r}")
+    assert out, f"{base}: no pyramid levels on disk" + (f" (tried {names}; {why[0]})" if why else "")
     CTX_CACHE[base] = out
     return out
 
