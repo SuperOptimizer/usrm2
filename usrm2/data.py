@@ -810,6 +810,27 @@ def read_teacher(a, k, lo, p):
     return out, ins
 
 
+def region_visits(regions, cap=64):
+    """`region_list` expanded into VISITS, so the rung mix holds throughout the walk and not only in the
+    expectation of a prefix.
+
+    A weighted shuffle front-loads the heavy items, and a rung with few regions but a large weight (rung 9
+    of a scroll is ONE region, and `--rung-boost 9=16` asks for a large share of it) is therefore used up in
+    the first percent of the walk and never seen again. Giving that region v = round(w * R) visits, each of
+    weight w / v, makes almost every entry weigh 1 / R: the order becomes near-uniform, the number of visits
+    of a group is proportional to its intended share, and the coarse rungs are spread over the whole epoch.
+    A visit draws its own windows (its own rng), so `v > 1` is a denser sampling of a region, not the same
+    windows again -- and v > 1 only happens where the weight per region is above average, i.e. exactly where
+    the ladder has almost no data to begin with. The fine rungs keep their one visit each."""
+    out = []
+    R = len(regions)
+    for r in regions:
+        v = int(min(max(round(r["w"] * R), 1), max(int(cap), 1)))
+        for j in range(v):
+            out.append(dict(r, w=r["w"] / v, v=j))
+    return out
+
+
 def walk_order(w, seed=0):
     """A weighted shuffle WITHOUT replacement (Efraimidis-Spirakis): key = Exp(1) / w, ascending. The first
     item is i with probability w_i / sum(w), and every item appears exactly once."""
@@ -1177,8 +1198,9 @@ class Patches(torch.utils.data.IterableDataset):
             while not S.have(f"{self._dirs[di]}/{key}"):
                 _time.sleep(back)
                 back = min(back * 1.5, 1.0)
+        wait += _time.time() - t0   # the WAIT is the queue and the buffer, never this worker's own decode
         item = self._rung_build(rec)
-        item["idx"], item["wait"] = torch.tensor(i), torch.tensor((wait + _time.time() - t0) * 1000.0)
+        item["idx"], item["wait"] = torch.tensor(i), torch.tensor(wait * 1000.0)
         with open(prog, "w") as f:
             f.write(str(i))
         return item

@@ -326,7 +326,7 @@ class Planner:
                  ahead=400, cache_gb=20.0, ctx=(), aug="geo", dense_pow=0.0, require_targets=False,
                  val=None, jobs=48, report=30.0, limit=0, val_rungs=data.VAL_RUNGS, val_patches=32,
                  region=0, windows_per_region=64, walk=None, active_regions=4, epochs=1, region_fails=0,
-                 teacher_regions=None):
+                 teacher_regions=None, visits_max=64):
         from usrm2 import aug as A
         self.dir = str(queue)
         self.stores_file, self.seed, self.W, self.ahead = str(stores_file), int(seed), int(workers), int(ahead)
@@ -339,9 +339,10 @@ class Planner:
                        region=int(region or 0), windows_per_region=int(windows_per_region),
                        region_fails=int(region_fails or 0), teacher_regions=teacher_regions)
         self.walk_mode = None if not walk else str(walk)
-        assert self.walk_mode in (None, "once"), f"--walk {walk}: only 'once' exists"
+        assert self.walk_mode in (None, "once", "mix"), f"--walk {walk}: 'once' or 'mix'"
         assert not self.walk_mode or region, "--walk needs --region (the walk is over regions)"
         self.K = max(int(active_regions), 1)
+        self.visits_max = max(int(visits_max), 1)
         self.epochs = max(int(epochs), 1)
         self.walk = None
         self.active = [None] * self.K   # the open regions, emitted round robin
@@ -462,6 +463,7 @@ class Planner:
                            "region": self.kw["region"], "seed": self.seed, "epochs": self.epochs,
                            "rungs": self.kw["rungs"] if self.kw["rungs"] is True else sorted(self.kw["rungs"]),
                            "boost": {str(k): v for k, v in self.kw["rung_boost"].items()},
+                           "walk": self.walk_mode, "visits_max": self.visits_max,
                            "val": _val_meta(self.val)}, sort_keys=True)
 
     async def build_walk(self, lines):
@@ -488,10 +490,13 @@ class Planner:
                                    boost=self.kw["rung_boost"], exclude=self.ds.ex,
                                    log=lambda q: print("stream-plan " + q, flush=True))
         assert regions, "the walk is empty: no region of any source has a target at any rung"
+        nreg = len(regions)
+        if self.walk_mode == "mix":  # visits proportional to the weight: the rung mix holds all the way
+            regions = data.region_visits(regions, self.visits_max)
         self.walk.build(regions, self.walk_fp)
         n = self.kw["windows_per_region"]
-        print(f"stream-plan: walk over {len(regions)} regions ({len(regions) * n} windows per epoch, "
-              f"{self.epochs} epoch(s)) enumerated in {time.time() - t0:.1f} s", flush=True)
+        print(f"stream-plan: walk over {nreg} regions / {len(regions)} visits ({len(regions) * n} windows "
+              f"per epoch, {self.epochs} epoch(s)) enumerated in {time.time() - t0:.1f} s", flush=True)
 
     def _meta(self, lines):
         return {"stores": lines, "stores_file": self.stores_file, "patch": [int(v) for v in self.patch],

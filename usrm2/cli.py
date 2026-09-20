@@ -76,9 +76,14 @@ def main(argv=None):
     sp.add_argument("--report", type=float, default=30.0, help="seconds between plan.jsonl reports")
     sp.add_argument("--region", type=int, default=0, help="region mode (see `train --region`)")
     sp.add_argument("--windows-per-region", type=int, default=64)
-    sp.add_argument("--walk", default=None, choices=["once"], help="NO-REPEAT walk: enumerate every region "
-                    "of every source at every usable rung, weight them so the source and rung mixes are "
-                    "honoured in expectation, and visit each exactly once; `epoch_done` then stops the trainer")
+    sp.add_argument("--walk", default=None, choices=["once", "mix"], help="NO-REPEAT walk: enumerate every "
+                    "region of every source at every usable rung, weight them so the source and rung mixes "
+                    "are honoured in expectation, and visit each exactly ONCE; `epoch_done` then stops the "
+                    "trainer. 'mix' gives a region round(w * regions) visits instead of one (see "
+                    "data.region_visits), so the coarse rungs -- a handful of regions carrying a large "
+                    "--rung-boost share -- are spread over the whole epoch instead of being used up in its "
+                    "first percent; the fine rungs still get one visit each")
+    sp.add_argument("--visits-max", type=int, default=64, help="most visits of one region under --walk mix")
     sp.add_argument("--active-regions", type=int, default=4, help="regions kept open at once; their windows "
                     "are emitted round robin, so consecutive queue entries come from different regions")
     sp.add_argument("--epochs", type=int, default=1, help="walk the region list this many times (a fresh "
@@ -265,7 +270,7 @@ def main(argv=None):
                val_rungs=[int(q) for q in a.val_rungs.split(",")], val_patches=a.val_patches,
                region=a.region, windows_per_region=a.windows_per_region, walk=a.walk,
                active_regions=a.active_regions, epochs=a.epochs, region_fails=a.region_fails,
-               teacher_regions=a.teacher_regions)
+               teacher_regions=a.teacher_regions, visits_max=a.visits_max)
     elif a.cmd == "ablate":
         from usrm2 import ablate
         ablate.sweep(a.out_dir, a.presets.split(","), size=a.size, steps=a.steps, patch=a.patch,

@@ -596,3 +596,20 @@ CT is not masked. Rung 3 is the 2x mean pool of the same store (`data.read_teach
 falls back to the exported mask pyramid: no store, not `done` yet, a window straddling two regions, another
 source, or any other rung. The queue entry records the store path (`t`), so the replaying worker reads what
 the planner decided rather than racing the service.
+
+### 18.2 `--walk mix`: the coarse rungs must not be used up in the first percent (measured)
+
+A weighted shuffle front-loads the heavy items, and that is a problem for a rung with FEW regions and a
+big share. Paris 4 at rung 9 is ONE region (640 x 256 x 256) and `--rung-boost 9=16` asks for a large
+slice of the samples; the 10 such regions of the 8-scroll stores file are all drawn in the first few
+hundred, and after ~640 windows rung 9 never appears again. Measured on the first 968 windows of the desk
+soak: rungs 4/5/6/7/9/11 = 332/192/190/64/64/6 and rung 2 only 120, although rung 2 is 69 % of the regions.
+The prefix mix is right (that is what the weights buy), but it is right ONCE.
+
+`--walk mix` (`data.region_visits`) gives a region `round(w * regions)` VISITS instead of one, each of
+weight `w / visits` (at most `--visits-max`, 64). Almost every entry then weighs 1 / regions, so the order
+is near-uniform, a group's share of the walk is its intended share all the way through, and the fine rungs
+still get exactly one visit each. A second visit draws its own windows from its own rng, so it is a denser
+sampling of a region, never the same window again -- and it only happens where the weight per region is
+above average, i.e. where the ladder has almost no data to sample. `--walk once` remains the strict
+no-repeat walk; `mix` is what a long run (the A100's 60k steps) should use.

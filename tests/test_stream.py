@@ -781,3 +781,30 @@ def test_the_queue_carries_the_teacher_store_so_the_replay_reads_it(tmp_path, or
     rec = [r for r in recs if "t" in r and not r.get("b")][0]
     item = ds._rung_build(rec)
     assert int(item["tgt"].max()) == 90, "the replay did not read the region teacher store"
+
+
+def test_walk_mix_spreads_the_coarse_rungs_over_the_whole_epoch(tmp_path, monkeypatch):
+    """A rung with few regions but a big --rung-boost share is used up in the first percent of a `once`
+    walk. `mix` gives it proportionally many visits instead, so its share holds throughout."""
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    ct = ct_pyramid(tmp_path, base=256, nlev=5)
+    tg = pred_pyramid(tmp_path, base=256, nlev=5)
+    data.CTX_CACHE.clear()
+    srcs = data.source_groups([f"{ct},{tg}"])
+    boost = {6: 40}                                   # the coarsest rung here: one region, a big share
+    regs = data.region_list(srcs, patch=P32, region=64, boost=boost)
+    vis = data.region_visits(regs, cap=64)
+    nreg = {k: sum(1 for r in regs if r["k"] == k) for k in {r["k"] for r in regs}}
+    assert nreg[2] > 50 and nreg[6] == 1
+    assert sum(1 for r in vis if r["k"] == 2) == nreg[2], "a fine rung keeps one visit per region"
+    assert sum(1 for r in vis if r["k"] == 6) > 1, "the coarse rung was not given more visits"
+    want = sum(r["w"] for r in regs if r["k"] == 6)   # its intended share
+    for name, lst in (("once", regs), ("mix", vis)):
+        order = data.walk_order([r["w"] for r in lst], 0)
+        seq = [lst[int(j)]["k"] for j in order]
+        got = np.mean([k == 6 for k in seq[len(seq) // 2:]])   # the SECOND half of the epoch
+        if name == "once":
+            assert got == 0, "the coarse rung should already be exhausted"
+        else:
+            assert abs(got - want) < 0.5 * want + 0.02, (got, want)
+    assert abs(sum(r["w"] for r in vis) - 1.0) < 1e-9
