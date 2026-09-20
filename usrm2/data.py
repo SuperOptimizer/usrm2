@@ -664,6 +664,112 @@ def rung_probs(src, patch, allowed=None, boost=None):
     return dict(zip(ks, w / w.sum()))
 
 
+# ------------------------------------------------------------------------- the no-repeat region walk
+# Region mode (below) draws a fresh (source, rung, region) for every visit, so over a long run the same
+# region comes up again and again -- the user's "I don't want to train over the same data multiple times".
+# The WALK enumerates instead: every region of every source at every usable rung, ONCE. A region is a
+# shard-aligned region^3 tile of the target's box at that rung; a tile whose target is all air is dropped up
+# front by a cheap check against a coarse level of the export. Each surviving region carries the draw weight
+#
+#     w(region) = (source's physical-volume share) * (its rung's probability) / (regions of that source+rung)
+#
+# so the source mix and the rung mix of `rung_probs` are honoured IN EXPECTATION while every region is
+# visited exactly once; `walk_order` turns those weights into a visit ORDER (a weighted shuffle without
+# replacement), and the planner walks that order with a persisted cursor.
+
+OCC_VOX = 64 << 20  # the occupancy check reads the finest target level with at most this many voxels
+
+
+def occupancy_rung(pyr, cap=OCC_VOX):
+    """The finest rung of a pyramid whose whole level is at most `cap` voxels (the coarsest one if none is)."""
+    for k in sorted(pyr):
+        if int(np.prod(pyr[k].shape[-3:])) <= cap:
+            return k
+    return max(pyr)
+
+
+def occupancy(pyr, k=None, cap=OCC_VOX):
+    """(rung, bool array of the whole level): where a target export is not air. A few MB per scroll."""
+    k = occupancy_rung(pyr, cap) if k is None else int(k)
+    a = pyr[k]
+    return k, np.asarray(a[:] if a.ndim == 3 else a[0], np.uint8) > 0
+
+
+def shard_grid(pyr, k):
+    """The shard (write-chunk) size, in rung-k voxels, of the level a pyramid is read from at rung k: what a
+    region is snapped to, so that one region is one shard footprint."""
+    src = max(r for r in pyr if r <= k)
+    g = np.array(getattr(pyr[src], "shards", None) or pyr[src].chunks, np.int64)[-3:]
+    return np.maximum(g >> (k - src), 1)
+
+
+def region_tiles(s, k, region, patch):
+    """The shard-aligned tiles covering a source's target box at rung k: (per-axis origins, tile size).
+    The tile size is `region` rounded DOWN to a multiple of the shard grid (and never below one shard, nor
+    above the box), so every tile origin is a shard boundary."""
+    p, t = shape3(patch), next(iter(s["targets"].values()))
+    blo, bs = target_box(t, k)
+    g = shard_grid(s["ct_pyr"], k)
+    R = np.maximum((shape3(region) // g) * g, g)
+    R = np.minimum(R, -(-np.maximum(bs, p) // g) * g)  # a box smaller than a region: one tile, still aligned
+    ax = [np.arange((blo[d] // g[d]) * g[d], int(blo[d] + bs[d]), int(R[d]), dtype=np.int64) for d in range(3)]
+    return ax, R
+
+
+def tiles_occupied(occ, ko, k, ax):
+    """Which tiles hold any non-air target voxel: the block maximum of the coarse occupancy array `occ`
+    (given at rung `ko`) over each tile's footprint at rung k. When a tile is smaller than one coarse voxel
+    the blocks merge, which keeps a tile its neighbour occupies -- the check only ever errs towards keeping."""
+    o = occ
+    for d in range(3):
+        st = (ax[d] >> (ko - k)) if ko >= k else (ax[d] << (k - ko))
+        st = np.clip(st, 0, max(o.shape[d] - 1, 0))
+        u, inv = np.unique(st, return_inverse=True)
+        o = np.take(np.maximum.reduceat(o, u, axis=d), inv, axis=d)
+    return o
+
+
+def region_list(srcs, patch=256, region=1024, allowed=None, boost=None, exclude=(), cap=OCC_VOX, log=None):
+    """Every (source, rung, shard-aligned region) worth visiting, with its draw weight. `exclude` is the
+    held-out box(es) as (origin, size) at rung 2: a region entirely inside one is dropped. The weights sum
+    to 1; the list is in enumeration order (`walk_order` gives the visit order)."""
+    sw = np.array([s["volume_um3"] for s in srcs], np.float64)
+    sw /= sw.sum()
+    out = []
+    for i, (s, ws) in enumerate(zip(srcs, sw)):
+        ko, occ = occupancy(next(iter(s["targets"].values()))["pyr"], cap=cap)
+        for k, pk in rung_probs(s, patch, allowed, boost).items():
+            ax, R = region_tiles(s, k, region, patch)
+            keep = tiles_occupied(occ, ko, k, ax)
+            ex = []
+            for o, sz in exclude:
+                d = k - 2
+                ex.append((np.array(o) >> d, np.maximum(np.array(sz) >> d, 1)) if d >= 0
+                          else (np.array(o) << -d, np.array(sz) << -d))
+            lo = [np.array([ax[0][a], ax[1][b], ax[2][c]], np.int64) for a, b, c in np.argwhere(keep)]
+            lo = [q for q in lo if not any(np.all(q >= eo) and np.all(q + R <= eo + es) for eo, es in ex)]
+            if not lo:
+                continue
+            w = float(ws * pk) / len(lo)
+            out += [{"s": i, "k": int(k), "lo": [int(v) for v in q], "size": [int(v) for v in R], "w": w}
+                    for q in lo]
+            if log:
+                log(f"  {s['line'].split(',')[0].split('/')[-1][:40]:40} rung {k:>2}: {len(lo):>7} regions "
+                    f"of {int(np.prod([len(q) for q in ax])):>7} (tile {tuple(int(v) for v in R)})")
+    tot = sum(q["w"] for q in out) or 1.0
+    for q in out:
+        q["w"] /= tot
+    return out
+
+
+def walk_order(w, seed=0):
+    """A weighted shuffle WITHOUT replacement (Efraimidis-Spirakis): key = Exp(1) / w, ascending. The first
+    item is i with probability w_i / sum(w), and every item appears exactly once."""
+    rng = np.random.default_rng(int(seed))
+    w = np.asarray(w, np.float64)
+    return np.argsort(rng.exponential(size=len(w)) / np.maximum(w, 1e-300), kind="stable")
+
+
 class Patches(torch.utils.data.IterableDataset):
     """Random (ct, teacher) patches; train patches never touch the val box."""
 
@@ -764,10 +870,16 @@ class Patches(torch.utils.data.IterableDataset):
                    else val_box(e) for e in self.exclude]  # (origin, size) at rung 2
         self.arrs = self.srcs
 
-    def region_state(self):
+    def region_state(self, region=None):
         """Per-iterator region-visit state. It cannot live on the dataset: the stream planner drives one
-        dataset from several threads, one rng stream each, and each stream visits its own region."""
-        return {"left": 0, "fails": 0}
+        dataset from several threads, one rng stream (or one active region) each, and each visits its own
+        region. With `region` (a `region_list` record) the state is FIXED to that region: the draw never
+        picks a new one, which is how the walk hands regions out."""
+        if region is None:
+            return {"left": 0, "fails": 0}
+        return {"i": int(region["s"]), "k": int(region["k"]), "lo": np.array(region["lo"], np.int64),
+                "size": np.array(region["size"], np.int64), "left": self.windows_per_region, "fails": 0,
+                "fixed": True}
 
     def _rung_sample(self, rng, st=None):
         """One compact sample (see `rung_item`), or None when the corner is rejected."""
@@ -776,10 +888,7 @@ class Patches(torch.utils.data.IterableDataset):
     def region_grid(self, s, k):
         """The shard size, in rung-k voxels, of the level the CT is read from at rung k: what a region is
         snapped to so that one region is one shard footprint."""
-        cpyr = s["ct_pyr"]
-        csrc = max(r for r in cpyr if r <= k)
-        g = np.array(getattr(cpyr[csrc], "shards", None) or cpyr[csrc].chunks, np.int64)[-3:]
-        return np.maximum(g >> (k - csrc), 1)
+        return shard_grid(s["ct_pyr"], k)
 
     def new_region(self, rng, st):
         """Pick the next (source, rung, 1024^3 region) to visit. One rng draw per quantity, as always."""
@@ -809,7 +918,7 @@ class Patches(torch.utils.data.IterableDataset):
         p = self.patch
         if self.region:  # region mode: the windows of one visit come from one 1024^3 region
             st = self.region_state() if st is None else st
-            if st.get("left", 0) <= 0 or st.get("fails", 0) >= self.region_fails:
+            if not st.get("fixed") and (st.get("left", 0) <= 0 or st.get("fails", 0) >= self.region_fails):
                 self.new_region(rng, st)
             i, k, s = st["i"], st["k"], self.srcs[st["i"]]
             st["fails"] += 1
@@ -928,44 +1037,71 @@ class Patches(torch.utils.data.IterableDataset):
         self._open_rungs()
 
     def _replay(self):
-        """Worker w yields the queue entries w, w + W, w + 2W, ... in order, waiting for the planner."""
+        """Stream g of GW yields the queue entries g, g + GW, g + 2GW, ... in order, waiting for the planner.
+
+        A stream is (rank, loader worker): with DDP every rank replays the SAME queue, so the share has to be
+        taken over `world * num_workers` streams -- otherwise every rank trains on every window and the run
+        sees each one `world` times. `stream-plan --workers` is that total.
+
+        The walk ends: when the planner has written `epoch_done` and the queue is exhausted the iterator
+        STOPS instead of waiting forever, so `usrm2 train --stream` finishes its epoch cleanly. Its last
+        entry is held back until the end is known, because the trainer's ranks must see the same number of
+        windows (the planner's bound is a multiple of the stream count)."""
         import time as _time
         from usrm2 import stream as S
         info = torch.utils.data.get_worker_info()
         w, W = (info.id, info.num_workers) if info else (0, 1)
-        assert W == int(self.smeta["workers"]), \
-            f"--stream was planned for {self.smeta['workers']} loader workers, not {W}"
-        dirs = list(self.smeta["dirs"])
+        rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
+        g, GW = rank * W + w, world * W
+        assert GW == int(self.smeta["workers"]), \
+            f"--stream was planned for {self.smeta['workers']} streams, not {world} ranks x {W} workers"
+        self._dirs = list(self.smeta["dirs"])
         os.makedirs(os.path.join(self.stream, S.PROGRESS), exist_ok=True)
-        prog = os.path.join(self.stream, S.PROGRESS, f"w{w}")
+        prog = os.path.join(self.stream, S.PROGRESS, f"w{g}")
         start = -1
         if os.path.exists(prog):
             try:
                 start = int(open(prog).read().strip() or -1)  # a restart skips what this worker already served
             except ValueError:
                 start = -1
-        wait = 0.0
-        for line, waited in S.tail(os.path.join(self.stream, S.QUEUE)):
+        done = os.path.join(self.stream, S.EPOCH_DONE)
+        wait, held = 0.0, None
+        for line, waited in S.tail(os.path.join(self.stream, S.QUEUE), stop=lambda: os.path.exists(done)):
             wait += waited
             rec = json.loads(line)
             i = int(rec["i"])
-            if i % W != w or i <= start:
+            if i % GW != g or i <= start:
                 continue
-            t0 = _time.time()
-            if any(di >= len(dirs) for di, _ in rec["c"]):  # the planner touched a level after meta was written
-                dirs = list(S.read_meta(self.stream)["dirs"])
-            for di, key in rec["c"]:
-                back = 0.02
-                while not S.have(f"{dirs[di]}/{key}"):
-                    _time.sleep(back)
-                    back = min(back * 1.5, 1.0)
-            wait += _time.time() - t0
-            item = self._rung_build(rec)
-            item["idx"], item["wait"] = torch.tensor(i), torch.tensor(float(wait) * 1000.0)
-            wait = 0.0
-            with open(prog, "w") as f:
-                f.write(str(i))
-            yield item
+            if held is not None:
+                yield self._replay_one(held, prog, wait)
+                wait = 0.0
+            held = rec
+        bound = 1 << 62
+        if os.path.exists(done):
+            try:
+                bound = int(json.load(open(done))["windows"])
+            except Exception:  # noqa: BLE001
+                bound = 1 << 62
+        if held is not None and int(held["i"]) < bound:
+            yield self._replay_one(held, prog, wait)
+
+    def _replay_one(self, rec, prog, wait):
+        """One queue entry -> the compact sample, once every chunk it names is in the buffer."""
+        import time as _time
+        from usrm2 import stream as S
+        t0, i = _time.time(), int(rec["i"])
+        if any(di >= len(self._dirs) for di, _ in rec["c"]):  # a level the planner touched after meta was written
+            self._dirs = list(S.read_meta(self.stream)["dirs"])
+        for di, key in rec["c"]:
+            back = 0.02
+            while not S.have(f"{self._dirs[di]}/{key}"):
+                _time.sleep(back)
+                back = min(back * 1.5, 1.0)
+        item = self._rung_build(rec)
+        item["idx"], item["wait"] = torch.tensor(i), torch.tensor((wait + _time.time() - t0) * 1000.0)
+        with open(prog, "w") as f:
+            f.write(str(i))
+        return item
 
     def _open(self):
         """Each teacher store names its CT volume and scroll axis (attrs), so stores from several scrolls can mix."""

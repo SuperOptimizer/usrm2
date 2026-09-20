@@ -36,6 +36,7 @@ import numpy as np
 from usrm2 import data, umbilicus as U
 
 META, QUEUE, STATE, PROGRESS, CONSUMED = "meta.json", "queue.jsonl", "state.json", "progress", "consumed"
+REGIONS, WALK, EPOCH_DONE = "regions.jsonl", "walk.json", "epoch_done"
 
 
 # ------------------------------------------------------------------ which chunks a read touches
@@ -119,6 +120,7 @@ class Fetcher:
         self.session, self.sem, self.retries = session, asyncio.Semaphore(jobs), retries
         self.lock = {}  # one download per shard: concurrent windows wanting the same object wait for it
         self.bytes = self.fetched = self.absent = self.have = self.failed = self.requests = 0
+        self.mirror = 0  # shards the pre-existing local mirror already owns: never fetched, never evicted
 
     async def get(self, path):
         """(status, bytes) with status in have / new / absent / fail. `path` is the LOCAL mirror path.
@@ -202,6 +204,75 @@ async def fetch_group_meta(f, base):
     return keep
 
 
+# ------------------------------------------------------------------ the no-repeat walk
+
+class Walk:
+    """The region list and a cursor over it: every region visited ONCE, in the weighted-shuffled order
+    `data.walk_order` gives (see the walk section of usrm2/data.py).
+
+    `regions.jsonl` is the list in enumeration order and `walk.json` the cursor ({"i", "epoch"}) plus the
+    fingerprint of the configuration it was built for. The visit ORDER is not stored: it is a pure function
+    of (seed, epoch), so a resumed planner recomputes it and continues at the cursor -- nothing before the
+    cursor is ever handed out again. With `epochs > 1` the list is re-permuted with the next epoch's seed
+    when it runs out; after the last epoch the planner writes `epoch_done` and stops."""
+
+    def __init__(self, d, seed=0, epochs=1):
+        self.dir, self.seed, self.epochs = str(d), int(seed), max(int(epochs), 1)
+        self.regions, self.order, self.i, self.epoch = [], None, 0, 0
+
+    @property
+    def path(self):
+        return os.path.join(self.dir, REGIONS)
+
+    def load(self, fp):
+        """Pick an existing list up when it was built for the same configuration."""
+        try:
+            st = json.load(open(os.path.join(self.dir, WALK)))
+        except Exception:  # noqa: BLE001
+            return False
+        if st.get("fp") != fp or not os.path.exists(self.path):
+            return False
+        self.regions = [json.loads(l) for l in open(self.path) if l.strip()]
+        self.i, self.epoch = int(st.get("i", 0)), int(st.get("epoch", 0))
+        self._permute()
+        return True
+
+    def build(self, regions, fp):
+        with open(self.path + ".tmp", "w") as f:
+            for r in regions:
+                f.write(json.dumps(r, separators=(",", ":")) + "\n")
+        os.replace(self.path + ".tmp", self.path)
+        self.regions, self.i, self.epoch, self.fp = regions, 0, 0, fp
+        self._permute()
+        self.save(fp)
+
+    def _permute(self):
+        self.order = data.walk_order([r["w"] for r in self.regions], self.seed + 7919 * self.epoch)
+
+    def save(self, fp):
+        tmp = os.path.join(self.dir, WALK + ".tmp")
+        json.dump({"i": self.i, "epoch": self.epoch, "n": len(self.regions), "fp": fp}, open(tmp, "w"))
+        os.replace(tmp, os.path.join(self.dir, WALK))
+
+    @property
+    def done(self):
+        return self.epoch >= self.epochs or (self.epoch == self.epochs - 1 and self.i >= len(self.regions))
+
+    def take(self, fp):
+        """(ordinal, region) -- the ordinal is unique across epochs and seeds the region's rng -- or None
+        when the walk is over."""
+        if self.i >= len(self.regions):
+            if self.epoch + 1 >= self.epochs:
+                return None
+            self.epoch, self.i = self.epoch + 1, 0
+            self._permute()
+        j = int(self.order[self.i])
+        ordinal = self.epoch * len(self.regions) + self.i
+        self.i += 1
+        self.save(fp)
+        return ordinal, self.regions[j]
+
+
 # ------------------------------------------------------------------ the planner
 
 class Hook:
@@ -227,7 +298,7 @@ class Planner:
     def __init__(self, stores_file, queue, patch=256, rungs=True, rung_boost=None, seed=0, workers=4,
                  ahead=400, cache_gb=20.0, ctx=(), aug="geo", dense_pow=0.0, require_targets=False,
                  val=None, jobs=48, report=30.0, limit=0, val_rungs=data.VAL_RUNGS, val_patches=32,
-                 region=0, windows_per_region=64):
+                 region=0, windows_per_region=64, walk=None, active_regions=4, epochs=1, region_fails=0):
         from usrm2 import aug as A
         self.dir = str(queue)
         self.stores_file, self.seed, self.W, self.ahead = str(stores_file), int(seed), int(workers), int(ahead)
@@ -237,7 +308,18 @@ class Planner:
         self.kw = dict(patch=patch, rungs=rungs, rung_boost=dict(rung_boost or {}), ctx=tuple(ctx),
                        aug=self.cfg, sym=self.cfg.get("sym", True), dense_pow=dense_pow,
                        require_targets=bool(require_targets), seed=int(seed),
-                       region=int(region or 0), windows_per_region=int(windows_per_region))
+                       region=int(region or 0), windows_per_region=int(windows_per_region),
+                       region_fails=int(region_fails or 0))
+        self.walk_mode = None if not walk else str(walk)
+        assert self.walk_mode in (None, "once"), f"--walk {walk}: only 'once' exists"
+        assert not self.walk_mode or region, "--walk needs --region (the walk is over regions)"
+        self.K = max(int(active_regions), 1)
+        self.epochs = max(int(epochs), 1)
+        self.walk = None
+        self.active = [None] * self.K   # the open regions, emitted round robin
+        self.rr = 0                     # whose turn it is
+        self.regions_done = self.region_bytes = 0
+        self.mirror = {}                # level dir -> which shards the LOCAL mirror already knows (startup)
         self.val, self.val_rungs, self.val_patches = val, tuple(val_rungs), int(val_patches)
         self.pin = set()   # the validation grid's chunks: fetched once, never evicted
         self.axis_rung = 9  # the rung a missing scroll axis is derived from (307 um: a few MB per scroll)
@@ -273,6 +355,45 @@ class Planner:
             self.ref.setdefault(path, -1)
         return sz
 
+    def mirrored(self, d, ix):
+        """Does the pre-existing local mirror already own this shard? `data.chunk_index`, snapshotted before
+        the planner fetched anything, is the authority: `mirror.json` says which shards the mirror KNOWS
+        (a complete level, or the boxes of a partially pulled one -- there an absent file is air), plus
+        whatever was on the disk at startup. Such a shard is a hit that is never fetched and never evicted;
+        only what the planner pulled itself is the rolling buffer."""
+        pres = self.mirror.get(d, False)
+        if pres is None:  # the whole level was already known at startup
+            return True
+        if pres is False:
+            return False
+        z, y, x = (int(v) for v in ix)
+        return bool(z < pres.shape[0] and y < pres.shape[1] and x < pres.shape[2] and pres[z, y, x])
+
+    async def _fetch(self, arr, keys, record=None, pin=False):
+        """Fetch a level's shards, skipping the ones the local mirror owns. Returns True when anything is
+        readable there (a mirrored shard that is not on the disk is air, exactly as the mirror means it)."""
+        want, got = [], False
+        for ix in keys:
+            di, key, q = self.path_of(arr, ix)
+            if self.mirrored(self.dirs[di], ix):
+                self.f.mirror += 1
+                got = got or os.path.exists(q)
+                continue
+            want.append((di, key, q))
+        res = await asyncio.gather(*[self.f.get(q) for _, _, q in want])
+        nb = 0
+        for (di, key, q), (st, v) in zip(want, res):
+            if st not in ("have", "new"):
+                continue
+            got, nb = True, nb + v
+            self.charge(q)
+            if pin:
+                self.pin.add(q)
+                self.ref.pop(q, None)
+            elif record is not None:
+                record.append((di, key))
+        return got, nb
+
     async def _need(self, hook, pyr, k, lo, record=True, pin=False):
         """Fetch the shards one `read_rung` will touch, whole. Returns False when the origin served none."""
         arr, a, b, whole = rung_range(pyr, k, lo, self.patch)
@@ -282,25 +403,11 @@ class Planner:
                 return self.whole_any[d]
             async with self.whole_lock.setdefault(d, asyncio.Lock()):
                 if d not in self.whole:
-                    res = await asyncio.gather(*[self.f.get(f"{d}/{chunk_key(arr, ix)}") for ix in all_keys(arr)])
-                    self.whole[d] = sum(v for _, v in res)
-                    self.whole_any[d] = any(st in ("have", "new") for st, _ in res)
+                    self.whole_any[d], self.whole[d] = await self._fetch(arr, all_keys(arr), record=None)
                     self.cache_bytes += self.whole[d]
             return self.whole_any[d]
-        paths = [self.path_of(arr, ix) for ix in keys_in(arr, a, b)]
-        res = await asyncio.gather(*[self.f.get(q) for _, _, q in paths])
-        got = False
-        for (di, key, q), (st, _) in zip(paths, res):
-            if st not in ("have", "new"):
-                continue
-            got = True
-            self.charge(q)
-            if pin:
-                self.pin.add(q)
-                self.ref.pop(q, None)
-            elif record:
-                hook.keys.append((di, key))
-        return got
+        return (await self._fetch(arr, keys_in(arr, a, b),
+                                  record=None if pin or not record else hook.keys, pin=pin))[0]
 
     async def fetch_data(self, hook, s, k, lo):
         """The CT cube and the targets of a candidate window. False = reject (`--require-targets` and the

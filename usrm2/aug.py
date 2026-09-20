@@ -468,6 +468,7 @@ PRESETS = {
     "geo+bias": _pre({k: INTENSITY[k] for k in ["bias"]}),
     "all": _pre(SPATIAL, INTENSITY, CUTOUT),
     "all_norad": _pre(SPATIAL, INTENSITY, CUTOUT, {"norad": True}),
+    "full": _pre(SPATIAL, INTENSITY, CUTOUT, SCAN, TONE, THICK, POOL, VOLCOMP, BLANK, ZJIT, SHEETCOMP),  # everything: the production streaming runs (user, 2026-09-20)
     "scan": _pre(SCAN),
     "tone": _pre(TONE),
     "thick": _pre(THICK),

@@ -197,3 +197,20 @@ def test_intensity_mask_guard_is_exact():
     cfg0 = {"gamma": {"p": 0.0, "max": 1.8}, "bright": {"p": 0.0, "max": 0.3}}
     assert torch.equal(A.intensity(c, cfg0), c)
     assert not torch.equal(A.intensity(c, cfg1), c)
+
+
+def test_full_preset_runs_on_a_rung_batch():
+    """The production preset applies to a rung-mode batch: 10 image channels + scale plane + radial, weights riding as
+    extra target channels."""
+    import torch
+    from usrm2 import aug
+    cfg = aug.PRESETS["full"]
+    assert all(k in cfg for k in ("elastic", "gamma", "cutout", "tone", "thick", "pool", "volcomp", "blank", "zjit", "sheetcomp", "ring", "stripe"))
+    B, ni = 2, 10
+    x = torch.randn(B, ni + 4, 32, 32, 32)
+    x[:, ni] = 0.0  # scale plane
+    r = torch.randn(B, 3, 32, 32, 32); x[:, ni + 1:] = r / r.norm(dim=1, keepdim=True)
+    tg = torch.rand(B, 2, 32, 32, 32)  # target + weight
+    torch.manual_seed(0)
+    xa, ta = aug.apply(x, tg, cfg)
+    assert xa.shape == x.shape and ta.shape == tg.shape and torch.isfinite(xa).all() and torch.isfinite(ta).all()
