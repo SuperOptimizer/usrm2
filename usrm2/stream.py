@@ -68,108 +68,10 @@ def all_keys(arr):
 
 
 # A volcomp level is a SHARDED zarr v3 array: the object is a 1024^3 shard holding 512 inner 128^3 chunks
-# plus an index of (offset, nbytes) pairs at its end. Fetching whole shards to read a 256^3 window would
-# amplify the traffic ~130x, so a shard is fetched by HTTP range: its index first, then only the inner
-# chunks the read touches, and the local copy is a VALID shard holding exactly those (its index marks the
-# rest empty, which is the array's fill value -- the same thing an unfetched region reads as).
-
-EMPTY = (1 << 64) - 1  # the index entry of an inner chunk that is not in the shard
-SHARD_SPEC = {}
-
-
-def shard_spec(d):
-    """{shard, inner, grid, n, ilen, crc, end} of a local array directory, or None when it is not sharded."""
-    if d in SHARD_SPEC:
-        return SHARD_SPEC[d]
-    spec = None
-    try:
-        j = json.load(open(f"{d}/zarr.json"))
-        g = list(j["chunk_grid"]["configuration"]["chunk_shape"])
-        for c in j.get("codecs", []):
-            if isinstance(c, dict) and c.get("name") == "sharding_indexed":
-                cf = c.get("configuration", {})
-                inner = list(cf["chunk_shape"])
-                grid = [-(-a // b) for a, b in zip(g, inner)]
-                ic = cf.get("index_codecs") or [{"name": "bytes"}, {"name": "crc32c"}]
-                crc = any((q.get("name") if isinstance(q, dict) else q) == "crc32c" for q in ic)
-                n = int(np.prod(grid))
-                spec = {"shard": g, "inner": inner, "grid": grid, "n": n, "crc": crc,
-                        "ilen": n * 16 + (4 if crc else 0),
-                        "end": cf.get("index_location", "end") == "end"}
-    except Exception:  # noqa: BLE001  (no metadata yet, or a plain unsharded array)
-        spec = None
-    SHARD_SPEC[d] = spec
-    return spec
-
-
-def shard_parts(arr, a, b, spec):
-    """{shard index: [flat inner-chunk index, ...]} covering the voxel range [a, b)."""
-    c, g, grid = np.array(spec["inner"]), np.array(spec["shard"]), np.array(spec["grid"])
-    S = np.array(arr.shape[-3:], np.int64)
-    a, b = np.maximum(np.asarray(a, np.int64), 0), np.minimum(np.asarray(b, np.int64), S)
-    if (b <= a).any():
-        return {}
-    lo, hi = a // c, -(-b // c)
-    out = {}
-    for z in range(lo[0], hi[0]):
-        for y in range(lo[1], hi[1]):
-            for x in range(lo[2], hi[2]):
-                ix = np.array([z, y, x], np.int64)
-                sh = tuple(int(v) for v in ix * c // g)
-                inner = ix - np.array(sh, np.int64) * (g // c)
-                out.setdefault(sh, []).append(int(inner[0] * grid[1] * grid[2] + inner[1] * grid[2] + inner[2]))
-    return out
-
-
-def index_bytes(idx, spec):
-    b = np.ascontiguousarray(idx, "<u8").tobytes()
-    if spec["crc"]:
-        import google_crc32c
-        b += int(google_crc32c.value(b)).to_bytes(4, "little")
-    return b
-
-
-def read_shard(path, spec):
-    """(index, payload) of a local shard; an all-empty index and no payload when it is not there."""
-    n, ilen = spec["n"], spec["ilen"]
-    if not os.path.exists(path):
-        return np.full((n, 2), EMPTY, np.uint64), b""
-    raw = open(path, "rb").read()
-    if len(raw) < ilen:
-        return np.full((n, 2), EMPTY, np.uint64), b""
-    o = len(raw) - ilen if spec["end"] else 0
-    idx = np.frombuffer(raw[o:o + n * 16], "<u8").reshape(n, 2).copy()
-    return idx, (raw[:len(raw) - ilen] if spec["end"] else raw[ilen:])
-
-
-def write_shard(path, spec, idx, payload, add):
-    """Add {flat inner index: bytes} to a local shard and rewrite its index. Returns the new file size."""
-    base = 0 if spec["end"] else spec["ilen"]
-    buf = bytearray(payload)
-    for i, blob in add.items():
-        if idx[i, 0] != EMPTY:
-            continue
-        idx[i] = (base + len(buf), len(blob))
-        buf += blob
-    ib = index_bytes(idx, spec)
-    out = bytes(buf) + ib if spec["end"] else ib + bytes(buf)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path + ".part", "wb") as f:
-        f.write(out)
-    os.replace(path + ".part", path)
-    return len(out)
-
-
-def runs(spans, gap=1 << 16):
-    """Byte ranges merged when they are adjacent or nearly so: one request instead of many."""
-    out = []
-    for lo, hi in sorted(spans):
-        if out and lo - out[-1][1] <= gap:
-            out[-1][1] = max(out[-1][1], hi)
-        else:
-            out.append([lo, hi])
-    return out
-
+# (a CT level-0 shard is ~17 MB, a level-2 shard ~35 MB). The SHARD is the unit of fetching and of caching:
+# it is written into the mirror at its normal path and stays there until eviction, so every later window
+# whose reads land in it costs nothing. One shard covers 64 windows' worth of volume at 256^3, so the
+# residency of the coarse levels (whose whole level is a handful of shards) is what the hit rate lives on.
 
 def rung_range(pyr, k, lo, p):
     """(array, a, b, whole) that `data.read_rung(pyr, k, lo, p)` will read: the voxel range [a, b) of the
@@ -217,30 +119,10 @@ class Fetcher:
         self.session, self.sem, self.retries = session, asyncio.Semaphore(jobs), retries
         self.bytes = self.fetched = self.absent = self.have = self.failed = self.requests = 0
 
-    async def raw(self, url, rng=None):
-        """(status, bytes) of one GET, optionally a byte range. 404 -> (404, b""); a server that ignores
-        the range answers 200 with the whole object and the caller slices it."""
-        headers = {"Range": rng} if rng else {}
-        async with self.sem:
-            for attempt in range(self.retries):
-                try:
-                    async with self.session.get(url, headers=headers) as r:
-                        if r.status == 404:
-                            return 404, b""
-                        r.raise_for_status()
-                        buf = await r.read()
-                    self.bytes += len(buf)
-                    self.requests += 1
-                    return r.status, buf
-                except Exception as e:  # noqa: BLE001
-                    if attempt == self.retries - 1:
-                        print(f"stream-plan: FAILED {url} {rng or ''}: {e!r}", flush=True)
-                        self.failed += 1
-                        return 0, b""
-                    await asyncio.sleep(2 * (attempt + 1))
-
     async def get(self, path):
-        """(status, bytes) with status in have / new / absent / fail. `path` is the LOCAL mirror path."""
+        """(status, bytes) with status in have / new / absent / fail. `path` is the LOCAL mirror path.
+        `have` counts the buffer hits -- a shard some earlier window already pulled -- and `fetched` the
+        misses, which is what the hit rate in the report is made of."""
         if os.path.exists(path):
             self.have += 1
             return "have", 0
@@ -265,6 +147,7 @@ class Fetcher:
                     os.replace(path + ".part", path)
                     self.bytes += len(buf)
                     self.fetched += 1
+                    self.requests += 1
                     return "new", len(buf)
                 except Exception as e:  # noqa: BLE001
                     if attempt == self.retries - 1:
@@ -341,7 +224,6 @@ class Planner:
         self.pin = set()   # the validation grid's chunks: fetched once, never evicted
         self.dirs, self.dir_ix = [], {}          # the level directories entries refer to, by index
         self.whole, self.whole_any, self.whole_lock = {}, {}, {}  # level dir -> bytes kept forever / served / guard
-        self.shard_lock = {}                     # one writer per local partial shard
         self.ref, self.size = {}, {}             # chunk path -> last referencing queue index / its size
         self.cache_bytes = self.evicted = self.evicted_bytes = 0
         self.index = 0                           # the next queue index to emit
@@ -360,56 +242,10 @@ class Planner:
             self.dirty = True
         return di, chunk_key(arr, ix), f"{d}/{chunk_key(arr, ix)}"
 
-    async def fetch_shard(self, path, spec, inners):
-        """One shard, by range: its index, then only the inner chunks `inners` that the origin holds and the
-        buffer does not. The local file stays a valid shard (see `write_shard`). Returns True when it holds
-        data for them, False when the origin's are empty (air), None when the whole shard is a 404."""
-        if os.path.exists(path + ".absent"):
-            return None
-        async with self.shard_lock.setdefault(path, asyncio.Lock()):
-            idx, payload = read_shard(path, spec)
-            miss = [i for i in inners if idx[i, 0] == EMPTY]
-            if not miss:
-                return True
-            url, n, ilen = data.remote(path), spec["n"], spec["ilen"]
-            st, buf = await self.f.raw(url, f"bytes=-{ilen}" if spec["end"] else f"bytes=0-{ilen - 1}")
-            if st == 404:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                open(path + ".absent", "wb").close()
-                self.f.absent += 1
-                return None
-            if len(buf) < ilen:
-                return None
-            whole = len(buf) > ilen  # the server ignored the range and sent the object
-            ibuf = buf[len(buf) - ilen:] if spec["end"] else buf[:ilen]
-            ridx = np.frombuffer(ibuf[:n * 16], "<u8").reshape(n, 2)
-            need = [i for i in miss if ridx[i, 0] != EMPTY]
-            add = {}
-            if need and whole:
-                for i in need:
-                    o, ln = int(ridx[i, 0]), int(ridx[i, 1])
-                    add[i] = buf[o:o + ln]
-            elif need:
-                spans = runs([[int(ridx[i, 0]), int(ridx[i, 0]) + int(ridx[i, 1])] for i in need])
-                got = await asyncio.gather(*[self.f.raw(url, f"bytes={a}-{b - 1}") for a, b in spans])
-                for (a, b), (st2, blob) in zip(spans, got):
-                    if len(blob) > b - a:  # the range was ignored: the whole object came back
-                        blob = blob[a:b]
-                    if len(blob) != b - a:
-                        continue
-                    for i in need:
-                        o, ln = int(ridx[i, 0]), int(ridx[i, 1])
-                        if a <= o and o + ln <= b:
-                            add[i] = blob[o - a:o - a + ln]
-            sz = await asyncio.to_thread(write_shard, path, spec, idx, payload, add)
-            self.f.fetched += len(add)
-            self.charge(path, sz)
-            return bool(add) or bool((idx[:, 0] != EMPTY).any())
-
     def charge(self, path, sz=None):
-        """Book a buffered object against the cache budget. Every fetched shard is booked, including the
-        ones a REJECTED candidate pulled: those are referenced by no queue entry (ref -1) and are the first
-        thing eviction takes, but they are on the disk and the budget has to see them."""
+        """Book a buffered shard against the cache budget. Every fetched shard is booked, including the ones
+        a REJECTED candidate pulled: those are referenced by no queue entry (ref -1) and are the first thing
+        eviction takes, but they are on the disk and the budget has to see them."""
         if sz is None:
             sz = os.path.getsize(path) if os.path.exists(path) else 0
         self.cache_bytes += sz - self.size.get(path, 0)
@@ -419,7 +255,7 @@ class Planner:
         return sz
 
     async def _need(self, hook, pyr, k, lo, record=True, pin=False):
-        """Fetch what one `read_rung` will touch. Returns False when the origin served none of it."""
+        """Fetch the shards one `read_rung` will touch, whole. Returns False when the origin served none."""
         arr, a, b, whole = rung_range(pyr, k, lo, self.patch)
         d = data.array_dir(arr)
         if whole:  # a level small enough that every worker keeps it decoded: fetched once, kept for the run
@@ -432,31 +268,17 @@ class Planner:
                     self.whole_any[d] = any(st in ("have", "new") for st, _ in res)
                     self.cache_bytes += self.whole[d]
             return self.whole_any[d]
-        spec = shard_spec(d)
-        if spec is None:  # a plain (unsharded) array: the chunk objects are the unit
-            paths = [self.path_of(arr, ix) for ix in keys_in(arr, a, b)]
-            res = await asyncio.gather(*[self.f.get(q) for _, _, q in paths])
-            got = False
-            for (di, key, q), (st, _) in zip(paths, res):
-                if st in ("have", "new"):
-                    got = True
-                    self.charge(q)
-                    if pin:
-                        self.pin.add(q), self.ref.pop(q, None)
-                    elif record:
-                        hook.keys.append((di, key))
-            return got
-        parts = shard_parts(arr, a, b, spec)
-        ref = [self.path_of(arr, ix) for ix in parts]
-        res = await asyncio.gather(*[self.fetch_shard(q, spec, inn)
-                                     for (_, _, q), inn in zip(ref, parts.values())])
+        paths = [self.path_of(arr, ix) for ix in keys_in(arr, a, b)]
+        res = await asyncio.gather(*[self.f.get(q) for _, _, q in paths])
         got = False
-        for (di, key, q), ok in zip(ref, res):
-            if ok is None:
+        for (di, key, q), (st, _) in zip(paths, res):
+            if st not in ("have", "new"):
                 continue
-            got = got or bool(ok)
+            got = True
+            self.charge(q)
             if pin:
-                self.pin.add(q), self.ref.pop(q, None)
+                self.pin.add(q)
+                self.ref.pop(q, None)
             elif record:
                 hook.keys.append((di, key))
         return got
@@ -690,7 +512,9 @@ class Planner:
                "cache_GiB": round(self.cache_bytes / 2 ** 30, 3), "chunks": self.f.fetched,
                "GB_total": round(self.f.bytes / 1e9, 3), "absent": self.f.absent, "failed": self.f.failed,
                "evicted": self.evicted, "whole_MiB": round(sum(self.whole.values()) / 2 ** 20, 1),
-               "requests": self.f.requests, "pinned": len(self.pin)}
+               "requests": self.f.requests, "pinned": len(self.pin),
+               "hit_rate": round(self.f.have / max(self.f.have + self.f.fetched + self.f.absent, 1), 4),
+               "B_per_vox": round(self.f.bytes / max(self.index * int(np.prod(self.patch)), 1), 4)}
         print("stream-plan " + json.dumps(rec), flush=True)
         with open(os.path.join(self.dir, "plan.jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")

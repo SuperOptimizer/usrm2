@@ -411,16 +411,15 @@ targets are fetched before the rejection rules run, the nine context cubes only 
 them. `data.raw` was split into `raw_params` (the rng draws, recorded in the entry) and `raw_apply`, so a
 replayed window is bit-identical to the sampled one without carrying an rng.
 
-**Range fetching, not whole shards.** A volcomp level's object is a 1024^3 SHARD holding 512 inner 128^3
-chunks plus an (offset, nbytes) index at its end (a CT level-0 shard is ~17 MB, a level-2 shard ~35 MB). A
-256^3 window touches about two shards per level, so fetching shard objects would pull ~35 MB per level per
-window -- about 130x what the reads use. The planner instead GETs the shard index by byte range, then only
-the inner chunks the read touches (adjacent ones coalesced into one request), and writes a VALID shard
-locally that holds exactly those: its index marks the rest empty, which is the array's fill value, so zarr
-reads the window correctly and the untouched region reads as air. Later windows merge more inner chunks
-into the same file. A server that ignores `Range` is handled by slicing the whole object. Measured on the
-A6000 against dl.ash2txt.org, a 256^3 rung-2 window with nine context rungs costs ~40 MB and ~250 requests
-instead of the ~5 GB of shard objects it touches.
+**The shard is the unit** (user, 2026-09-20). A volcomp level's object is a 1024^3 SHARD holding 512
+inner 128^3 chunks (a CT level-0 shard is ~17 MB, a level-2 shard ~35 MB). The planner downloads whole
+shards -- no byte ranges, no partial objects -- and writes them into the mirror at their normal paths, so
+the buffered copy is the origin's object byte for byte and every later window whose reads land in a resident
+shard costs nothing. One shard covers 64 windows' worth of volume at 256^3, and the coarse levels are a
+handful of shards each, which is where the hit rate comes from; the window ORDER is still the sampler's own
+seeded draw (reordering it would break the guarantee that the queue is what the direct sampler would have
+drawn), so reuse is residency, not scheduling. `plan.jsonl` reports `hit_rate` (buffer hits over all shard
+lookups) and `B_per_vox` (bytes fetched per training voxel).
 
 `usrm2 train ... --stream DIR` makes `data.Patches` replay instead of sample: worker w takes entries
 w, w+W, ..., waits (backoff to 1 s) when the planner has not got there yet, and reads each window from the

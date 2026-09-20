@@ -390,21 +390,15 @@ def sharded_origin(tmp_path):
         srv.wait()
 
 
-def test_a_shard_is_fetched_by_range_and_the_partial_copy_reads_correctly(tmp_path, sharded_origin,
-                                                                          monkeypatch, per_window):
-    """The buffer holds VALID shards containing only the inner chunks the windows needed: the window reads
-    back exactly what the origin has, the rest of the shard reads as the fill value, and the traffic is a
-    fraction of the shard objects."""
+def test_whole_shards_are_cached_and_later_windows_hit_them(tmp_path, sharded_origin, monkeypatch,
+                                                            per_window):
+    """The unit of fetching and caching is the whole shard object: the buffer's copy is byte-identical to the
+    origin's, and windows that land in a resident shard cost nothing (the report's hit rate)."""
     monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
     mct, mtg, oct_, otg = sharded_origin
     q = tmp_path / "q"
-    S.SHARD_SPEC.clear()
-    run_plan(tmp_path, mct, mtg, q, limit=6, workers=1, ctx=(1,))
+    run_plan(tmp_path, mct, mtg, q, limit=12, workers=1, ctx=(1,))
     data.CTX_CACHE.clear(), data.CHUNK_INDEX.clear()
-    S.SHARD_SPEC.clear()
-
-    spec = S.shard_spec(f"{mct}/0")
-    assert spec and spec["inner"] == [16, 16, 16] and spec["shard"] == [32, 32, 32] and spec["end"]
 
     ds = data.Patches(patch=P32, stores=[f"{mct},{mtg}"], exclude=[], rungs={2, 3}, ctx=(1,), stream=str(q))
     ds._open()
@@ -416,10 +410,13 @@ def test_a_shard_is_fetched_by_range_and_the_partial_copy_reads_correctly(tmp_pa
         assert torch.equal(got["ct"], want["ct"]), "the streamed window differs from the origin"
         assert torch.equal(got["tgt"], want["tgt"])
 
-    # the mirror is a small fraction of the origin, and every local shard is a valid zarr object
-    def du(p):
-        return sum(f.stat().st_size for f in pathlib.Path(p).rglob("*") if f.is_file())
-    assert du(f"{mct}/0") < 0.6 * du(f"{oct_}/0")
+    # every buffered object is the origin's object, byte for byte
+    n = 0
+    for f in pathlib.Path(f"{mct}/0").rglob("*"):
+        if f.is_file() and f.name != "zarr.json" and not f.name.endswith(".absent"):
+            assert f.read_bytes() == (pathlib.Path(f"{oct_}/0") / f.relative_to(f"{mct}/0")).read_bytes()
+            n += 1
+    assert n, "no shard was cached"
     rec = [json.loads(l) for l in open(q / "plan.jsonl")][-1]
-    # the range path really ran: far fewer bytes than the shard objects the windows touched
-    assert rec["GB_total"] * 1e9 < 0.5 * du(f"{oct_}/0") + du(f"{otg}/2.4")
+    assert rec["hit_rate"] > 0.3, f"shards are not being reused: {rec['hit_rate']}"
+    assert rec["B_per_vox"] > 0
