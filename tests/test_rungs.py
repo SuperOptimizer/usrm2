@@ -46,13 +46,13 @@ def ct_pyramid(root, base=256, nlev=4, value=lambda l: 100 + 10 * l, partial=Fal
 
 
 def pred_pyramid(root, name="pred.zarr", base=256, nlev=4, value=lambda k: 220 - 30 * k, attrs=None,
-                 mask=False):
+                 mask=False, k0=2):
     """An exported prediction group: levels named by the exact voxel size, OME multiscales in zarr.json."""
     root = root / name
     root.mkdir(parents=True, exist_ok=True)
     lv = []
     for l in range(nlev):
-        n, um = base >> l, data.rung_um(2 + l)
+        n, um = base >> l, data.rung_um(k0 + l)
         lv.append({"path": f"{um:g}" if "." in f"{um:g}" else f"{um:.1f}", "um": um})
         if mask:
             import volcomp_zarr as vc
@@ -63,13 +63,13 @@ def pred_pyramid(root, name="pred.zarr", base=256, nlev=4, value=lambda k: 220 -
             v[n // 4:3 * n // 4] = 255  # a slab of "surface"
             a[:] = v
         else:
-            plain_level(root / lv[-1]["path"], (n, n, n), value(2 + l))
+            plain_level(root / lv[-1]["path"], (n, n, n), value(k0 + l))
     meta = {"zarr_format": 3, "node_type": "group", "attributes": {
         "ome": {"version": "0.5", "multiscales": [{"version": "0.5", "name": name, "type": "mean",
                 "axes": [{"name": q, "type": "space", "unit": "micrometer"} for q in "zyx"],
                 "datasets": [{"path": q["path"], "coordinateTransformations":
                               [{"type": "scale", "scale": [q["um"]] * 3}]} for q in lv]}]},
-        "volcomp": {"encoding": "mask" if mask else "ramp", "rung_voxel_size_um": 2.4}}}
+        "volcomp": {"encoding": "mask" if mask else "ramp", "rung_voxel_size_um": data.rung_um(k0)}}}
     meta["attributes"].update(attrs or {})
     (root / "zarr.json").write_text(json.dumps(meta))
     return str(root)
@@ -443,3 +443,16 @@ def test_a_window_with_no_weighted_voxel_is_not_sampled(tmp_path, monkeypatch):
     ds._open_rungs()
     rng = np.random.default_rng(0)
     assert all(ds._rung_draw(rng, build=False)[0] is None for _ in range(50))
+
+
+def test_source_weight_is_physical_volume(tmp_path, monkeypatch):
+    """Two scrolls of the same physical size draw equally even when one is stored 4x coarser (64x fewer voxels)."""
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    ct_a = ct_pyramid(tmp_path / "a", base=256)
+    tg_a = pred_pyramid(tmp_path / "a", base=256)                       # native rung 2, 256^3 voxels
+    ct_b = ct_pyramid(tmp_path / "b", base=64)
+    tg_b = pred_pyramid(tmp_path / "b", base=64, k0=4)  # native 9.6 um
+    srcs = data.source_groups([f"{ct_a},{tg_a}", f"{ct_b},{tg_b}"])
+    assert srcs[1]["native"] == 4
+    assert srcs[0]["voxels"] == 64 * srcs[1]["voxels"]
+    assert srcs[0]["volume_um3"] == pytest.approx(srcs[1]["volume_um3"])

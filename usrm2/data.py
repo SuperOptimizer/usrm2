@@ -638,7 +638,10 @@ def source_groups(lines):
         own = umbilicus_path(sc) if sc else None
         src["umbilicus"] = (umb or group_attrs(parts[0]).get("umbilicus")
                             or (own if own and os.path.exists(own) else UMBILICUS))
+        # a source's draw weight is its PHYSICAL volume (um^3), not its voxel count: a 9.6 um-native scroll would
+        # otherwise weigh 64x less than a 2.4 um one of the same size
         src["voxels"] = float(np.prod(target_box(next(iter(src["targets"].values())), src["native"])[1]))
+        src["volume_um3"] = src["voxels"] * rung_um(src["native"]) ** 3
         out.append(src)
     return out
 
@@ -755,7 +758,7 @@ class Patches(torch.utils.data.IterableDataset):
         for s in self.srcs:
             s["probs"] = rung_probs(s, self.patch, allowed, self.rung_boost)
             s["axis"] = axis(s["umbilicus"])
-        self.w = np.array([s["voxels"] for s in self.srcs], np.float64)
+        self.w = np.array([s["volume_um3"] for s in self.srcs], np.float64)
         self.w /= self.w.sum()
         self.ex = [e if isinstance(e, (tuple, list)) and len(e) == 2 and not isinstance(e[0], str)
                    else val_box(e) for e in self.exclude]  # (origin, size) at rung 2
@@ -1079,7 +1082,7 @@ def rung_mix(lines, patch=256, allowed=None, boost=None):
     n_k = target voxels / patch voxels, the probability inside the source and overall, and how much of the
     CT level that rung reads is mirrored locally."""
     srcs = source_groups(lines)
-    sw = np.array([s["voxels"] for s in srcs], np.float64)
+    sw = np.array([s["volume_um3"] for s in srcs], np.float64)
     sw /= sw.sum()
     per, rows = float(np.prod(shape3(patch))), []
     for s, ws in zip(srcs, sw):
