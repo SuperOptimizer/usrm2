@@ -67,25 +67,135 @@ def all_keys(arr):
     return [(z, y, x) for z in range(n[0]) for y in range(n[1]) for x in range(n[2])]
 
 
-def rung_need(pyr, k, lo, p):
-    """(array, chunk indices, whole) that `data.read_rung(pyr, k, lo, p)` will read.
+# A volcomp level is a SHARDED zarr v3 array: the object is a 1024^3 shard holding 512 inner 128^3 chunks
+# plus an index of (offset, nbytes) pairs at its end. Fetching whole shards to read a 256^3 window would
+# amplify the traffic ~130x, so a shard is fetched by HTTP range: its index first, then only the inner
+# chunks the read touches, and the local copy is a VALID shard holding exactly those (its index marks the
+# rest empty, which is the array's fill value -- the same thing an unfetched region reads as).
+
+EMPTY = (1 << 64) - 1  # the index entry of an inner chunk that is not in the shard
+SHARD_SPEC = {}
+
+
+def shard_spec(d):
+    """{shard, inner, grid, n, ilen, crc, end} of a local array directory, or None when it is not sharded."""
+    if d in SHARD_SPEC:
+        return SHARD_SPEC[d]
+    spec = None
+    try:
+        j = json.load(open(f"{d}/zarr.json"))
+        g = list(j["chunk_grid"]["configuration"]["chunk_shape"])
+        for c in j.get("codecs", []):
+            if isinstance(c, dict) and c.get("name") == "sharding_indexed":
+                cf = c.get("configuration", {})
+                inner = list(cf["chunk_shape"])
+                grid = [-(-a // b) for a, b in zip(g, inner)]
+                ic = cf.get("index_codecs") or [{"name": "bytes"}, {"name": "crc32c"}]
+                crc = any((q.get("name") if isinstance(q, dict) else q) == "crc32c" for q in ic)
+                n = int(np.prod(grid))
+                spec = {"shard": g, "inner": inner, "grid": grid, "n": n, "crc": crc,
+                        "ilen": n * 16 + (4 if crc else 0),
+                        "end": cf.get("index_location", "end") == "end"}
+    except Exception:  # noqa: BLE001  (no metadata yet, or a plain unsharded array)
+        spec = None
+    SHARD_SPEC[d] = spec
+    return spec
+
+
+def shard_parts(arr, a, b, spec):
+    """{shard index: [flat inner-chunk index, ...]} covering the voxel range [a, b)."""
+    c, g, grid = np.array(spec["inner"]), np.array(spec["shard"]), np.array(spec["grid"])
+    S = np.array(arr.shape[-3:], np.int64)
+    a, b = np.maximum(np.asarray(a, np.int64), 0), np.minimum(np.asarray(b, np.int64), S)
+    if (b <= a).any():
+        return {}
+    lo, hi = a // c, -(-b // c)
+    out = {}
+    for z in range(lo[0], hi[0]):
+        for y in range(lo[1], hi[1]):
+            for x in range(lo[2], hi[2]):
+                ix = np.array([z, y, x], np.int64)
+                sh = tuple(int(v) for v in ix * c // g)
+                inner = ix - np.array(sh, np.int64) * (g // c)
+                out.setdefault(sh, []).append(int(inner[0] * grid[1] * grid[2] + inner[1] * grid[2] + inner[2]))
+    return out
+
+
+def index_bytes(idx, spec):
+    b = np.ascontiguousarray(idx, "<u8").tobytes()
+    if spec["crc"]:
+        import google_crc32c
+        b += int(google_crc32c.value(b)).to_bytes(4, "little")
+    return b
+
+
+def read_shard(path, spec):
+    """(index, payload) of a local shard; an all-empty index and no payload when it is not there."""
+    n, ilen = spec["n"], spec["ilen"]
+    if not os.path.exists(path):
+        return np.full((n, 2), EMPTY, np.uint64), b""
+    raw = open(path, "rb").read()
+    if len(raw) < ilen:
+        return np.full((n, 2), EMPTY, np.uint64), b""
+    o = len(raw) - ilen if spec["end"] else 0
+    idx = np.frombuffer(raw[o:o + n * 16], "<u8").reshape(n, 2).copy()
+    return idx, (raw[:len(raw) - ilen] if spec["end"] else raw[ilen:])
+
+
+def write_shard(path, spec, idx, payload, add):
+    """Add {flat inner index: bytes} to a local shard and rewrite its index. Returns the new file size."""
+    base = 0 if spec["end"] else spec["ilen"]
+    buf = bytearray(payload)
+    for i, blob in add.items():
+        if idx[i, 0] != EMPTY:
+            continue
+        idx[i] = (base + len(buf), len(blob))
+        buf += blob
+    ib = index_bytes(idx, spec)
+    out = bytes(buf) + ib if spec["end"] else ib + bytes(buf)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".part", "wb") as f:
+        f.write(out)
+    os.replace(path + ".part", path)
+    return len(out)
+
+
+def runs(spans, gap=1 << 16):
+    """Byte ranges merged when they are adjacent or nearly so: one request instead of many."""
+    out = []
+    for lo, hi in sorted(spans):
+        if out and lo - out[-1][1] <= gap:
+            out[-1][1] = max(out[-1][1], hi)
+        else:
+            out.append([lo, hi])
+    return out
+
+
+def rung_range(pyr, k, lo, p):
+    """(array, a, b, whole) that `data.read_rung(pyr, k, lo, p)` will read: the voxel range [a, b) of the
+    source level, or whole=True when `data.full_level` keeps that level decoded and reads all of it.
 
     It mirrors `read_rung` / `read_block` / `full_level`: the source level is the highest rung at or below k,
-    and when either that level or the rung-k view of it is small enough for `data.full_level` to keep it
-    decoded, the WHOLE level is read (once) instead of a window of it."""
+    and when either that level or the rung-k view of it is small enough to be kept whole, the WHOLE level is
+    read (once) instead of a window of it."""
     src = max(r for r in pyr if r <= k)
     arr = pyr[src]
+    S = np.array(arr.shape[-3:], np.int64)
     if (int(np.prod(data.rung_shape(pyr, k))) <= data.CACHE_VOX
-            or int(np.prod(np.array(arr.shape[-3:], np.int64))) <= data.CACHE_VOX):
-        return arr, all_keys(arr), True
+            or int(np.prod(S)) <= data.CACHE_VOX):
+        return arr, np.zeros(3, np.int64), S, True
     p, lo = data.shape3(p), np.asarray(lo, np.int64)
     e = 1 << (k - src)
-    S = np.array(arr.shape[-3:], np.int64)
     jlo, jhi = np.maximum(-lo, 0), np.minimum(-(-S // e) - lo, p)
     if (jhi <= jlo).any():  # the cube does not touch the array at all
-        return arr, [], False
-    a, b = (lo + jlo) * e, np.minimum((lo + jhi) * e, S)
-    return arr, keys_in(arr, a, b), False
+        return arr, np.zeros(3, np.int64), np.zeros(3, np.int64), False
+    return arr, (lo + jlo) * e, np.minimum((lo + jhi) * e, S), False
+
+
+def rung_need(pyr, k, lo, p):
+    """(array, chunk indices, whole) of the same read: the outer (shard) keys it touches."""
+    arr, a, b, whole = rung_range(pyr, k, lo, p)
+    return arr, (all_keys(arr) if whole else keys_in(arr, a, b)), whole
 
 
 def ctx_need(pyr, k, lo, p, ctx):
@@ -105,7 +215,29 @@ class Fetcher:
 
     def __init__(self, session, jobs=48, retries=4):
         self.session, self.sem, self.retries = session, asyncio.Semaphore(jobs), retries
-        self.bytes = self.fetched = self.absent = self.have = self.failed = 0
+        self.bytes = self.fetched = self.absent = self.have = self.failed = self.requests = 0
+
+    async def raw(self, url, rng=None):
+        """(status, bytes) of one GET, optionally a byte range. 404 -> (404, b""); a server that ignores
+        the range answers 200 with the whole object and the caller slices it."""
+        headers = {"Range": rng} if rng else {}
+        async with self.sem:
+            for attempt in range(self.retries):
+                try:
+                    async with self.session.get(url, headers=headers) as r:
+                        if r.status == 404:
+                            return 404, b""
+                        r.raise_for_status()
+                        buf = await r.read()
+                    self.bytes += len(buf)
+                    self.requests += 1
+                    return r.status, buf
+                except Exception as e:  # noqa: BLE001
+                    if attempt == self.retries - 1:
+                        print(f"stream-plan: FAILED {url} {rng or ''}: {e!r}", flush=True)
+                        self.failed += 1
+                        return 0, b""
+                    await asyncio.sleep(2 * (attempt + 1))
 
     async def get(self, path):
         """(status, bytes) with status in have / new / absent / fail. `path` is the LOCAL mirror path."""
@@ -208,7 +340,8 @@ class Planner:
         self.val, self.val_rungs, self.val_patches = val, tuple(val_rungs), int(val_patches)
         self.pin = set()   # the validation grid's chunks: fetched once, never evicted
         self.dirs, self.dir_ix = [], {}          # the level directories entries refer to, by index
-        self.whole, self.whole_any = {}, {}      # level dir -> bytes kept forever / did the origin serve any of it
+        self.whole, self.whole_any, self.whole_lock = {}, {}, {}  # level dir -> bytes kept forever / served / guard
+        self.shard_lock = {}                     # one writer per local partial shard
         self.ref, self.size = {}, {}             # chunk path -> last referencing queue index / its size
         self.cache_bytes = self.evicted = self.evicted_bytes = 0
         self.index = 0                           # the next queue index to emit
@@ -227,45 +360,100 @@ class Planner:
             self.dirty = True
         return di, chunk_key(arr, ix), f"{d}/{chunk_key(arr, ix)}"
 
+    async def fetch_shard(self, path, spec, inners):
+        """One shard, by range: its index, then only the inner chunks `inners` that the origin holds and the
+        buffer does not. The local file stays a valid shard (see `write_shard`). Returns True when it holds
+        data for them, False when the origin's are empty (air), None when the whole shard is a 404."""
+        if os.path.exists(path + ".absent"):
+            return None
+        async with self.shard_lock.setdefault(path, asyncio.Lock()):
+            idx, payload = read_shard(path, spec)
+            miss = [i for i in inners if idx[i, 0] == EMPTY]
+            if not miss:
+                return True
+            url, n, ilen = data.remote(path), spec["n"], spec["ilen"]
+            st, buf = await self.f.raw(url, f"bytes=-{ilen}" if spec["end"] else f"bytes=0-{ilen - 1}")
+            if st == 404:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                open(path + ".absent", "wb").close()
+                self.f.absent += 1
+                return None
+            if len(buf) < ilen:
+                return None
+            whole = len(buf) > ilen  # the server ignored the range and sent the object
+            ibuf = buf[len(buf) - ilen:] if spec["end"] else buf[:ilen]
+            ridx = np.frombuffer(ibuf[:n * 16], "<u8").reshape(n, 2)
+            need = [i for i in miss if ridx[i, 0] != EMPTY]
+            add = {}
+            if need and whole:
+                for i in need:
+                    o, ln = int(ridx[i, 0]), int(ridx[i, 1])
+                    add[i] = buf[o:o + ln]
+            elif need:
+                spans = runs([[int(ridx[i, 0]), int(ridx[i, 0]) + int(ridx[i, 1])] for i in need])
+                got = await asyncio.gather(*[self.f.raw(url, f"bytes={a}-{b - 1}") for a, b in spans])
+                for (a, b), (st2, blob) in zip(spans, got):
+                    if len(blob) > b - a:  # the range was ignored: the whole object came back
+                        blob = blob[a:b]
+                    if len(blob) != b - a:
+                        continue
+                    for i in need:
+                        o, ln = int(ridx[i, 0]), int(ridx[i, 1])
+                        if a <= o and o + ln <= b:
+                            add[i] = blob[o - a:o - a + ln]
+            sz = await asyncio.to_thread(write_shard, path, spec, idx, payload, add)
+            self.f.fetched += len(add)
+            self.size[path] = sz
+            return bool(add) or bool((idx[:, 0] != EMPTY).any())
+
     async def _need(self, hook, pyr, k, lo, record=True, pin=False):
         """Fetch what one `read_rung` will touch. Returns False when the origin served none of it."""
-        arr, keys, whole = rung_need(pyr, k, lo, self.patch)
+        arr, a, b, whole = rung_range(pyr, k, lo, self.patch)
         d = data.array_dir(arr)
-        if whole:
+        if whole:  # a level small enough that every worker keeps it decoded: fetched once, kept for the run
             if d in self.whole:
                 return self.whole_any[d]
-            res = await asyncio.gather(*[self.f.get(f"{d}/{chunk_key(arr, ix)}") for ix in keys])
-            self.whole[d] = sum(n for _, n in res)
-            self.whole_any[d] = any(st in ("have", "new") for st, _ in res)
-            self.cache_bytes += self.whole[d]
+            async with self.whole_lock.setdefault(d, asyncio.Lock()):
+                if d not in self.whole:
+                    res = await asyncio.gather(*[self.f.get(f"{d}/{chunk_key(arr, ix)}") for ix in all_keys(arr)])
+                    self.whole[d] = sum(v for _, v in res)
+                    self.whole_any[d] = any(st in ("have", "new") for st, _ in res)
+                    self.cache_bytes += self.whole[d]
             return self.whole_any[d]
-        paths = [self.path_of(arr, ix) for ix in keys]
-        res = await asyncio.gather(*[self.f.get(p) for _, _, p in paths])
+        spec = shard_spec(d)
+        if spec is None:  # a plain (unsharded) array: the chunk objects are the unit
+            paths = [self.path_of(arr, ix) for ix in keys_in(arr, a, b)]
+            res = await asyncio.gather(*[self.f.get(q) for _, _, q in paths])
+            got = False
+            for (di, key, q), (st, _) in zip(paths, res):
+                if st in ("have", "new"):
+                    got = True
+                    self.pin.add(q) if pin else (record and hook.keys.append((di, key)))
+            return got
+        parts = shard_parts(arr, a, b, spec)
+        ref = [self.path_of(arr, ix) for ix in parts]
+        res = await asyncio.gather(*[self.fetch_shard(q, spec, inn)
+                                     for (_, _, q), inn in zip(ref, parts.values())])
         got = False
-        for (di, key, p), (st, _) in zip(paths, res):
-            if st in ("have", "new"):
-                got = True
-                if pin:
-                    self.pin.add(p)
-                elif record:
-                    hook.keys.append((di, key))
+        for (di, key, q), ok in zip(ref, res):
+            if ok is None:
+                continue
+            got = got or bool(ok)
+            self.pin.add(q) if pin else (record and hook.keys.append((di, key)))
         return got
 
     async def fetch_data(self, hook, s, k, lo):
         """The CT cube and the targets of a candidate window. False = reject (`--require-targets` and the
         origin serves no target chunk at all for this window: nothing was exported there)."""
-        await self._need(hook, s["ct_pyr"], k, lo)
-        any_t = False
-        for t in s["targets"].values():
-            any_t |= await self._need(hook, t["pyr"], k, lo)
-        return bool(any_t) if self.require_targets and s["targets"] else True
+        res = await asyncio.gather(self._need(hook, s["ct_pyr"], k, lo),
+                                   *[self._need(hook, t["pyr"], k, lo) for t in s["targets"].values()])
+        return bool(any(res[1:])) if self.require_targets and s["targets"] else True
 
     async def fetch_ctx(self, hook, s, k, lo):
         """The nine context cubes, fetched only once the window has been accepted."""
         c0 = np.asarray(lo, np.int64) + self.patch // 2
-        for d in self.ctx:
-            lo_d = c0 // (1 << int(d)) - self.patch // 2
-            await self._need(hook, s["ct_pyr"], k + int(d), lo_d)
+        await asyncio.gather(*[self._need(hook, s["ct_pyr"], k + int(d),
+                                          c0 // (1 << int(d)) - self.patch // 2) for d in self.ctx])
         return True
 
     # ---- the queue ---------------------------------------------------------
@@ -308,12 +496,12 @@ class Planner:
             p = f"{self.dirs[di]}/{key}"
             if p in self.pin:  # a validation chunk: kept for the whole run
                 continue
-            if p not in self.size:
-                try:
-                    self.size[p] = os.path.getsize(p)
-                except OSError:
-                    self.size[p] = 0
-                self.cache_bytes += self.size[p]
+            try:
+                sz = os.path.getsize(p)
+            except OSError:
+                sz = 0
+            self.cache_bytes += sz - self.size.get(p, 0)  # a partial shard grows as windows add inner chunks
+            self.size[p] = sz
             self.ref[p] = self.index
         self.index += 1
 
@@ -355,15 +543,17 @@ class Planner:
                        for x in range(0, max(int(sz[2]) - int(p3[2]), 0) + 1, int(p3[2]))]
             if self.val_patches and len(corners) > self.val_patches:
                 corners = [corners[i] for i in np.linspace(0, len(corners) - 1, self.val_patches).astype(int)]
-            for c in corners:
-                lo = org + np.array(c, np.int64)
-                await self._need(hook, s["ct_pyr"], k, lo, pin=True)
-                for t in s["targets"].values():
-                    await self._need(hook, t["pyr"], k, lo, pin=True)
-                c0 = lo + p3 // 2
-                for dd in self.ctx:
-                    await self._need(hook, s["ct_pyr"], k + int(dd), c0 // (1 << int(dd)) - p3 // 2, pin=True)
-                n += 1
+            for i in range(0, len(corners), 4):  # four windows at a time, all their levels in parallel
+                jobs = []
+                for c in corners[i:i + 4]:
+                    lo = org + np.array(c, np.int64)
+                    c0 = lo + p3 // 2
+                    jobs.append(self._need(hook, s["ct_pyr"], k, lo, pin=True))
+                    jobs += [self._need(hook, t["pyr"], k, lo, pin=True) for t in s["targets"].values()]
+                    jobs += [self._need(hook, s["ct_pyr"], k + int(dd), c0 // (1 << int(dd)) - p3 // 2,
+                                        pin=True) for dd in self.ctx]
+                    n += 1
+                await asyncio.gather(*jobs)
         return n
 
     # ---- resume ------------------------------------------------------------
@@ -420,14 +610,15 @@ class Planner:
                     for a in pyr.values():
                         self.path_of(a, (0, 0, 0))
             self.lines = lines
+            self.resume()
+            self.write_meta(lines)  # before the val prefetch: the trainer may already be opening the pyramids
+            self.dirty = False
             t1 = time.time()
             nv = await self.prefetch_val()
+            open(os.path.join(self.dir, "val_ready"), "w").write(str(nv))  # the trainer waits for this
             if nv:
                 print(f"stream-plan: {nv} validation windows prefetched in {time.time() - t1:.1f} s "
-                      f"({self.f.bytes / 1e6:.1f} MB so far)", flush=True)
-            self.resume()
-            self.write_meta(lines)
-            self.dirty = False
+                      f"({self.f.bytes / 1e6:.1f} MB, {self.f.fetched} chunks so far)", flush=True)
             loop = asyncio.get_running_loop()
             self.stop = False
             tasks = [asyncio.create_task(self.stream(w, loop)) for w in range(self.W)]
@@ -438,6 +629,7 @@ class Planner:
                 self.stop = True
                 for t in tasks:
                     t.cancel()
+                self.report_line(t0, 0, 0)
 
     async def stream(self, w, loop):
         """One loader worker's rng stream: draw, fetch, reject, park the accepted windows for the emitter."""
@@ -482,7 +674,8 @@ class Planner:
                "MB_s": round((self.f.bytes - b0) / 1e6 / dt, 1), "chunks_s": round((self.f.fetched - n0) / dt, 1),
                "cache_GiB": round(self.cache_bytes / 2 ** 30, 3), "chunks": self.f.fetched,
                "GB_total": round(self.f.bytes / 1e9, 3), "absent": self.f.absent, "failed": self.f.failed,
-               "evicted": self.evicted, "whole_MiB": round(sum(self.whole.values()) / 2 ** 20, 1)}
+               "evicted": self.evicted, "whole_MiB": round(sum(self.whole.values()) / 2 ** 20, 1),
+               "requests": self.f.requests, "pinned": len(self.pin)}
         print("stream-plan " + json.dumps(rec), flush=True)
         with open(os.path.join(self.dir, "plan.jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")

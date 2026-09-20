@@ -297,3 +297,129 @@ def test_train_over_a_streamed_queue(tmp_path, origin, monkeypatch):
     step20 = [q_ for q_ in logs if q_.get("step") == 20 and "vox_s" in q_][0]
     assert "stream_wait_ms" in step20 and step20["stream_idx"] >= 19
     assert json.load(open(q / S.CONSUMED))["i"] >= 19
+
+
+# ------------------------------------------------------------------ sharded levels (the real layout)
+
+def sharded_pyramid(root, name, nlev=3, base=128, chunks=16, shards=32, pred=False, seed=0):
+    """A pyramid whose levels are SHARDED zarr v3 arrays, as the exported volcomp levels are (1024^3 shards
+    of 128^3 inner chunks). The data is random, so a partially fetched shard cannot pass by accident."""
+    import zarr
+    root = pathlib.Path(root) / name
+    root.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    lv = []
+    for l in range(nlev):
+        n, um = base >> l, data.rung_um(2 + l)
+        nm = f"{um:g}" if pred else str(l)
+        lv.append({"path": nm, "um": um})
+        a = zarr.create_array(str(root / nm), shape=(n, n, n), chunks=(chunks,) * 3, shards=(shards,) * 3,
+                              dtype="uint8", fill_value=0, overwrite=True)
+        a[:] = rng.integers(1, 255, (n, n, n), dtype=np.uint8)
+    meta = {"zarr_format": 3, "node_type": "group", "attributes": {
+        "ome": {"version": "0.5", "multiscales": [{"version": "0.5", "name": name, "type": "mean",
+                "axes": [{"name": q, "type": "space", "unit": "micrometer"} for q in "zyx"],
+                "datasets": [{"path": q["path"], "coordinateTransformations":
+                              [{"type": "scale", "scale": [q["um"]] * 3}]} for q in lv]}]},
+        "volcomp": {"rung_voxel_size_um": 2.4}}}
+    (root / "zarr.json").write_text(json.dumps(meta))
+    return str(root)
+
+
+RANGE_SERVER = """
+import http.server, os, re, sys, functools
+class H(http.server.SimpleHTTPRequestHandler):
+    def send_head(self):                       # nginx-style single byte range, which http.server lacks
+        rng = self.headers.get("Range")
+        path = self.translate_path(self.path)
+        if not rng or not os.path.isfile(path):
+            return super().send_head()
+        n = os.path.getsize(path)
+        m = re.fullmatch(r"bytes=(\\d*)-(\\d*)", rng.strip())
+        a, b = m.group(1), m.group(2)
+        lo, hi = (n - int(b), n - 1) if a == "" else (int(a), n - 1 if b == "" else int(b))
+        lo, hi = max(lo, 0), min(hi, n - 1)
+        f = open(path, "rb"); f.seek(lo)
+        buf = f.read(hi - lo + 1); f.close()
+        self.send_response(206)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Range", f"bytes {lo}-{hi}/{n}")
+        self.send_header("Content-Length", str(len(buf)))
+        self.end_headers()
+        import io; return io.BytesIO(buf)
+http.server.HTTPServer.allow_reuse_address = True
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])),
+                       functools.partial(H, directory=sys.argv[2])).serve_forever()
+"""
+
+
+@pytest.fixture
+def sharded_origin(tmp_path):
+    import socket
+    import urllib.request
+    root = tmp_path / "origin"
+    (root / SCROLL / "volumes").mkdir(parents=True)
+    (root / SCROLL / "representations" / "predictions" / "surfaces").mkdir(parents=True)
+    ct = sharded_pyramid(root / SCROLL / "volumes", "20260101000000-2.400um-0.2m-78keV-masked.zarr", seed=1)
+    tg = sharded_pyramid(root / SCROLL / "representations" / "predictions" / "surfaces", "pred.zarr",
+                         pred=True, seed=2)
+    with socket.socket() as sk:
+        sk.bind(("127.0.0.1", 0))
+        port = sk.getsockname()[1]
+    srv = subprocess.Popen([sys.executable, "-c", RANGE_SERVER, str(port), str(root)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(200):
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=0.5).read(1)
+            break
+        except Exception:  # noqa: BLE001
+            time.sleep(0.05)
+    else:
+        srv.kill()
+        pytest.fail("the range server did not start")
+    mirror = tmp_path / "mirror"
+    mirror.mkdir()
+    old = data.LOCAL_VOLUMES, data.STREAM_VOLUMES
+    data.LOCAL_VOLUMES, data.STREAM_VOLUMES = str(mirror), f"http://127.0.0.1:{port}"
+    try:
+        yield (f"{mirror}/{SCROLL}/{os.path.basename(ct)}",
+               f"{mirror}/{SCROLL}/representations/predictions/surfaces/pred.zarr", ct, tg)
+    finally:
+        data.LOCAL_VOLUMES, data.STREAM_VOLUMES = old
+        srv.kill()
+        srv.wait()
+
+
+def test_a_shard_is_fetched_by_range_and_the_partial_copy_reads_correctly(tmp_path, sharded_origin,
+                                                                          monkeypatch, per_window):
+    """The buffer holds VALID shards containing only the inner chunks the windows needed: the window reads
+    back exactly what the origin has, the rest of the shard reads as the fill value, and the traffic is a
+    fraction of the shard objects."""
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    mct, mtg, oct_, otg = sharded_origin
+    q = tmp_path / "q"
+    S.SHARD_SPEC.clear()
+    run_plan(tmp_path, mct, mtg, q, limit=6, workers=1, ctx=(1,))
+    data.CTX_CACHE.clear(), data.CHUNK_INDEX.clear()
+    S.SHARD_SPEC.clear()
+
+    spec = S.shard_spec(f"{mct}/0")
+    assert spec and spec["inner"] == [16, 16, 16] and spec["shard"] == [32, 32, 32] and spec["end"]
+
+    ds = data.Patches(patch=P32, stores=[f"{mct},{mtg}"], exclude=[], rungs={2, 3}, ctx=(1,), stream=str(q))
+    ds._open()
+    src = data.Patches(patch=P32, stores=[f"{oct_},{otg}"], exclude=[], rungs={2, 3}, ctx=(1,))
+    src._open_rungs()
+    for line in open(q / S.QUEUE):
+        rec = json.loads(line)
+        got, want = ds._rung_build(rec), src._rung_build(rec)
+        assert torch.equal(got["ct"], want["ct"]), "the streamed window differs from the origin"
+        assert torch.equal(got["tgt"], want["tgt"])
+
+    # the mirror is a small fraction of the origin, and every local shard is a valid zarr object
+    def du(p):
+        return sum(f.stat().st_size for f in pathlib.Path(p).rglob("*") if f.is_file())
+    assert du(f"{mct}/0") < 0.6 * du(f"{oct_}/0")
+    rec = [json.loads(l) for l in open(q / "plan.jsonl")][-1]
+    # the range path really ran: far fewer bytes than the shard objects the windows touched
+    assert rec["GB_total"] * 1e9 < 0.5 * du(f"{oct_}/0") + du(f"{otg}/2.4")
