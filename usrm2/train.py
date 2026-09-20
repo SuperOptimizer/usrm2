@@ -260,7 +260,8 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     ck = out / "ckpt.pt"
     if resume and ck.exists():
         st = torch.load(ck, map_location=dev)
-        grow = ("steps", "stores", "stores_file", "val")  # a continued run may train longer and on more data
+        grow = ("steps", "stores", "stores_file", "val", "val_rungs", "val_patches", "compile", "workers",
+                "require_targets", "rung_boost", "eval_every")  # a continued run may train longer, on more data, with other bookkeeping
         diff = {k: (st["args"][k], args.get(k)) for k in st["args"] if k not in grow and k != "aug_cfg" and st["args"][k] != args.get(k)}
         assert not diff, f"resume with different arguments (saved, now): {diff}"
         if st["args"].get("stores") != args.get("stores"):
