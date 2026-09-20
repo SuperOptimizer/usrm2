@@ -517,3 +517,55 @@ PHerc0332 m7 (9.596) + PHerc0343 m7 (8.64) + PHercMANB m7 (9.596)):
 The A6000s are served by a proxied GPU (Thunder Compute): twice during these runs the trainer's main thread
 parked on a futex with the GPU at 0 % and 33 GiB still allocated, and did not recover. That is an
 infrastructure hang, not the loader -- the loader workers had items ready and the machine was idle.
+
+
+## 18. The no-repeat region walk (2026-09-20, night)
+
+The user: *"I don't want to train over the same data multiple times."* Region mode draws a fresh
+(source, rung, region) for every visit, so a long run revisits regions by chance -- at 584 windows the
+A6000 run had already drawn Paris 4 twelve times. `--walk once` replaces the draw with an enumeration.
+
+**The list.** `data.region_list` walks every source, every usable rung and every shard-aligned `--region`
+tile of the target's box at that rung. A tile whose target is all air is dropped before it can cost a
+fetch: `data.occupancy` reads ONE coarse level of the export (the finest level under 64 Mvox -- rung 9 for
+Paris 4, 38 Mvox, a few MB over the wire) and `tiles_occupied` takes the block maximum of it over each
+tile's footprint, so the whole rung's tiles are filtered in one vectorised pass. Each surviving region
+carries
+
+    w(region) = (source's physical-volume share) x (its rung's probability from `rung_probs`) / (regions of that source+rung)
+
+so the rung mix and the um^3 source weights of section 17 are honoured IN EXPECTATION while every region is
+visited exactly once. `data.walk_order` turns the weights into the visit ORDER by a weighted shuffle
+without replacement (Efraimidis-Spirakis, key = Exp(1)/w): P(region r is first) = w_r, and each region
+appears exactly once. The order is a pure function of (seed, epoch), so it is never stored -- `regions.jsonl`
+holds the list in enumeration order and `walk.json` the cursor, the epoch and a fingerprint of the
+configuration the list was built for. A restarted planner recomputes the permutation and continues at the
+cursor: nothing before it is ever handed out again.
+
+When the list runs out the planner writes `epoch_done` ({"windows", "index", "regions"}) and stops; the
+trainer's replay iterator then ENDS instead of waiting, so `usrm2 train --stream` finishes its epoch, logs
+`stream_end`, evaluates and saves. `--epochs N` re-permutes and walks again instead. The epoch's window
+count is rounded down to a multiple of the stream count so every replaying (rank, worker) gets the same
+number of windows and a DDP run's ranks stop together (the replay holds its last entry back until the
+bound is known).
+
+**Interleaving.** `--active-regions K` (default 4) keeps K regions OPEN at once: K `visit` tasks each draw
+their own region's windows into their own buffer, and the emitter takes from them round robin, so
+consecutive queue entries come from different regions. A slot is released -- free to take the next region
+of the walk -- only once every one of its windows has been queued, so all K footprints stay resident for as
+long as they are being drawn and the hit rate does not fall. Each region's draws come from its own rng
+seeded by its walk ordinal, which is what makes a resume reproducible without carrying bit-generator state.
+Every queue entry records its region as `g`.
+
+**Streams, not workers.** `--stream` replay used to shard the queue by loader worker only, so with DDP
+every rank replayed the SAME entries and the run saw each window `world` times -- exactly what the walk is
+meant to prevent. The share is now taken over `world * num_workers` STREAMS and `stream-plan --workers` is
+that total (2 ranks x 8 workers = `--workers 16`).
+
+**The mirror is not the buffer.** The desk already mirrors Paris 4 (levels 1-9 complete, level 0 boxed).
+`Planner.mirrored` snapshots `data.chunk_index` for every level BEFORE the first fetch: whatever
+`mirror.json` says the mirror owns (a complete level, or the boxes of a partially pulled one, where an
+absent file means air) is a hit that is never fetched, never charged against `--cache-gb` and never evicted.
+Only planner-fetched shards are the rolling buffer. `plan.jsonl` reports `mirror` (such hits) and folds
+them into `hit_rate`, plus `regions` / `regions_left` / `regions_total` / `epoch` / `active` and
+`region_MiB` (bytes fetched per region, which is what `--cache-gb` has to hold K of).

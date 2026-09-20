@@ -1044,9 +1044,9 @@ class Patches(torch.utils.data.IterableDataset):
         sees each one `world` times. `stream-plan --workers` is that total.
 
         The walk ends: when the planner has written `epoch_done` and the queue is exhausted the iterator
-        STOPS instead of waiting forever, so `usrm2 train --stream` finishes its epoch cleanly. Its last
-        entry is held back until the end is known, because the trainer's ranks must see the same number of
-        windows (the planner's bound is a multiple of the stream count)."""
+        STOPS instead of waiting forever, so `usrm2 train --stream` finishes its epoch cleanly. The queue
+        always ends on a stream boundary (the planner writes it in groups of GW), so every stream sees the
+        same number of windows and a DDP run's ranks stop together."""
         import time as _time
         from usrm2 import stream as S
         info = torch.utils.data.get_worker_info()
@@ -1065,25 +1065,15 @@ class Patches(torch.utils.data.IterableDataset):
             except ValueError:
                 start = -1
         done = os.path.join(self.stream, S.EPOCH_DONE)
-        wait, held = 0.0, None
+        wait = 0.0
         for line, waited in S.tail(os.path.join(self.stream, S.QUEUE), stop=lambda: os.path.exists(done)):
             wait += waited
             rec = json.loads(line)
             i = int(rec["i"])
             if i % GW != g or i <= start:
                 continue
-            if held is not None:
-                yield self._replay_one(held, prog, wait)
-                wait = 0.0
-            held = rec
-        bound = 1 << 62
-        if os.path.exists(done):
-            try:
-                bound = int(json.load(open(done))["windows"])
-            except Exception:  # noqa: BLE001
-                bound = 1 << 62
-        if held is not None and int(held["i"]) < bound:
-            yield self._replay_one(held, prog, wait)
+            yield self._replay_one(rec, prog, wait)
+            wait = 0.0
 
     def _replay_one(self, rec, prog, wait):
         """One queue entry -> the compact sample, once every chunk it names is in the buffer."""

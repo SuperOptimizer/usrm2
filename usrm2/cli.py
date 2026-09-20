@@ -73,6 +73,15 @@ def main(argv=None):
     sp.add_argument("--report", type=float, default=30.0, help="seconds between plan.jsonl reports")
     sp.add_argument("--region", type=int, default=0, help="region mode (see `train --region`)")
     sp.add_argument("--windows-per-region", type=int, default=64)
+    sp.add_argument("--walk", default=None, choices=["once"], help="NO-REPEAT walk: enumerate every region "
+                    "of every source at every usable rung, weight them so the source and rung mixes are "
+                    "honoured in expectation, and visit each exactly once; `epoch_done` then stops the trainer")
+    sp.add_argument("--active-regions", type=int, default=4, help="regions kept open at once; their windows "
+                    "are emitted round robin, so consecutive queue entries come from different regions")
+    sp.add_argument("--epochs", type=int, default=1, help="walk the region list this many times (a fresh "
+                    "permutation each time)")
+    sp.add_argument("--region-fails", type=int, default=0, help="consecutive rejected draws that abandon a "
+                    "region (0 = 8 x --windows-per-region)")
     sp.add_argument("--val-rungs", default="2,3,4,6", help="rungs the held-out box is scored at (prefetched and pinned)")
     sp.add_argument("--val-patches", type=int, default=32)
     sp.add_argument("--limit", type=int, default=0, help="stop after this many queued windows (0 = forever)")
@@ -249,7 +258,8 @@ def main(argv=None):
                ahead=a.ahead, cache_gb=a.cache_gb, ctx=parse_ctx(a.ctx), aug=a.aug, dense_pow=a.dense_pow,
                require_targets=a.require_targets, val=a.val, jobs=a.jobs, report=a.report, limit=a.limit,
                val_rungs=[int(q) for q in a.val_rungs.split(",")], val_patches=a.val_patches,
-               region=a.region, windows_per_region=a.windows_per_region)
+               region=a.region, windows_per_region=a.windows_per_region, walk=a.walk,
+               active_regions=a.active_regions, epochs=a.epochs, region_fails=a.region_fails)
     elif a.cmd == "ablate":
         from usrm2 import ablate
         ablate.sweep(a.out_dir, a.presets.split(","), size=a.size, steps=a.steps, patch=a.patch,

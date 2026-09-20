@@ -322,7 +322,8 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     wait_ms, stream_idx = 0.0, -1
     # the planner may evict a chunk once every worker is past it; the DataLoader is up to this many entries
     # ahead of what the training loop has actually seen
-    margin = max(workers, 1) * batch * (2 + 2)
+    # (x world: every rank replays its own share of the one queue, and the bound must clear the slowest)
+    margin = world * max(workers, 1) * batch * (2 + 2)
     for item in dl:
         if step >= steps:
             break
@@ -377,6 +378,14 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
                 print("val_png:", repr(e))
             save()
             t0 = time.time()
+    else:  # the loader ran out: a streamed walk finished its epoch (nothing is ever trained on twice)
+        if stream:
+            log("train.jsonl", {"step": step, "stream_end": stream_idx,
+                                **({"epoch_done": json.load(open(os.path.join(str(stream), "epoch_done")))}
+                                   if os.path.exists(os.path.join(str(stream), "epoch_done")) else {})})
+            if main:
+                evnet.load_state_dict(ema)
+                log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev, wtgt, norad=no_radial)})
     save()
     if world > 1:
         dist.barrier()

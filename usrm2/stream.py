@@ -319,6 +319,7 @@ class Planner:
         self.active = [None] * self.K   # the open regions, emitted round robin
         self.rr = 0                     # whose turn it is
         self.regions_done = self.region_bytes = 0
+        self.group = []                 # emitted windows not yet written: the queue grows a stream's worth at a time
         self.mirror = {}                # level dir -> which shards the LOCAL mirror already knows (startup)
         self.val, self.val_rungs, self.val_patches = val, tuple(val_rungs), int(val_patches)
         self.pin = set()   # the validation grid's chunks: fetched once, never evicted
@@ -425,6 +426,45 @@ class Planner:
 
     # ---- the queue ---------------------------------------------------------
 
+    # ---- the walk ----------------------------------------------------------
+
+    def fingerprint(self, lines):
+        """What the region list was built for: a different one means a different list."""
+        return json.dumps({"stores": lines, "patch": [int(v) for v in self.patch],
+                           "region": self.kw["region"], "seed": self.seed, "epochs": self.epochs,
+                           "rungs": self.kw["rungs"] if self.kw["rungs"] is True else sorted(self.kw["rungs"]),
+                           "boost": {str(k): v for k, v in self.kw["rung_boost"].items()},
+                           "val": _val_meta(self.val)}, sort_keys=True)
+
+    async def build_walk(self, lines):
+        """Enumerate every region once (or pick up the list a previous planner left here)."""
+        self.walk_fp = self.fingerprint(lines)
+        self.walk = Walk(self.dir, seed=self.seed, epochs=self.epochs)
+        loaded = self.walk.load(self.walk_fp)
+        if not loaded or not self.walk.done:  # a marker from an earlier walk must not stop the new trainer
+            try:
+                os.remove(os.path.join(self.dir, EPOCH_DONE))
+            except OSError:
+                pass
+        if loaded:
+            print(f"stream-plan: walk resumed at region {self.walk.i}/{len(self.walk.regions)} "
+                  f"of epoch {self.walk.epoch + 1}/{self.epochs}", flush=True)
+            return
+        t0 = time.time()
+        for s in self.ds.srcs:  # the occupancy check reads one coarse level of each target: pull it first
+            for t in s["targets"].values():
+                arr = t["pyr"][data.occupancy_rung(t["pyr"])]
+                await self._fetch(arr, all_keys(arr), record=None)
+        regions = data.region_list(self.ds.srcs, patch=self.patch, region=self.kw["region"],
+                                   allowed=None if self.kw["rungs"] is True else set(self.kw["rungs"]),
+                                   boost=self.kw["rung_boost"], exclude=self.ds.ex,
+                                   log=lambda q: print("stream-plan " + q, flush=True))
+        assert regions, "the walk is empty: no region of any source has a target at any rung"
+        self.walk.build(regions, self.walk_fp)
+        n = self.kw["windows_per_region"]
+        print(f"stream-plan: walk over {len(regions)} regions ({len(regions) * n} windows per epoch, "
+              f"{self.epochs} epoch(s)) enumerated in {time.time() - t0:.1f} s", flush=True)
+
     def _meta(self, lines):
         return {"stores": lines, "stores_file": self.stores_file, "patch": [int(v) for v in self.patch],
                 "workers": self.W, "seed": self.seed, "ctx": list(self.ctx),
@@ -433,6 +473,8 @@ class Planner:
                 "aug": self.cfg, "dense_pow": self.kw["dense_pow"],
                 "require_targets": self.require_targets, "channels": self.ds.channels,
                 "region": self.kw["region"], "windows_per_region": self.kw["windows_per_region"],
+                "walk": self.walk_mode, "active_regions": self.K, "epochs": self.epochs,
+                "regions": len(self.walk.regions) if self.walk else 0,
                 "val": _val_meta(self.val),
                 "dirs": self.dirs, "whole": sorted(self.whole)}
 
@@ -590,13 +632,21 @@ class Planner:
                 await self.ensure_axis(ct)
             self.ds = data.Patches(stores=lines, exclude=[] if self.val is None else self.val, **self.kw)
             self.ds._open_rungs()
-            # the directory table has to exist before resume() can map the recorded keys back to paths
+            # the directory table has to exist before resume() can map the recorded keys back to paths;
+            # and `data.chunk_index`, read here before anything is fetched, is the record of what the
+            # pre-existing local mirror owns (never fetched, never evicted -- see `mirrored`)
             for s in self.ds.srcs:
                 for pyr in [s["ct_pyr"]] + [t["pyr"] for t in s["targets"].values()]:
                     for a in pyr.values():
                         self.path_of(a, (0, 0, 0))
+                        self.mirror[data.array_dir(a)] = data.chunk_index(a)[1]
+            nm = sum(1 for v in self.mirror.values() if v is None)
+            print(f"stream-plan: {nm}/{len(self.mirror)} levels already complete in the local mirror",
+                  flush=True)
             self.lines = lines
             self.resume()
+            if self.walk_mode:
+                await self.build_walk(lines)
             self.write_meta(lines)  # before the val prefetch: the trainer may already be opening the pyramids
             self.dirty = False
             t1 = time.time()
@@ -607,7 +657,9 @@ class Planner:
                       f"({self.f.bytes / 1e6:.1f} MB, {self.f.fetched} chunks so far)", flush=True)
             loop = asyncio.get_running_loop()
             self.stop = False
-            tasks = [asyncio.create_task(self.stream(w, loop)) for w in range(self.W)]
+            self.drained = [False] * self.K
+            tasks = ([asyncio.create_task(self.visit(j, loop)) for j in range(self.K)] if self.walk_mode
+                     else [asyncio.create_task(self.stream(w, loop)) for w in range(self.W)])
             tasks.append(asyncio.create_task(self.emitter(lines)))
             tasks.append(asyncio.create_task(self.keeper()))
             try:
@@ -644,8 +696,63 @@ class Planner:
             if desc is not None:
                 self.pending[w].append((desc, hook.keys, _json_state(rng.bit_generator.state)))
 
+    async def visit(self, j, loop):
+        """One of the K ACTIVE REGIONS. It takes the next region of the walk, draws that region's windows
+        into its own buffer, and is released -- free to take another region -- only once the emitter has
+        queued every one of them. All K regions stay resident while they are open, which is what keeps the
+        cache hit rate up while consecutive queue entries come from different regions."""
+        cap = max(4, self.ahead // self.K)
+        while not self.stop:
+            slot = self.active[j]
+            if slot is not None and slot["done"] and not slot["out"]:  # every window queued: let it go
+                self.active[j], slot = None, None
+                self.regions_done += 1
+            if slot is None:
+                got = self.walk.take(self.walk_fp)
+                if got is None:  # the walk is over
+                    self.drained[j] = True
+                    return
+                ordinal, reg = got
+                self.active[j] = slot = {"g": int(ordinal), "out": [], "done": False,
+                                         "rng": np.random.default_rng([self.seed, int(ordinal)]),
+                                         "st": self.ds.region_state(reg)}
+            if slot["done"] or self.full or len(slot["out"]) >= cap:
+                await asyncio.sleep(0.02)
+                continue
+            hook = Hook(self, loop)
+            desc = await asyncio.to_thread(_draw, self.ds, slot["rng"], hook, slot["st"])
+            if desc is not None:
+                desc["g"] = slot["g"]
+                slot["out"].append((desc, hook.keys))
+            st = slot["st"]
+            if st["left"] <= 0 or st["fails"] >= self.ds.region_fails:
+                slot["done"] = True
+
+    def next_slot(self):
+        """Round robin over the active regions: consecutive entries come from different regions."""
+        for d in range(self.K):
+            j = (self.rr + d) % self.K
+            s = self.active[j]
+            if s is not None and s["out"]:
+                self.rr = (j + 1) % self.K
+                return s
+        return None
+
+    def finish(self, lines):
+        """The walk is done. The last partial group of windows (fewer than one per replay stream) is never
+        written, so the queue ends on a stream boundary and a DDP run's ranks stop together."""
+        n, rec = self.index, {"windows": self.index, "dropped": len(self.group),
+                              "regions": self.regions_done, "epochs": self.epochs}
+        self.group = []
+        tmp = os.path.join(self.dir, EPOCH_DONE + ".tmp")
+        json.dump(rec, open(tmp, "w"))
+        os.replace(tmp, os.path.join(self.dir, EPOCH_DONE))
+        print(f"stream-plan: walk complete -- {self.regions_done} regions, {n} windows " + json.dumps(rec),
+              flush=True)
+        self.stop = True
+
     async def emitter(self, lines):
-        """Entry i goes to worker i % W, so the queue is the round robin the DataLoader will replay."""
+        """Entry i goes to stream i % W, so the queue is the round robin the DataLoader will replay."""
         t0, last, b0, n0 = time.time(), time.time(), self.f.bytes, self.f.fetched
         while not self.stop:
             if time.time() - last > self.report:
@@ -655,6 +762,20 @@ class Planner:
                 return
             if self.full:  # over --cache-gb, or --ahead windows in front of the trainer: wait for it
                 await asyncio.sleep(0.2)
+                continue
+            if self.walk_mode:
+                slot = self.next_slot()
+                if slot is None:
+                    if all(self.drained):
+                        return self.finish(lines)
+                    await asyncio.sleep(0.02)
+                    continue
+                self.group.append(slot["out"].pop(0))
+                if len(self.group) >= self.W:  # the queue only ever ends on a stream boundary
+                    for d, ks in self.group:
+                        self.emit(d, ks)
+                    self.group = []
+                    self.save_state()
                 continue
             w = self.index % self.W
             if not self.pending[w]:
@@ -673,8 +794,17 @@ class Planner:
                "GB_total": round(self.f.bytes / 1e9, 3), "absent": self.f.absent, "failed": self.f.failed,
                "evicted": self.evicted, "whole_MiB": round(sum(self.whole.values()) / 2 ** 20, 1),
                "requests": self.f.requests, "pinned": len(self.pin),
-               "hit_rate": round(self.f.have / max(self.f.have + self.f.fetched + self.f.absent, 1), 4),
+               "hit_rate": round((self.f.have + self.f.mirror) /
+                                 max(self.f.have + self.f.mirror + self.f.fetched + self.f.absent, 1), 4),
+               "mirror": self.f.mirror,
                "B_per_vox": round(self.f.bytes / max(self.index * int(np.prod(self.patch)), 1), 4)}
+        if self.walk:
+            rec.update(regions=self.regions_done, regions_left=len(self.walk.regions) - self.walk.i,
+                       regions_total=len(self.walk.regions), epoch=self.walk.epoch, active=self.K,
+                       region_MiB=round(self.f.bytes / max(self.regions_done, 1) / 2 ** 20, 1))
+            if self.regions_done >= self.K and self.K * self.f.bytes / self.regions_done > 0.5 * self.cache_max:
+                print(f"stream-plan: WARNING --cache-gb {self.cache_max / 2 ** 30:.0f} is small for "
+                      f"--active-regions {self.K} ({rec['region_MiB']} MiB fetched per region)", flush=True)
         print("stream-plan " + json.dumps(rec), flush=True)
         with open(os.path.join(self.dir, "plan.jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")

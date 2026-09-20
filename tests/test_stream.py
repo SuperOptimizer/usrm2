@@ -520,3 +520,171 @@ def test_a_multi_scroll_stores_file_gives_each_source_its_own_axis(tmp_path, mon
         assert s["umbilicus"] == data.umbilicus_path(sc)
     y0, y1 = float(np.mean(data.axis(srcs[0]["umbilicus"])[1])), float(np.mean(data.axis(srcs[1]["umbilicus"])[1]))
     assert y0 < y1 - 20, "the two scrolls must not share an axis"
+
+
+# ------------------------------------------------------------------ the no-repeat walk
+
+def walk_plan(tmp_path, ct, tg, queue, name="w.txt", workers=2, active_regions=3, windows_per_region=2, **kw):
+    S.plan(stores_file=stores(tmp_path, ct, tg, name), queue=str(queue), patch=P32, rungs={2, 3}, seed=0,
+           workers=workers, ahead=10 ** 6, cache_gb=10 ** 6, ctx=(1,), jobs=8, report=10 ** 6, val=None,
+           region=64, windows_per_region=windows_per_region, walk="once",
+           active_regions=active_regions, **kw)
+
+
+def queue_of(q):
+    return [json.loads(l) for l in open(pathlib.Path(q) / S.QUEUE)]
+
+
+def test_the_region_list_tiles_the_box_and_drops_the_air(tmp_path, monkeypatch):
+    """Every region is a shard-aligned tile of the target box, the tiles are disjoint and cover it, and a
+    tile whose target is all air is not in the list at all."""
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    import zarr
+    ct = ct_pyramid(tmp_path, base=256, nlev=4)
+    tg = pred_pyramid(tmp_path, base=256, nlev=4)
+    for l, n in ((0, 256), (1, 128), (2, 64), (3, 32)):  # only the first eighth of z carries any surface
+        v = np.zeros((n, n, n), np.uint8)
+        v[:max(n // 8, 1)] = 200
+        zarr.open(f"{tg}/{data.rung_um(2 + l):g}", mode="r+")[:] = v
+    data.CTX_CACHE.clear()
+    srcs = data.source_groups([f"{ct},{tg}"])
+    regs = data.region_list(srcs, patch=P32, region=64, allowed={2})
+    assert regs, "no region survived"
+    lo = np.array([r["lo"] for r in regs])
+    assert (lo % 32 == 0).all()                       # shard-aligned (32^3 chunks in the test pyramids)
+    assert len({tuple(q) for q in lo}) == len(regs)   # disjoint
+    assert (lo[:, 0] < 64).all(), "an all-air region was kept"
+    assert set(lo[:, 1]) == set(range(0, 256, 64)) and len(regs) == 1 * 4 * 4
+    assert abs(sum(r["w"] for r in regs) - 1.0) < 1e-9
+
+
+def test_the_walk_weights_honour_the_source_and_rung_mix(tmp_path, monkeypatch):
+    """Per (source, rung) the region weights add up to that source's volume share times the rung's
+    probability -- the mix `rung_probs` defines, spread over the regions of that rung."""
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir(), b.mkdir()
+    lines = [f"{ct_pyramid(a, base=256, nlev=4)},{pred_pyramid(a, base=256, nlev=4)}",
+             f"{ct_pyramid(b, base=128, nlev=3)},{pred_pyramid(b, base=128, nlev=3)}"]
+    data.CTX_CACHE.clear()
+    srcs = data.source_groups(lines)
+    regs = data.region_list(srcs, patch=P32, region=64)
+    sw = np.array([s["volume_um3"] for s in srcs], np.float64)
+    sw /= sw.sum()
+    got = {}
+    for r in regs:
+        got[(r["s"], r["k"])] = got.get((r["s"], r["k"]), 0.0) + r["w"]
+    for i, s in enumerate(srcs):
+        for k, p in data.rung_probs(s, P32).items():
+            assert abs(got[(i, k)] - sw[i] * p) < 1e-9
+
+
+def test_the_walk_order_is_a_weighted_shuffle_without_replacement():
+    w = np.array([0.5, 0.3, 0.15, 0.05])
+    n = 4000
+    firsts = np.bincount([int(data.walk_order(w, s)[0]) for s in range(n)], minlength=4) / n
+    assert np.abs(firsts - w).max() < 0.03, firsts   # P(first = i) = w_i exactly (Efraimidis-Spirakis)
+    for s in (0, 1, 2):
+        assert sorted(data.walk_order(w, s).tolist()) == [0, 1, 2, 3]  # every item, exactly once
+
+
+def test_the_walk_visits_every_region_exactly_once(tmp_path, origin, monkeypatch):
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    mct, mtg, _, _, _ = origin
+    q = tmp_path / "q"
+    walk_plan(tmp_path, mct, mtg, q)
+    recs = queue_of(q)
+    regs = [json.loads(l) for l in open(q / S.REGIONS)]
+    assert len(regs) > 8
+    gs = [r["g"] for r in recs]
+    # every region was visited (the last partial group of windows is dropped, so one region may be short)
+    assert len(set(gs)) >= len(regs) - 1 and set(gs) <= set(range(len(regs)))
+    assert all(gs.count(g) <= 2 for g in set(gs))  # at most --windows-per-region windows from each
+    first, last = {}, {}
+    for i, g in enumerate(gs):
+        first.setdefault(g, i)
+        last[g] = i
+    for g in set(gs):  # a region's windows are contiguous in the interleave: it is never re-opened
+        assert len([1 for h in gs[first[g]:last[g] + 1] if h == g]) == gs.count(g)
+    done = json.load(open(q / S.EPOCH_DONE))
+    assert done["regions"] == len(regs)
+    assert done["windows"] == len(recs) and len(recs) % 2 == 0  # the queue ends on a stream boundary
+
+
+def test_resuming_mid_walk_never_repeats_a_region(tmp_path, origin, monkeypatch):
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    mct, mtg, _, _, _ = origin
+    q = tmp_path / "q"
+    walk_plan(tmp_path, mct, mtg, q, limit=12)     # stop part way
+    half = [r["g"] for r in queue_of(q)]
+    assert half and not os.path.exists(q / S.EPOCH_DONE)
+    data.CTX_CACHE.clear(), data.CHUNK_INDEX.clear()
+    walk_plan(tmp_path, mct, mtg, q)               # a fresh planner picks the walk up
+    recs = queue_of(q)
+    gs = [r["g"] for r in recs]
+    assert gs[:len(half)] == half
+    rest = gs[len(half):]
+    assert not (set(rest) & set(half)), "a region was visited twice across the resume"
+    regs = [json.loads(l) for l in open(q / S.REGIONS)]
+    assert all(gs.count(g) <= 2 for g in set(gs)) and len(set(gs)) <= len(regs)
+
+
+def test_the_active_regions_are_interleaved_and_released_only_when_queued(tmp_path, origin, monkeypatch):
+    """K regions are open at once, their windows go out round robin, and a region is released (a new one
+    opened) only after every window of it has been queued."""
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    mct, mtg, _, _, _ = origin
+    q = tmp_path / "q"
+    walk_plan(tmp_path, mct, mtg, q, active_regions=3, windows_per_region=4)
+    gs = [r["g"] for r in queue_of(q)]
+    first, last = {}, {}
+    for i, g in enumerate(gs):
+        first.setdefault(g, i)
+        last[g] = i
+    open_now = [sum(1 for g in first if first[g] <= i <= last[g]) for i in range(len(gs))]
+    assert max(open_now) <= 3, f"more than --active-regions regions open at once: {max(open_now)}"
+    assert max(open_now) > 1, "the regions were not interleaved at all"
+    pairs = [1 for a, b in zip(gs, gs[1:]) if a != b]
+    assert len(pairs) > 0.5 * (len(gs) - 1), "consecutive entries mostly came from the same region"
+
+
+def test_the_trainer_stops_when_the_walk_is_done(tmp_path, origin, monkeypatch):
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    mct, mtg, _, _, _ = origin
+    q = tmp_path / "q"
+    walk_plan(tmp_path, mct, mtg, q, workers=1)
+    n = json.load(open(q / S.EPOCH_DONE))["windows"]
+    data.CTX_CACHE.clear(), data.CHUNK_INDEX.clear()
+    ds = data.Patches(patch=P32, stores=[f"{mct},{mtg}"], exclude=[], rungs={2, 3}, ctx=(1,), stream=str(q))
+    ds._open()
+    got = [int(item["idx"]) for item in ds]         # it ENDS instead of waiting for more
+    assert got == list(range(n))
+
+
+def test_a_mirrored_shard_is_a_hit_and_is_never_evicted(tmp_path, origin, monkeypatch, per_window):
+    """The local mirror is not the planner's buffer: what `mirror.json` says the mirror owns is never
+    fetched, never charged and never evicted."""
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    mct, mtg, _, oct_, _ = origin
+    shutil.copytree(oct_, mct)                       # the CT is mirrored here already, in full
+    for l in sorted(os.listdir(mct)):
+        if os.path.isdir(f"{mct}/{l}"):
+            json.dump({"complete": True}, open(f"{mct}/{l}/mirror.json", "w"))
+    before = {str(p) for p in pathlib.Path(mct).rglob("*") if p.is_file()}
+    q = tmp_path / "q"
+    run_plan(tmp_path, mct, mtg, q, limit=12, workers=1, ctx=(1,))
+    rec = [json.loads(l) for l in open(q / "plan.jsonl")][-1]
+    assert rec["mirror"] > 0 and rec["hit_rate"] > 0
+    recs = queue_of(q)
+    dirs = json.load(open(q / S.META))["dirs"]
+    assert recs and not any(dirs[di].startswith(mct) for r in recs for di, _ in r["c"]), \
+        "a mirrored shard was recorded as a buffered one"
+    pl = S.Planner(stores_file=stores(tmp_path, mct, mtg), queue=str(q), patch=P32, rungs={2, 3}, workers=1,
+                   ctx=(1,), cache_gb=0)
+    pl.qf = str(q / S.QUEUE)
+    pl.dirs, pl.dir_ix = dirs, {d: i for i, d in enumerate(dirs)}
+    pl.resume()
+    json.dump({"i": 10 ** 6, "margin": 0}, open(q / S.CONSUMED, "w"))
+    pl.evict()
+    assert {str(p) for p in pathlib.Path(mct).rglob("*") if p.is_file()} >= before
