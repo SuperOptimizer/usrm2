@@ -375,3 +375,28 @@ def test_predict_writes_the_rung_in_the_attrs(tmp_path, monkeypatch):
                   device="cpu", volcomp=False, rung=4)
     a = zarr.open(o, mode="r")
     assert a.attrs["rung"] == 4 and a.attrs["voxel_um"] == pytest.approx(9.6)
+
+
+def test_require_targets_skips_unpulled_windows(tmp_path, monkeypatch):
+    """A partially pulled export: with require_targets a window whose target shard is missing is never drawn."""
+    import shutil
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    ct = ct_pyramid(tmp_path)
+    tg = pred_pyramid(tmp_path)
+    lvl = tmp_path / "pred.zarr" / "2.4"
+    zs = sorted(lvl.glob("c/*"), key=lambda q: int(q.name))
+    for c in zs[len(zs) // 2:]:  # drop the upper half of the finest level's z chunk rows
+        shutil.rmtree(c)
+    data.CHUNK_INDEX.clear()
+    assert 0.0 < data.coverage(data.rungs(tg)[2]) < 1.0
+    kw = dict(patch=P32, stores=[f"{ct},{tg}"], exclude=[], rungs={2}, sym=False, air_keep=1.0, fg_keep=1.0, fg_min=0.0)
+    seen_empty = False
+    it = iter(data.Patches(**kw))
+    for _ in range(60):
+        _, t, _, _ = next(it)
+        seen_empty |= float(t.max()) == 0.0
+    assert seen_empty  # without the flag the missing shards read as zeros
+    it = iter(data.Patches(require_targets=True, **kw))
+    for _ in range(60):
+        _, t, _, _ = next(it)
+        assert float(t.max()) > 0.0

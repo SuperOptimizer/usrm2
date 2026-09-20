@@ -44,6 +44,7 @@ def main(argv=None):
                    "'ct_base,target_group[,...]' lines of whole-scroll pyramids")
     t.add_argument("--rung-boost", nargs="*", default=(), metavar="K=M", help="per-rung sampling multipliers, e.g. 2=2 11=0.5")
     t.add_argument("--val-rungs", default="2,3,4,6", help="rungs the held-out box is scored at")
+    t.add_argument("--require-targets", action="store_true", help="only draw windows whose target chunks are on disk (a partially pulled export)")
     t.add_argument("--aug", default="geo", help="augmentation preset (see aug.PRESETS)")
     t.add_argument("--no-radial", action="store_true", help="zero the radial channels 1..3")
     b = sub.add_parser("ablate", help="train one run per augmentation preset, sequentially")
@@ -182,7 +183,7 @@ def main(argv=None):
                 workers=a.workers, eval_every=a.eval_every, val_patches=a.val_patches, resume=a.resume,
                 aug=a.aug, no_radial=a.no_radial,
                 **({"rungs": parse_rungs(a.rungs), "rung_boost": parse_boost(a.rung_boost),
-                    "val_rungs": [int(q) for q in a.val_rungs.split(",")]} if a.rungs else {}),
+                    "val_rungs": [int(q) for q in a.val_rungs.split(",")], "require_targets": a.require_targets} if a.rungs else {}),
                 **{k: v for k, v in dict(stores=a.stores, stores_file=a.stores_file, val=a.val).items() if v})
     elif a.cmd == "ablate":
         from usrm2 import ablate

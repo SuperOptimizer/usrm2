@@ -465,7 +465,7 @@ class Patches(torch.utils.data.IterableDataset):
 
     def __init__(self, patch=128, ct=CT, stores=TRAIN, exclude=VAL, seed=0, air_keep=0.1, fg_min=0.05,
                  fg_keep=0.25, sym=True, aug=None, dense_pow=0.0, dense_ref=0.2, ctx=(), stores_file=None,
-                 recheck=200, rungs=None, rung_boost=None, channels=None):
+                 recheck=200, rungs=None, rung_boost=None, channels=None, require_targets=False):
         """dense_pow > 0 biases sampling towards sheet-dense patches: a patch whose target mean m is below
         dense_ref is kept with probability (m / dense_ref) ** dense_pow (crushed windings are where students fail).
         stores_file: instead of `stores`, a text file with one comma-joined group per line that is re-read
@@ -498,6 +498,7 @@ class Patches(torch.utils.data.IterableDataset):
         self.rungs, self.rung_boost, self.channels = rungs, dict(rung_boost or {}), channels
         self.norm, self.umbilicus = NORM, UMBILICUS  # module state the (spawned) workers must inherit explicitly
         self.stores_file, self.recheck, self.file_mtime = stores_file, recheck, None
+        self.require_targets = require_targets  # only draw windows whose target chunks are on disk (a partial pull)
         if stores_file:
             stores = self.read_groups()
         self.patch, self.ct_path, self.paths, self.seed = shape3(patch), ct, [str(s).split(",") for s in stores], seed
@@ -565,6 +566,12 @@ class Patches(torch.utils.data.IterableDataset):
         e = 1 << (k - csrc)
         if not covered(cpyr[csrc], lo * e, p * e):  # a partially mirrored level (level 0 of the desk's CT)
             return None
+        if self.require_targets:  # a partially pulled export: an absent shard is "not yet exported", not air
+            for t in s["targets"].values():
+                tsrc = max(r for r in t["pyr"] if r <= k)
+                te = 1 << (k - tsrc)
+                if not covered(t["pyr"][tsrc], lo * te, p * te):
+                    return None
         bl = self.aug.get("blank")
         if bl and rng.random() < bl["p"]:  # an all-air patch (CT 0 = air) with target 0
             ct = np.zeros(tuple(p), np.uint8)
