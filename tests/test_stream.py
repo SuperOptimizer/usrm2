@@ -420,3 +420,103 @@ def test_whole_shards_are_cached_and_later_windows_hit_them(tmp_path, sharded_or
     rec = [json.loads(l) for l in open(q / "plan.jsonl")][-1]
     assert rec["hit_rate"] > 0.3, f"shards are not being reused: {rec['hit_rate']}"
     assert rec["B_per_vox"] > 0
+
+
+# ------------------------------------------------------------------ region mode
+
+def test_region_mode_keeps_the_windows_inside_one_region(tmp_path, origin, monkeypatch):
+    """`--region R --windows-per-region N`: N windows out of one snapped RxRxR region of one source at one
+    rung, then the next region -- which is what makes a shard pay for itself."""
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    mct, mtg, _, oct_, otg = origin
+    ds = data.Patches(patch=P32, stores=[f"{oct_},{otg}"], exclude=[], rungs={2, 3}, sym=False,
+                      air_keep=1.0, fg_keep=1.0, region=64, windows_per_region=4)
+    ds._open_rungs()
+    rng, st, got = np.random.default_rng(0), ds.region_state(), []
+    while len(got) < 12:
+        d = ds._rung_draw(rng, build=False, st=st)[0]
+        if d is not None:
+            got.append((d["s"], d["k"], np.array(d["lo"]), tuple(st["lo"]), tuple(st["size"])))
+    for _, k, lo, rlo, rsz in got:
+        assert np.all(lo >= np.array(rlo)) and np.all(lo <= np.array(rlo) + np.array(rsz))
+        assert tuple(int(v) % 32 for v in rlo) == (0, 0, 0)  # snapped to the level's chunk grid
+    # consecutive windows share a region: far fewer distinct regions than windows
+    regions = {(g[0], g[1], g[3]) for g in got}
+    assert len(regions) <= 4 < len(got)
+
+
+def test_region_mode_lifts_the_cache_hit_rate(tmp_path, sharded_origin, monkeypatch, per_window):
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    mct, mtg, _, _ = sharded_origin
+    hits = {}
+    for name, kw in (("plain", {}), ("region", dict(region=64, windows_per_region=8))):
+        q = tmp_path / name
+        S.plan(stores_file=stores(tmp_path, mct, mtg, f"s_{name}.txt"), queue=str(q), patch=P32,
+               rungs={2, 3}, seed=0, workers=1, ahead=10 ** 6, cache_gb=10 ** 6, ctx=(1,), limit=24,
+               jobs=8, report=10 ** 6, val=None, **kw)
+        data.CTX_CACHE.clear(), data.CHUNK_INDEX.clear()
+        hits[name] = [json.loads(l) for l in open(q / "plan.jsonl")][-1]
+    assert hits["region"]["hit_rate"] > hits["plain"]["hit_rate"]
+    assert hits["region"]["B_per_vox"] < hits["plain"]["B_per_vox"]
+
+
+# ------------------------------------------------------------------ per-scroll axis
+
+def test_umbilicus_is_derived_per_scroll_and_parsed_in_both_formats(tmp_path, monkeypatch):
+    from usrm2 import umbilicus as U
+    monkeypatch.setattr(data, "LOCAL_VOLUMES", str(tmp_path / "m"))
+    monkeypatch.setattr(data, "UMBILICUS_DIR", str(tmp_path / "umb"))
+    root = pathlib.Path(data.LOCAL_VOLUMES) / "PHerc0139"
+    root.mkdir(parents=True)
+    ct = ct_pyramid(root, base=128, nlev=4, value=lambda l: 0)   # all air, then a blob per z slice
+    a = data.rungs(ct)[2]
+    v = np.zeros((128, 128, 128), np.uint8)
+    v[:, 40:56, 72:88] = 200          # a "scroll" off centre: the centroid must find it
+    import zarr
+    zarr.open(ct + "/0", mode="r+")[:] = v
+    for l in (1, 2, 3):
+        n = 128 >> l
+        w = np.zeros((n, n, n), np.uint8)
+        w[:, 40 >> l:56 >> l, 72 >> l:88 >> l] = 200
+        zarr.open(f"{ct}/{l}", mode="r+")[:] = w
+    data.CTX_CACHE.clear()
+    assert data.scroll_of(ct) == "PHerc0139"
+    p = U.ensure(ct, rung=4)  # rung 4 = level 2 of this 2.400 um pyramid
+    assert p == data.umbilicus_path("PHerc0139") and os.path.exists(p)
+    ax = data.axis(p)
+    assert ax.shape[0] == 3 and ax.shape[1] > 2
+    assert abs(float(np.mean(ax[1])) - 47.5) < 3 and abs(float(np.mean(ax[2])) - 79.5) < 3  # rung-2 voxels
+
+    # both published formats parse to the same points
+    j = json.dumps({"control_points": [{"z": 1, "y": 2, "x": 3}, {"z": 4, "y": 5, "x": 6}]})
+    assert U.parse(j) == [(1.0, 2.0, 3.0), (4.0, 5.0, 6.0)]
+    assert U.parse("4, 3, 2\n7, 6, 5\n") == [(1.0, 2.0, 3.0), (4.0, 5.0, 6.0)]  # volpkg: x, y, z, 1-based
+
+
+def test_a_multi_scroll_stores_file_gives_each_source_its_own_axis(tmp_path, monkeypatch):
+    from usrm2 import umbilicus as U
+    monkeypatch.setattr(data, "LOCAL_VOLUMES", str(tmp_path / "m"))
+    monkeypatch.setattr(data, "UMBILICUS_DIR", str(tmp_path / "umb"))
+    monkeypatch.setattr(data, "UMBILICUS", str(tmp_path / "paris.json"))
+    (tmp_path / "paris.json").write_text(json.dumps({"control_points": [{"z": 0, "y": 1, "x": 1}]}))
+    lines = []
+    for sc, cy in (("PHerc0139", 8), ("PHerc0332", 44)):
+        root = pathlib.Path(data.LOCAL_VOLUMES) / sc
+        root.mkdir(parents=True)
+        ct = ct_pyramid(root, base=64, nlev=2, value=lambda l: 0)
+        import zarr
+        for l in (0, 1):
+            n = 64 >> l
+            w = np.zeros((n, n, n), np.uint8)
+            w[:, cy >> l:(cy + 8) >> l, 8 >> l:16 >> l] = 200
+            zarr.open(f"{ct}/{l}", mode="r+")[:] = w
+        data.CTX_CACHE.clear()
+        U.ensure(ct, rung=3)
+        lines.append(f"{ct},{pred_pyramid(root, name='p.zarr', base=64, nlev=2)}")
+    data.CTX_CACHE.clear()
+    srcs = data.source_groups(lines)
+    assert [data.scroll_of(s["ct"]) for s in srcs] == ["PHerc0139", "PHerc0332"]
+    for s, sc in zip(srcs, ("PHerc0139", "PHerc0332")):
+        assert s["umbilicus"] == data.umbilicus_path(sc)
+    y0, y1 = float(np.mean(data.axis(srcs[0]["umbilicus"])[1])), float(np.mean(data.axis(srcs[1]["umbilicus"])[1]))
+    assert y0 < y1 - 20, "the two scrolls must not share an axis"

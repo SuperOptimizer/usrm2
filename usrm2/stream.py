@@ -33,7 +33,7 @@ import time
 
 import numpy as np
 
-from usrm2 import data
+from usrm2 import data, umbilicus as U
 
 META, QUEUE, STATE, PROGRESS, CONSUMED = "meta.json", "queue.jsonl", "state.json", "progress", "consumed"
 
@@ -226,7 +226,8 @@ class Planner:
 
     def __init__(self, stores_file, queue, patch=256, rungs=True, rung_boost=None, seed=0, workers=4,
                  ahead=400, cache_gb=20.0, ctx=(), aug="geo", dense_pow=0.0, require_targets=False,
-                 val=None, jobs=48, report=30.0, limit=0, val_rungs=data.VAL_RUNGS, val_patches=32):
+                 val=None, jobs=48, report=30.0, limit=0, val_rungs=data.VAL_RUNGS, val_patches=32,
+                 region=0, windows_per_region=64):
         from usrm2 import aug as A
         self.dir = str(queue)
         self.stores_file, self.seed, self.W, self.ahead = str(stores_file), int(seed), int(workers), int(ahead)
@@ -235,9 +236,11 @@ class Planner:
         self.cfg = A.get(aug)
         self.kw = dict(patch=patch, rungs=rungs, rung_boost=dict(rung_boost or {}), ctx=tuple(ctx),
                        aug=self.cfg, sym=self.cfg.get("sym", True), dense_pow=dense_pow,
-                       require_targets=bool(require_targets), seed=int(seed))
+                       require_targets=bool(require_targets), seed=int(seed),
+                       region=int(region or 0), windows_per_region=int(windows_per_region))
         self.val, self.val_rungs, self.val_patches = val, tuple(val_rungs), int(val_patches)
         self.pin = set()   # the validation grid's chunks: fetched once, never evicted
+        self.axis_rung = 9  # the rung a missing scroll axis is derived from (307 um: a few MB per scroll)
         self.dirs, self.dir_ix = [], {}          # the level directories entries refer to, by index
         self.whole, self.whole_any, self.whole_lock = {}, {}, {}  # level dir -> bytes kept forever / served / guard
         self.ref, self.size = {}, {}             # chunk path -> last referencing queue index / its size
@@ -322,6 +325,7 @@ class Planner:
                 "rung_boost": {str(k): v for k, v in self.kw["rung_boost"].items()},
                 "aug": self.cfg, "dense_pow": self.kw["dense_pow"],
                 "require_targets": self.require_targets, "channels": self.ds.channels,
+                "region": self.kw["region"], "windows_per_region": self.kw["windows_per_region"],
                 "val": _val_meta(self.val),
                 "dirs": self.dirs, "whole": sorted(self.whole)}
 
@@ -378,6 +382,26 @@ class Planner:
             self.cache_bytes -= self.size.pop(p, 0)
             self.ref.pop(p, None)
             self.evicted += 1
+
+    async def ensure_axis(self, ct):
+        """Every scroll needs its OWN axis for the radial channel. A published umbilicus is used when the
+        origin serves one; otherwise it is derived from the scroll's own CT, which means pulling one coarse
+        level whole first (rung 9 of Paris 4 is 2.3 MB)."""
+        sc = data.scroll_of(ct)
+        if not sc or os.path.exists(data.umbilicus_path(sc)):
+            return
+        t1 = time.time()
+        try:
+            pyr = data.rungs(ct)
+            k = max(r for r in pyr if r <= self.axis_rung)
+            arr = pyr[k]
+            await asyncio.gather(*[self.f.get(f"{data.array_dir(arr)}/{chunk_key(arr, ix)}")
+                                   for ix in all_keys(arr)])
+            data.CTX_CACHE.clear()
+            u = U.ensure(ct, scroll=sc, urls=U.published_urls(ct, sc), rung=self.axis_rung)
+            print(f"stream-plan: axis for {sc} -> {u} ({time.time() - t1:.1f} s)", flush=True)
+        except Exception as e:  # noqa: BLE001  (fall back to the configured default and say so)
+            print(f"stream-plan: no axis for {sc} ({e!r}); falling back to {data.UMBILICUS}", flush=True)
 
     async def prefetch_val(self):
         """The held-out box, at every rung `evaluate` scores it, read from the same pyramids as training
@@ -455,6 +479,8 @@ class Planner:
             for b in bases:
                 await fetch_group_meta(self.f, data.pyramid_base(b))
             print(f"stream-plan: {len(bases)} pyramids, metadata in {time.time() - t0:.1f} s", flush=True)
+            for ct in dict.fromkeys(l.split(",")[0].strip() for l in lines):
+                await self.ensure_axis(ct)
             self.ds = data.Patches(stores=lines, exclude=[] if self.val is None else self.val, **self.kw)
             self.ds._open_rungs()
             # the directory table has to exist before resume() can map the recorded keys back to paths
@@ -501,12 +527,13 @@ class Planner:
         if self.states[w]:
             rng.bit_generator.state = _unjson_state(self.states[w])
         hi = max(4, self.ahead // self.W)
+        st = self.ds.region_state()
         while not self.stop:
             if self.full or len(self.pending[w]) >= hi:
                 await asyncio.sleep(0.05)
                 continue
             hook = Hook(self, loop)
-            desc = await asyncio.to_thread(_draw, self.ds, rng, hook)
+            desc = await asyncio.to_thread(_draw, self.ds, rng, hook, st)
             if desc is not None:
                 self.pending[w].append((desc, hook.keys, _json_state(rng.bit_generator.state)))
 
@@ -554,9 +581,9 @@ def _val_meta(val):
         return str(val)
 
 
-def _draw(ds, rng, hook):
+def _draw(ds, rng, hook, st):
     """The sampler itself, run in a thread (its fetches go back to the event loop through the hook)."""
-    return ds._rung_draw(rng, hook=hook, build=False)[0]
+    return ds._rung_draw(rng, hook=hook, build=False, st=st)[0]
 
 
 def _json_state(st):

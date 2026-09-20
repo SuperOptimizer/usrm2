@@ -48,6 +48,9 @@ def main(argv=None):
     t.add_argument("--require-targets", action="store_true", help="only draw windows whose target chunks are on disk (a partially pulled export)")
     t.add_argument("--aug", default="geo", help="augmentation preset (see aug.PRESETS)")
     t.add_argument("--no-radial", action="store_true", help="zero the radial channels 1..3")
+    t.add_argument("--region", type=int, default=0, help="region mode: visit one REGION^3 region of one "
+                   "source at one rung, take --windows-per-region windows inside it, then move on")
+    t.add_argument("--windows-per-region", type=int, default=64)
     t.add_argument("--stream", default=None, help="replay a `usrm2 stream-plan` queue directory instead of "
                    "sampling: the windows come from the rolling local buffer the planner fills")
     sp = sub.add_parser("stream-plan", help="plan and stream the training windows into a rolling disk buffer "
@@ -68,6 +71,8 @@ def main(argv=None):
     sp.add_argument("--val", nargs="+", default=None, help="held-out box(es), excluded exactly as in training")
     sp.add_argument("--jobs", type=int, default=48, help="concurrent HTTP requests")
     sp.add_argument("--report", type=float, default=30.0, help="seconds between plan.jsonl reports")
+    sp.add_argument("--region", type=int, default=0, help="region mode (see `train --region`)")
+    sp.add_argument("--windows-per-region", type=int, default=64)
     sp.add_argument("--val-rungs", default="2,3,4,6", help="rungs the held-out box is scored at (prefetched and pinned)")
     sp.add_argument("--val-patches", type=int, default=32)
     sp.add_argument("--limit", type=int, default=0, help="stop after this many queued windows (0 = forever)")
@@ -106,6 +111,12 @@ def main(argv=None):
     p.add_argument("--head", default="0", help="head index of a multi-teacher student, or mean / prod / max")
     p.add_argument("--radial-sign", type=float, default=1.0, help="-1 negates the radial vector (the student then predicts the verso face)")
     p.add_argument("--lut-to", nargs="*", default=(), metavar="REF", help="also average with the input histogram-matched to REF volumes")
+    ub = sub.add_parser("umbilicus", help="put a scroll's axis where the loader looks for it "
+                        "(a published file if there is one, otherwise derived from the scroll's own CT)")
+    ub.add_argument("ct_base", nargs="+", help="CT pyramid group(s), or a stores file with --stores-file")
+    ub.add_argument("--stores-file", action="store_true", help="the arguments are stores files")
+    ub.add_argument("--rung", type=int, default=7, help="the rung the axis is derived from (76.8 um)")
+    ub.add_argument("--force", action="store_true")
     rm = sub.add_parser("rung-mix", help="print the rung sampling mix of a stores file and the local CT coverage")
     rm.add_argument("stores_file")
     rm.add_argument("--patch", type=int, nargs="+", default=[256])
@@ -218,15 +229,27 @@ def main(argv=None):
                 workers=a.workers, eval_every=a.eval_every, val_patches=a.val_patches, resume=a.resume,
                 aug=a.aug, no_radial=a.no_radial,
                 **({"rungs": parse_rungs(a.rungs), "rung_boost": parse_boost(a.rung_boost),
-                    "val_rungs": [int(q) for q in a.val_rungs.split(",")], "require_targets": a.require_targets} if a.rungs else {}),
+                    "val_rungs": [int(q) for q in a.val_rungs.split(",")], "require_targets": a.require_targets,
+                    "region": a.region, "windows_per_region": a.windows_per_region} if a.rungs else {}),
                 **{k: v for k, v in dict(stores=a.stores, stores_file=a.stores_file, val=a.val).items() if v})
+    elif a.cmd == "umbilicus":
+        from usrm2 import umbilicus as U
+        bases = []
+        for q in a.ct_base:
+            if a.stores_file:
+                bases += [l.split(",")[0].strip() for l in open(q) if l.strip() and not l.startswith("#")]
+            else:
+                bases.append(q)
+        for b in dict.fromkeys(bases):
+            print(b, "->", U.ensure(b, urls=U.published_urls(b), rung=a.rung, force=a.force), flush=True)
     elif a.cmd == "stream-plan":
         from usrm2 import stream as S
         S.plan(stores_file=a.stores_file, queue=a.queue, patch=a.patch if len(a.patch) > 1 else a.patch[0],
                rungs=parse_rungs(a.rungs), rung_boost=parse_boost(a.rung_boost), seed=a.seed, workers=a.workers,
                ahead=a.ahead, cache_gb=a.cache_gb, ctx=parse_ctx(a.ctx), aug=a.aug, dense_pow=a.dense_pow,
                require_targets=a.require_targets, val=a.val, jobs=a.jobs, report=a.report, limit=a.limit,
-               val_rungs=[int(q) for q in a.val_rungs.split(",")], val_patches=a.val_patches)
+               val_rungs=[int(q) for q in a.val_rungs.split(",")], val_patches=a.val_patches,
+               region=a.region, windows_per_region=a.windows_per_region)
     elif a.cmd == "ablate":
         from usrm2 import ablate
         ablate.sweep(a.out_dir, a.presets.split(","), size=a.size, steps=a.steps, patch=a.patch,

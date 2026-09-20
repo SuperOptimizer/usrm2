@@ -58,6 +58,24 @@ def remote(path):
     return f"{STREAM_VOLUMES}/{scroll}/volumes/{rest}"
 
 
+UMBILICUS_DIR = _os.environ.get("USRM2_UMBILICUS_DIR", "/vesuvius/usrm/umbilicus")
+
+
+def scroll_of(path):
+    """The scroll a mirror path or origin URL belongs to ('.../volcomp/PHerc0139/...' -> 'PHerc0139')."""
+    p = str(path)
+    if "/volcomp/" in p:
+        return p.split("/volcomp/", 1)[1].split("/", 1)[0]
+    if p.startswith(LOCAL_VOLUMES + "/"):
+        return p[len(LOCAL_VOLUMES) + 1:].split("/", 1)[0]
+    return None
+
+
+def umbilicus_path(scroll):
+    """Where this machine keeps a scroll's axis (usrm2.umbilicus writes it there)."""
+    return f"{UMBILICUS_DIR}/{scroll}/umbilicus-full-resolution.json"
+
+
 def open_zarr(path):
     import zarr
     try:
@@ -281,6 +299,17 @@ def group_meta(base):
     return None, {}
 
 
+def group_native_um(at):
+    """The native voxel size a pyramid group's attributes declare, or None. The exported prediction groups
+    carry it as `volcomp.rung_voxel_size_um` (Paris 4, resampled onto the ladder) or, for the scrolls
+    exported on their native grid, `native_voxel_size_um` / `volcomp.native_voxel_size_um`."""
+    v = (at.get("volcomp") or {})
+    for q in (v.get("rung_voxel_size_um"), v.get("native_voxel_size_um"), at.get("native_voxel_size_um")):
+        if q:
+            return float(q)
+    return None
+
+
 def rungs(base):
     """{rung: zarr array} of a pyramid group (a level path such as '.../x.zarr/0' names its group).
     Levels named by voxel size ('2.4', '1228.8': the exported prediction groups) are placed by that size;
@@ -293,7 +322,7 @@ def rungs(base):
     ms, at = group_meta(base)
     names = [str(d["path"]) for d in ms["datasets"]] if ms else []
     names += [d for d in sorted(os.listdir(base)) if d not in names]  # levels built locally after the export (6-9)
-    nat = float((at.get("volcomp") or {}).get("rung_voxel_size_um") or native_um(base))
+    nat = float(group_native_um(at) or native_um(base))
     out = {}
     for n in names:
         if not re.fullmatch(r"[0-9]+(\.[0-9]+)?", n) or not os.path.isdir(f"{base}/{n}"):
@@ -318,7 +347,7 @@ def base_rung(path):
         if "." in last:
             return um_rung(float(last))
         ms, at = group_meta(base)
-        return um_rung(float((at.get("volcomp") or {}).get("rung_voxel_size_um") or native_um(base))) + int(last)
+        return um_rung(float(group_native_um(at) or native_um(base))) + int(last)
     return min(pyr)
 
 
@@ -603,7 +632,12 @@ def source_groups(lines):
                                   "box": (bx[0], bx[1]) if bx else None}
             umb = umb or at.get("umbilicus")
         src["native"] = min(t["native"] for t in src["targets"].values())
-        src["umbilicus"] = umb or group_attrs(parts[0]).get("umbilicus") or UMBILICUS
+        # a multi-scroll stores file must never fall back to another scroll's axis: the source's own
+        # scroll directory comes first, and the configured default only serves a path without a scroll
+        sc = scroll_of(parts[0])
+        own = umbilicus_path(sc) if sc else None
+        src["umbilicus"] = (umb or group_attrs(parts[0]).get("umbilicus")
+                            or (own if own and os.path.exists(own) else UMBILICUS))
         src["voxels"] = float(np.prod(target_box(next(iter(src["targets"].values())), src["native"])[1]))
         out.append(src)
     return out
@@ -632,7 +666,8 @@ class Patches(torch.utils.data.IterableDataset):
 
     def __init__(self, patch=128, ct=CT, stores=TRAIN, exclude=VAL, seed=0, air_keep=0.1, fg_min=0.05,
                  fg_keep=0.25, sym=True, aug=None, dense_pow=0.0, dense_ref=0.2, ctx=(), stores_file=None,
-                 recheck=200, rungs=None, rung_boost=None, channels=None, require_targets=False, stream=None):
+                 recheck=200, rungs=None, rung_boost=None, channels=None, require_targets=False, stream=None,
+                 region=0, windows_per_region=64, region_fails=0):
         """dense_pow > 0 biases sampling towards sheet-dense patches: a patch whose target mean m is below
         dense_ref is kept with probability (m / dense_ref) ** dense_pow (crushed windings are where students fail).
         stores_file: instead of `stores`, a text file with one comma-joined group per line that is re-read
@@ -670,6 +705,11 @@ class Patches(torch.utils.data.IterableDataset):
         train.py logs as `stream_wait_ms`."""
         super().__init__()
         self.stream = None if stream is None else str(stream)
+        # REGION MODE: visit one 1024^3 region of one source at one rung, draw `windows_per_region` windows
+        # inside it, then move on. The region is snapped to the shard grid of the level the CT is read from,
+        # so a visit touches one shard footprint per level and the buffer serves the whole visit.
+        self.region, self.windows_per_region = int(region or 0), int(windows_per_region)
+        self.region_fails = int(region_fails or 8 * max(self.windows_per_region, 1))
         self.rungs, self.rung_boost, self.channels = rungs, dict(rung_boost or {}), channels
         self.norm, self.umbilicus = NORM, UMBILICUS  # module state the (spawned) workers must inherit explicitly
         self.stores_file, self.recheck, self.file_mtime = stores_file, recheck, None
@@ -721,11 +761,39 @@ class Patches(torch.utils.data.IterableDataset):
                    else val_box(e) for e in self.exclude]  # (origin, size) at rung 2
         self.arrs = self.srcs
 
-    def _rung_sample(self, rng):
-        """One compact sample (see `rung_item`), or None when the corner is rejected."""
-        return self._rung_draw(rng)[1]
+    def region_state(self):
+        """Per-iterator region-visit state. It cannot live on the dataset: the stream planner drives one
+        dataset from several threads, one rng stream each, and each stream visits its own region."""
+        return {"left": 0, "fails": 0}
 
-    def _rung_draw(self, rng, hook=None, build=True):
+    def _rung_sample(self, rng, st=None):
+        """One compact sample (see `rung_item`), or None when the corner is rejected."""
+        return self._rung_draw(rng, st=st)[1]
+
+    def region_grid(self, s, k):
+        """The shard size, in rung-k voxels, of the level the CT is read from at rung k: what a region is
+        snapped to so that one region is one shard footprint."""
+        cpyr = s["ct_pyr"]
+        csrc = max(r for r in cpyr if r <= k)
+        g = np.array(getattr(cpyr[csrc], "shards", None) or cpyr[csrc].chunks, np.int64)[-3:]
+        return np.maximum(g >> (k - csrc), 1)
+
+    def new_region(self, rng, st):
+        """Pick the next (source, rung, 1024^3 region) to visit. One rng draw per quantity, as always."""
+        i = rng.choice(len(self.srcs), p=self.w)
+        s = self.srcs[i]
+        ks, pk = list(s["probs"]), np.array(list(s["probs"].values()))
+        k = int(rng.choice(ks, p=pk))
+        blo, bs = target_box(next(iter(s["targets"].values())), k)
+        size = np.minimum(shape3(self.region), np.maximum(bs, self.patch))
+        hi = np.maximum(blo + bs - size, blo)
+        lo = rng.integers(np.minimum(blo, hi), hi + 1)
+        g = self.region_grid(s, k)
+        lo = np.maximum((lo // g) * g, 0)  # snapped: the region is one shard footprint at this rung
+        st.update(i=int(i), k=k, lo=lo, size=size, left=self.windows_per_region, fails=0)
+        return st
+
+    def _rung_draw(self, rng, hook=None, build=True, st=None):
         """Draw one candidate window, apply the rejection rules and (with `build`) read it.
         Returns (descriptor, sample); (None, None) when the window is rejected. The descriptor is what the
         stream queue stores: source index, rung, corner, cube symmetry, the blank-patch flag and the raw-aug
@@ -736,14 +804,23 @@ class Patches(torch.utils.data.IterableDataset):
         a key the origin does not serve is air). With build=False the accepted window is not turned into a
         sample -- the planner only needs the descriptor and the fetches."""
         p = self.patch
-        i = rng.choice(len(self.srcs), p=self.w)
-        s = self.srcs[i]
-        ks, pk = list(s["probs"]), np.array(list(s["probs"].values()))
-        k = int(rng.choice(ks, p=pk))
-        t0 = next(iter(s["targets"].values()))
-        blo, bs = target_box(t0, k)
-        lo_min, lo_max = np.minimum(blo, blo + bs - p), np.maximum(blo, blo + bs - p)
-        lo = rng.integers(lo_min, lo_max + 1)
+        if self.region:  # region mode: the windows of one visit come from one 1024^3 region
+            st = self.region_state() if st is None else st
+            if st.get("left", 0) <= 0 or st.get("fails", 0) >= self.region_fails:
+                self.new_region(rng, st)
+            i, k, s = st["i"], st["k"], self.srcs[st["i"]]
+            st["fails"] += 1
+            hi = np.maximum(st["lo"] + st["size"] - p, st["lo"])
+            lo = rng.integers(np.minimum(st["lo"], hi), hi + 1)
+        else:
+            i = rng.choice(len(self.srcs), p=self.w)
+            s = self.srcs[i]
+            ks, pk = list(s["probs"]), np.array(list(s["probs"].values()))
+            k = int(rng.choice(ks, p=pk))
+            t0 = next(iter(s["targets"].values()))
+            blo, bs = target_box(t0, k)
+            lo_min, lo_max = np.minimum(blo, blo + bs - p), np.maximum(blo, blo + bs - p)
+            lo = rng.integers(lo_min, lo_max + 1)
         for o, sz in self.ex:  # the held-out box, given at rung 2
             d = k - 2
             eo, es = (np.array(o) >> d, np.maximum(np.array(sz) >> d, 1)) if d >= 0 else (np.array(o) << -d, np.array(sz) << -d)
@@ -783,6 +860,8 @@ class Patches(torch.utils.data.IterableDataset):
             prm = raw_params(rng, self.aug)
             ct = raw_apply(ct, prm)
         sym = int(draw_sym(rng, tuple(p))) if self.sym else 0  # applied on the GPU (usrm2.prep), not here
+        if self.region and st is not None:
+            st["left"], st["fails"] = st.get("left", 0) - 1, 0  # an accepted window ends the failure run
         desc = {"s": int(i), "k": k, "lo": [int(v) for v in lo], "y": sym, "b": int(blank), "r": prm}
         if hook is not None and self.ctx:
             hook.ctx(s, k, lo)
@@ -920,6 +999,7 @@ class Patches(torch.utils.data.IterableDataset):
         info = torch.utils.data.get_worker_info()
         rng = np.random.default_rng(self.seed + 1000 * (info.id if info else 0))
         p = self.patch
+        rst = self.region_state()
         rejected, served = 0, 0
         while True:
             assert rejected < 10000, "no acceptable patch in 10000 draws (stores all air, or all inside the val box?)"
@@ -930,7 +1010,7 @@ class Patches(torch.utils.data.IterableDataset):
                 print(f"stores file changed: {n0} -> {len(self.paths)} groups", flush=True)
                 served += 1
             if self.rungs is not None:
-                got = self._rung_sample(rng)
+                got = self._rung_sample(rng, st=rst)
                 if got is None:
                     continue
                 rejected, served = 0, served + 1
