@@ -403,8 +403,20 @@ class Planner:
                             add[i] = blob[o - a:o - a + ln]
             sz = await asyncio.to_thread(write_shard, path, spec, idx, payload, add)
             self.f.fetched += len(add)
-            self.size[path] = sz
+            self.charge(path, sz)
             return bool(add) or bool((idx[:, 0] != EMPTY).any())
+
+    def charge(self, path, sz=None):
+        """Book a buffered object against the cache budget. Every fetched shard is booked, including the
+        ones a REJECTED candidate pulled: those are referenced by no queue entry (ref -1) and are the first
+        thing eviction takes, but they are on the disk and the budget has to see them."""
+        if sz is None:
+            sz = os.path.getsize(path) if os.path.exists(path) else 0
+        self.cache_bytes += sz - self.size.get(path, 0)
+        self.size[path] = sz
+        if path not in self.pin:
+            self.ref.setdefault(path, -1)
+        return sz
 
     async def _need(self, hook, pyr, k, lo, record=True, pin=False):
         """Fetch what one `read_rung` will touch. Returns False when the origin served none of it."""
@@ -428,7 +440,11 @@ class Planner:
             for (di, key, q), (st, _) in zip(paths, res):
                 if st in ("have", "new"):
                     got = True
-                    self.pin.add(q) if pin else (record and hook.keys.append((di, key)))
+                    self.charge(q)
+                    if pin:
+                        self.pin.add(q), self.ref.pop(q, None)
+                    elif record:
+                        hook.keys.append((di, key))
             return got
         parts = shard_parts(arr, a, b, spec)
         ref = [self.path_of(arr, ix) for ix in parts]
@@ -439,7 +455,10 @@ class Planner:
             if ok is None:
                 continue
             got = got or bool(ok)
-            self.pin.add(q) if pin else (record and hook.keys.append((di, key)))
+            if pin:
+                self.pin.add(q), self.ref.pop(q, None)
+            elif record:
+                hook.keys.append((di, key))
         return got
 
     async def fetch_data(self, hook, s, k, lo):
@@ -496,12 +515,7 @@ class Planner:
             p = f"{self.dirs[di]}/{key}"
             if p in self.pin:  # a validation chunk: kept for the whole run
                 continue
-            try:
-                sz = os.path.getsize(p)
-            except OSError:
-                sz = 0
-            self.cache_bytes += sz - self.size.get(p, 0)  # a partial shard grows as windows add inner chunks
-            self.size[p] = sz
+            self.charge(p)  # a partial shard grows as later windows add inner chunks to it
             self.ref[p] = self.index
         self.index += 1
 
@@ -579,9 +593,10 @@ class Planner:
             for di, key in rec["c"]:
                 if di < len(self.dirs):
                     self.ref[f"{self.dirs[di]}/{key}"] = rec["i"]
-        for q in self.ref:
+        for q in list(self.ref):
             self.size[q] = os.path.getsize(q) if os.path.exists(q) else 0
         self.cache_bytes = sum(self.size.values())
+        print(f"stream-plan: {len(self.ref)} buffered objects known from the queue", flush=True)
         print(f"stream-plan: resuming at index {self.index} ({self.cache_bytes / 2 ** 30:.2f} GiB buffered)",
               flush=True)
 
