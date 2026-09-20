@@ -57,7 +57,8 @@ def main():
         t0 = time.time()
         try:
             teacher.run(out, z, y, x, Z, Y, X, window=256, halo=32, tile=a.tile, margin=128, gpu_acc=True)
-            arr = data.open_zarr(out); arr.attrs["done"] = True; arr.attrs["region"] = R
+            import zarr
+            arr = zarr.open(out, mode="r+"); arr.attrs["done"] = True; arr.attrs["region"] = R
         except Exception as e:
             print(f"FAILED {out}: {e!r}", flush=True)
             continue
