@@ -388,3 +388,54 @@ for an m7 mask read at L2 of a 2.399 um scan; "9.362", "18.724" for a 9.362 um s
 its nearest rung (nearest in log2) and the CT mirrors are on the same native grids, so nothing needs resampling
 up front; exact-grid resampling remains available (`--encoding mask`) if a scroll ever needs it. Paris 4 keeps
 its existing 2x-mode export (it is exactly 2.400 um and already training).
+
+## 16. Training while streaming (2026-09-20)
+
+The user's requirement: "we only stream in data and buffer it to disk then train over it. the order of
+iteration has to be known so we can download some GBs first, wait until we've consumed them, then download
+more, so that we don't need to do any pre-downloading but also don't lose time waiting on downloads."
+
+The numbers say it fits: at 32 Mvox/s the card eats ~5 MB/s of compressed CT + context + targets (q8 at the
+predicted rung ~1 MB/s, q4/q2 context ~4 MB/s, targets ~0), and the public tree serves 400+ MB/s to an
+instance at ~48 concurrent requests. A few GB of buffer is therefore many minutes of training.
+
+`usrm2/stream.py`. **The planner IS the sampler**: `usrm2 stream-plan STORES --queue DIR` runs
+`data.Patches._rung_draw` with the same per-worker seeds (`seed + 1000 * w`), the same draw order and the
+same air / low-foreground / dense_pow rejection, but a `Hook` is called before every read and fetches, from
+the public tree, exactly the chunks that read will touch (`stream.rung_need` mirrors `read_rung` /
+`read_block` / `full_level`, including "this level is small enough that the worker keeps it decoded whole").
+A 404 is air: a zero-length `<chunk>.absent` marker is written so nothing refetches it and the replaying
+worker does not wait for it. Accepted windows are appended to `queue.jsonl` with a monotonic index; entry i
+belongs to loader worker i % W, so the queue IS the round robin the DataLoader replays. The CT and the
+targets are fetched before the rejection rules run, the nine context cubes only for windows that survive
+them. `data.raw` was split into `raw_params` (the rng draws, recorded in the entry) and `raw_apply`, so a
+replayed window is bit-identical to the sampled one without carrying an rng.
+
+`usrm2 train ... --stream DIR` makes `data.Patches` replay instead of sample: worker w takes entries
+w, w+W, ..., waits (backoff to 1 s) when the planner has not got there yet, and reads each window from the
+buffer exactly as before (uint8 path, `prep.prepare` on the GPU unchanged). Every sample carries `idx` and
+`wait`; `train.jsonl` gains `stream_wait_ms` and `stream_idx` per 20-step interval, and the trainer writes
+`<DIR>/consumed` ({"i", "margin"}) for the planner's eviction bound.
+
+Buffer management: the planner stays `--ahead N` windows in front of `consumed`, and once the cache passes
+`--cache-gb` it deletes the chunks of consumed windows, oldest reference first, down to 90 % of the budget.
+Never evicted: whole levels small enough for `data.full_level` (fetched once), the `.absent` markers, any
+`zarr.json`, and the validation grid -- the held-out box at every `--val-rungs` is prefetched and pinned at
+startup, since nothing else would ever fetch it out of an empty mirror.
+
+Resume: `queue.jsonl` (torn last line dropped), `state.json` (the index plus each worker stream's
+bit-generator state, saved with every emitted entry) and the per-worker `progress/w<k>` files. A restarted
+planner continues the same rng streams at the same index; a restarted trainer skips what its workers
+already served.
+
+`data.remote()` is the explicit inverse of `data.local()` and knows both subtrees under a scroll: the CT
+volumes (`<scroll>/volumes/<rest>` on the origin, `<scroll>/<rest>` in the mirror) and the exported
+predictions (`<scroll>/representations/...` either way).
+
+tests/test_stream.py runs a real `python -m http.server` over a synthetic volcomp tree and checks: the
+planner's window sequence equals the direct sampler's for the same seed; the chunks land where `read_rung`
+expects them; the queue replays across W workers with no gaps or duplicates (including a real 3-worker
+DataLoader); a consumer started first waits instead of skipping and reports the wait; eviction respects the
+budget and never touches an unconsumed window's chunks; a restarted planner continues the index and the rng;
+404s become absent markers; `--require-targets` drops a rung whose export the origin does not serve; and a
+20-step `train --stream` run logs `stream_wait_ms` and writes `consumed`.

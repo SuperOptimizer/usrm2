@@ -30,7 +30,8 @@ def main(argv=None):
     t.add_argument("--ridge-w", type=float, default=0.0, help="extra BCE weight on the band core (target >= 0.9)")
     t.add_argument("--dense-pow", type=float, default=0.0, help="bias sampling towards sheet-dense patches (1-2)")
     t.add_argument("--norm", default="patch", choices=["patch", "global"], help="per-patch z-score or fixed scan mean/std")
-    t.add_argument("--ctx", type=int, nargs="*", default=(), help="coarse context channels: pyramid levels, e.g. 1 2 3 = 4.8/9.6/19.2um cubes")
+    t.add_argument("--ctx", nargs="*", default=(), help="coarse context channels: pyramid levels, e.g. 1 2 3 "
+                   "(= 4.8/9.6/19.2um cubes) or the range 1..9")
     t.add_argument("--init-from", default=None, help="warm start from this checkpoint's EMA weights (new input channels start at zero, new heads copy old ones)")
     t.add_argument("--wtgt", type=int, nargs="*", default=(), help="target channels that carry loss weights (verso targets), e.g. 2 3")
     t.add_argument("--resume", action="store_true")
@@ -47,6 +48,29 @@ def main(argv=None):
     t.add_argument("--require-targets", action="store_true", help="only draw windows whose target chunks are on disk (a partially pulled export)")
     t.add_argument("--aug", default="geo", help="augmentation preset (see aug.PRESETS)")
     t.add_argument("--no-radial", action="store_true", help="zero the radial channels 1..3")
+    t.add_argument("--stream", default=None, help="replay a `usrm2 stream-plan` queue directory instead of "
+                   "sampling: the windows come from the rolling local buffer the planner fills")
+    sp = sub.add_parser("stream-plan", help="plan and stream the training windows into a rolling disk buffer "
+                        "(usrm2/stream.py): the planner IS the sampler")
+    sp.add_argument("stores_file")
+    sp.add_argument("--queue", required=True, help="the queue directory (queue.jsonl, meta.json, state.json)")
+    sp.add_argument("--ahead", type=int, default=400, help="windows kept in front of the trainer")
+    sp.add_argument("--cache-gb", type=float, default=20.0, help="disk budget of the chunk buffer")
+    sp.add_argument("--seed", type=int, default=0, help="must match the training run's (train uses the step it starts at)")
+    sp.add_argument("--workers", type=int, default=4, help="the training run's --workers: entry i is worker i %% W's")
+    sp.add_argument("--patch", type=int, nargs="+", default=[256])
+    sp.add_argument("--rungs", default="all")
+    sp.add_argument("--rung-boost", nargs="*", default=(), metavar="K=M")
+    sp.add_argument("--ctx", nargs="*", default=(), help="context offsets, e.g. 1..9")
+    sp.add_argument("--aug", default="geo")
+    sp.add_argument("--dense-pow", type=float, default=0.0)
+    sp.add_argument("--require-targets", action="store_true")
+    sp.add_argument("--val", nargs="+", default=None, help="held-out box(es), excluded exactly as in training")
+    sp.add_argument("--jobs", type=int, default=48, help="concurrent HTTP requests")
+    sp.add_argument("--report", type=float, default=30.0, help="seconds between plan.jsonl reports")
+    sp.add_argument("--val-rungs", default="2,3,4,6", help="rungs the held-out box is scored at (prefetched and pinned)")
+    sp.add_argument("--val-patches", type=int, default=32)
+    sp.add_argument("--limit", type=int, default=0, help="stop after this many queued windows (0 = forever)")
     b = sub.add_parser("ablate", help="train one run per augmentation preset, sequentially")
     b.add_argument("out_dir")
     b.add_argument("--presets", default="geo,all")
@@ -167,6 +191,17 @@ def main(argv=None):
             return set(range(int(lo), int(hi) + 1))
         return {int(q) for q in str(v).replace(" ", ",").split(",") if q}
 
+    def parse_ctx(vs):
+        """'1 2 3' or '1..9' -> (1, 2, 3) / (1, ..., 9)."""
+        out = []
+        for v in ([vs] if isinstance(vs, str) else vs):
+            if ".." in str(v):
+                lo, hi = str(v).split("..")
+                out += list(range(int(lo), int(hi) + 1))
+            else:
+                out.append(int(v))
+        return tuple(out)
+
     def parse_boost(vs):
         return {int(q.split("=")[0]): float(q.split("=")[1]) for q in vs}
     if a.umbilicus:
@@ -179,12 +214,19 @@ def main(argv=None):
         print(data.format_rung_mix(rows))
     elif a.cmd == "train":
         T.train(a.out_dir, accum=a.accum, ema_decay=a.ema, lr_floor=a.lr_floor, ridge_w=a.ridge_w, dense_pow=a.dense_pow,
-                norm=a.norm, ctx=tuple(a.ctx), init_from=a.init_from, wtgt=tuple(a.wtgt), compile=a.compile, ckpt_act=a.ckpt_act, add_skip=a.add_skip, deep=a.deep, size=a.size, steps=a.steps, patch=a.patch if len(a.patch) > 1 else a.patch[0], batch=a.batch, lr=a.lr,
+                norm=a.norm, ctx=parse_ctx(a.ctx), stream=a.stream, init_from=a.init_from, wtgt=tuple(a.wtgt), compile=a.compile, ckpt_act=a.ckpt_act, add_skip=a.add_skip, deep=a.deep, size=a.size, steps=a.steps, patch=a.patch if len(a.patch) > 1 else a.patch[0], batch=a.batch, lr=a.lr,
                 workers=a.workers, eval_every=a.eval_every, val_patches=a.val_patches, resume=a.resume,
                 aug=a.aug, no_radial=a.no_radial,
                 **({"rungs": parse_rungs(a.rungs), "rung_boost": parse_boost(a.rung_boost),
                     "val_rungs": [int(q) for q in a.val_rungs.split(",")], "require_targets": a.require_targets} if a.rungs else {}),
                 **{k: v for k, v in dict(stores=a.stores, stores_file=a.stores_file, val=a.val).items() if v})
+    elif a.cmd == "stream-plan":
+        from usrm2 import stream as S
+        S.plan(stores_file=a.stores_file, queue=a.queue, patch=a.patch if len(a.patch) > 1 else a.patch[0],
+               rungs=parse_rungs(a.rungs), rung_boost=parse_boost(a.rung_boost), seed=a.seed, workers=a.workers,
+               ahead=a.ahead, cache_gb=a.cache_gb, ctx=parse_ctx(a.ctx), aug=a.aug, dense_pow=a.dense_pow,
+               require_targets=a.require_targets, val=a.val, jobs=a.jobs, report=a.report, limit=a.limit,
+               val_rungs=[int(q) for q in a.val_rungs.split(",")], val_patches=a.val_patches)
     elif a.cmd == "ablate":
         from usrm2 import ablate
         ablate.sweep(a.out_dir, a.presets.split(","), size=a.size, steps=a.steps, patch=a.patch,

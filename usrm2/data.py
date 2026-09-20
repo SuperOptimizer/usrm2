@@ -32,16 +32,30 @@ STREAM_VOLUMES = "https://dl.ash2txt.org/community-uploads/forrest/volcomp"  # t
 
 def local(path):
     """A streamed volume URL -> its local mirror when present (stores made in the cloud name the URL), and a
-    mirror path that does not exist here -> the streamed URL (stores made on the desk, read in the cloud)."""
+    mirror path that does not exist here -> the streamed URL (stores made on the desk, read in the cloud).
+    Two subtrees live under a scroll: the CT volumes (URL `<scroll>/volumes/<rest>`, mirrored at
+    `<scroll>/<rest>`) and the exported predictions (`<scroll>/representations/...` either way)."""
     import os
     if "://" in path and "/volcomp/" in path:
-        scroll, _, rest = path.split("/volcomp/", 1)[1].partition("/volumes/")
+        scroll, _, rest = path.split("/volcomp/", 1)[1].partition("/")
+        rest = rest[len("volumes/"):] if rest.startswith("volumes/") else rest
         cand = f"{LOCAL_VOLUMES}/{scroll}/{rest}"
         return cand if os.path.exists(cand) else path
     if path.startswith(LOCAL_VOLUMES + "/") and not os.path.exists(path):
-        scroll, _, rest = path[len(LOCAL_VOLUMES) + 1:].partition("/")
-        return f"{STREAM_VOLUMES}/{scroll}/volumes/{rest}"
+        return remote(path)
     return path
+
+
+def remote(path):
+    """The mirror path -> its origin URL (the inverse of `local`), whether or not it exists here."""
+    path = str(path)
+    if "://" in path:
+        return path
+    assert path.startswith(LOCAL_VOLUMES + "/"), f"{path} is not under the local mirror {LOCAL_VOLUMES}"
+    scroll, _, rest = path[len(LOCAL_VOLUMES) + 1:].partition("/")
+    if rest.startswith("representations/"):  # the exported prediction pyramids keep their key
+        return f"{STREAM_VOLUMES}/{scroll}/{rest}"
+    return f"{STREAM_VOLUMES}/{scroll}/volumes/{rest}"
 
 
 def open_zarr(path):
@@ -146,21 +160,38 @@ def volcomp_roundtrip(vol, q):
     return buf[:vol.shape[0], :vol.shape[1], :vol.shape[2]]
 
 
+def raw_params(rng, cfg):
+    """The rng draws of the raw-uint8 stage as a small JSON-able dict ({} = nothing to do). Split from
+    `raw_apply` so the stream planner (usrm2/stream.py) makes exactly the draws the loader used to make
+    and records the outcome in the queue, and the replaying worker applies it without an rng."""
+    out = {}
+    k = cfg.get("window")
+    if k and rng.random() < k["p"]:
+        out["window"] = [float(rng.uniform(k["lo_lo"], k["lo_hi"])), float(rng.uniform(k["hi_lo"], k["hi_hi"]))]
+    k = cfg.get("volcomp")
+    if k and rng.random() < k["p"]:
+        out["volcomp"] = float(rng.uniform(*k["q"]))
+    return out
+
+
+def raw_apply(ct, prm):
+    """`raw_params` applied to a uint8 CT cube."""
+    if prm.get("window"):
+        lo, hi = prm["window"]
+        ct = np.clip((ct.astype(np.float32) - lo) * (255.0 / max(hi - lo, 1e-6)), 0, 255).astype(np.uint8)
+    if prm.get("volcomp"):
+        try:
+            ct = volcomp_roundtrip(np.ascontiguousarray(ct, np.uint8), prm["volcomp"])
+        except Exception:
+            pass
+    return ct
+
+
 def raw(rng, ct, cfg):
     """Raw-uint8 CT augs that have to happen before the z-score (see aug.py): the 8-bit export
     window (an affine remap is a no-op after re-z-scoring -- only its clipping is real) and the
     volcomp codec round trip (C code over bytes; skipped silently without the codec)."""
-    k = cfg.get("window")
-    if k and rng.random() < k["p"]:
-        lo, hi = rng.uniform(k["lo_lo"], k["lo_hi"]), rng.uniform(k["hi_lo"], k["hi_hi"])
-        ct = np.clip((ct.astype(np.float32) - lo) * (255.0 / max(hi - lo, 1e-6)), 0, 255).astype(np.uint8)
-    k = cfg.get("volcomp")
-    if k and rng.random() < k["p"]:
-        try:
-            ct = volcomp_roundtrip(np.ascontiguousarray(ct, np.uint8), rng.uniform(*k["q"]))
-        except Exception:
-            pass
-    return ct
+    return raw_apply(ct, raw_params(rng, cfg))
 
 
 SYM_PERMS = tuple(itertools.permutations(range(3)))  # the 6 axis permutations
@@ -601,7 +632,7 @@ class Patches(torch.utils.data.IterableDataset):
 
     def __init__(self, patch=128, ct=CT, stores=TRAIN, exclude=VAL, seed=0, air_keep=0.1, fg_min=0.05,
                  fg_keep=0.25, sym=True, aug=None, dense_pow=0.0, dense_ref=0.2, ctx=(), stores_file=None,
-                 recheck=200, rungs=None, rung_boost=None, channels=None, require_targets=False):
+                 recheck=200, rungs=None, rung_boost=None, channels=None, require_targets=False, stream=None):
         """dense_pow > 0 biases sampling towards sheet-dense patches: a patch whose target mean m is below
         dense_ref is kept with probability (m / dense_ref) ** dense_pow (crushed windings are where students fail).
         stores_file: instead of `stores`, a text file with one comma-joined group per line that is re-read
@@ -630,8 +661,15 @@ class Patches(torch.utils.data.IterableDataset):
             overall    57.4%  27.5%   9.7%   3.4%   1.2%   0.4%  0.1%  0.1%  0.1%
 
         Rung 2 appears once a rung-2 target is added (the boxed level-0 recto mask); `--rung-boost 2=4`
-        skews the mix by hand."""
+        skews the mix by hand.
+
+        stream: a queue directory written by `usrm2 stream-plan` (usrm2/stream.py). The workers then REPLAY
+        that queue instead of sampling -- worker w takes entries w, w + W, w + 2W, ... and reads each window
+        from the rolling local buffer the planner fills, waiting when the planner has not got there yet --
+        and every sample carries `idx` (its queue index) and `wait` (milliseconds waited, ms), which
+        train.py logs as `stream_wait_ms`."""
         super().__init__()
+        self.stream = None if stream is None else str(stream)
         self.rungs, self.rung_boost, self.channels = rungs, dict(rung_boost or {}), channels
         self.norm, self.umbilicus = NORM, UMBILICUS  # module state the (spawned) workers must inherit explicitly
         self.stores_file, self.recheck, self.file_mtime = stores_file, recheck, None
@@ -685,6 +723,18 @@ class Patches(torch.utils.data.IterableDataset):
 
     def _rung_sample(self, rng):
         """One compact sample (see `rung_item`), or None when the corner is rejected."""
+        return self._rung_draw(rng)[1]
+
+    def _rung_draw(self, rng, hook=None, build=True):
+        """Draw one candidate window, apply the rejection rules and (with `build`) read it.
+        Returns (descriptor, sample); (None, None) when the window is rejected. The descriptor is what the
+        stream queue stores: source index, rung, corner, cube symmetry, the blank-patch flag and the raw-aug
+        draws -- everything `_rung_build` needs to reproduce the sample without an rng.
+
+        `hook` (usrm2.stream.Hook) makes this the STREAM PLANNER: before each read it is asked to fetch the
+        chunks that read will touch, and it replaces the local-coverage rules (nothing is mirrored up front;
+        a key the origin does not serve is air). With build=False the accepted window is not turned into a
+        sample -- the planner only needs the descriptor and the fetches."""
         p = self.patch
         i = rng.choice(len(self.srcs), p=self.w)
         s = self.srcs[i]
@@ -698,38 +748,64 @@ class Patches(torch.utils.data.IterableDataset):
             d = k - 2
             eo, es = (np.array(o) >> d, np.maximum(np.array(sz) >> d, 1)) if d >= 0 else (np.array(o) << -d, np.array(sz) << -d)
             if np.all(lo < eo + es) and np.all(lo + p > eo):
-                return None
+                return None, None
         cpyr = s["ct_pyr"]
-        csrc = max(r for r in cpyr if r <= k)
-        e = 1 << (k - csrc)
-        if not covered(cpyr[csrc], lo * e, p * e):  # a partially mirrored level (level 0 of the desk's CT)
-            return None
-        if self.require_targets:  # a partially pulled export: an absent shard is "not yet exported", not air
-            for t in s["targets"].values():
-                tsrc = max(r for r in t["pyr"] if r <= k)
-                te = 1 << (k - tsrc)
-                if not covered(t["pyr"][tsrc], lo * te, p * te):
-                    return None
-        bl = self.aug.get("blank")
+        if hook is None:
+            csrc = max(r for r in cpyr if r <= k)
+            e = 1 << (k - csrc)
+            if not covered(cpyr[csrc], lo * e, p * e):  # a partially mirrored level (level 0 of the desk's CT)
+                return None, None
+            if self.require_targets:  # a partially pulled export: an absent shard is "not yet exported", not air
+                for t in s["targets"].values():
+                    tsrc = max(r for r in t["pyr"] if r <= k)
+                    te = 1 << (k - tsrc)
+                    if not covered(t["pyr"][tsrc], lo * te, p * te):
+                        return None, None
+        elif not hook.data(s, k, lo):
+            return None, None
+        bl, blank, prm = self.aug.get("blank"), False, {}
         if bl and rng.random() < bl["p"]:  # an all-air patch (CT 0 = air) with target 0
+            blank = True
             ct = np.zeros(tuple(p), np.uint8)
             tg = np.zeros((len(self.channels),) + tuple(p), np.uint8)
             w = np.zeros_like(tg)
         else:
             ct = read_rung(cpyr, k, lo, p, dtype=np.uint8)
             if (ct == 0).mean() > 0.9 and rng.random() > self.air_keep:
-                return None
+                return None, None
             tg, w = self._rung_target(s, k, lo, ct)
             sel = w > 0
             m = float(np.sum(tg, where=sel, dtype=np.int64)) / 255.0 / max(int(sel.sum()), 1)
             if m < self.fg_min and rng.random() > self.fg_keep:
-                return None
+                return None, None
             if self.dense_pow > 0 and m < self.dense_ref and rng.random() > (m / self.dense_ref) ** self.dense_pow:
-                return None
-            ct = raw(rng, ct, self.aug)
+                return None, None
+            prm = raw_params(rng, self.aug)
+            ct = raw_apply(ct, prm)
+        sym = int(draw_sym(rng, tuple(p))) if self.sym else 0  # applied on the GPU (usrm2.prep), not here
+        desc = {"s": int(i), "k": k, "lo": [int(v) for v in lo], "y": sym, "b": int(blank), "r": prm}
+        if hook is not None and self.ctx:
+            hook.ctx(s, k, lo)
+        if not build:
+            return desc, None
         cx = context(s["ct"], lo, ct.shape, self.ctx, rung=k) if self.ctx else ()
-        sym = draw_sym(rng, ct.shape) if self.sym else 0  # applied on the GPU (usrm2.prep), not here
-        return rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, s["axis"], sym)
+        return desc, rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, s["axis"], sym)
+
+    def _rung_build(self, d):
+        """A queue descriptor (`_rung_draw`) -> the compact sample, read from the local buffer. No rng: the
+        rejection rules and every random draw happened in the planner."""
+        p, s, k = self.patch, self.srcs[int(d["s"])], int(d["k"])
+        lo = np.array(d["lo"], np.int64)
+        if d.get("b"):
+            ct = np.zeros(tuple(p), np.uint8)
+            tg = np.zeros((len(self.channels),) + tuple(p), np.uint8)
+            w = np.zeros_like(tg)
+        else:
+            ct = read_rung(s["ct_pyr"], k, lo, p, dtype=np.uint8)
+            tg, w = self._rung_target(s, k, lo, ct)
+            ct = raw_apply(ct, d.get("r") or {})
+        cx = context(s["ct"], lo, ct.shape, self.ctx, rung=k) if self.ctx else ()
+        return rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, s["axis"], int(d.get("y", 0)))
 
     def _rung_target(self, s, k, lo, ct):
         """(target, weight) at rung k as uint8 (255 = 1.0): one channel per output channel, 0 (weight 0) for
@@ -753,9 +829,65 @@ class Patches(torch.utils.data.IterableDataset):
             w[c] = np.where(ins & inside_ct, np.uint8(round(255 * t["weight"])), np.uint8(0))
         return tg, w
 
+    def _open_stream(self):
+        """Replay mode: the queue's meta.json fixes the store list, the patch, the context offsets and the
+        channel order, so a queue can only be replayed by a run that matches the plan."""
+        from usrm2 import stream as S
+        m = self.smeta = S.read_meta(self.stream)
+        assert [int(v) for v in m["patch"]] == [int(v) for v in self.patch], \
+            f"--stream was planned at patch {m['patch']}, not {[int(v) for v in self.patch]}"
+        assert tuple(m["ctx"]) == tuple(self.ctx), f"--stream was planned with --ctx {m['ctx']}"
+        self.paths, self.stores_file = [g.split(",") for g in m["stores"]], None
+        if self.channels is None:
+            self.channels = list(m["channels"])
+        assert list(self.channels) == list(m["channels"]), f"--stream was planned for channels {m['channels']}"
+        self._open_rungs()
+
+    def _replay(self):
+        """Worker w yields the queue entries w, w + W, w + 2W, ... in order, waiting for the planner."""
+        import time as _time
+        from usrm2 import stream as S
+        info = torch.utils.data.get_worker_info()
+        w, W = (info.id, info.num_workers) if info else (0, 1)
+        assert W == int(self.smeta["workers"]), \
+            f"--stream was planned for {self.smeta['workers']} loader workers, not {W}"
+        dirs = list(self.smeta["dirs"])
+        os.makedirs(os.path.join(self.stream, S.PROGRESS), exist_ok=True)
+        prog = os.path.join(self.stream, S.PROGRESS, f"w{w}")
+        start = -1
+        if os.path.exists(prog):
+            try:
+                start = int(open(prog).read().strip() or -1)  # a restart skips what this worker already served
+            except ValueError:
+                start = -1
+        wait = 0.0
+        for line, waited in S.tail(os.path.join(self.stream, S.QUEUE)):
+            wait += waited
+            rec = json.loads(line)
+            i = int(rec["i"])
+            if i % W != w or i <= start:
+                continue
+            t0 = _time.time()
+            if any(di >= len(dirs) for di, _ in rec["c"]):  # the planner touched a level after meta was written
+                dirs = list(S.read_meta(self.stream)["dirs"])
+            for di, key in rec["c"]:
+                back = 0.02
+                while not S.have(f"{dirs[di]}/{key}"):
+                    _time.sleep(back)
+                    back = min(back * 1.5, 1.0)
+            wait += _time.time() - t0
+            item = self._rung_build(rec)
+            item["idx"], item["wait"] = torch.tensor(i), torch.tensor(float(wait) * 1000.0)
+            wait = 0.0
+            with open(prog, "w") as f:
+                f.write(str(i))
+            yield item
+
     def _open(self):
         """Each teacher store names its CT volume and scroll axis (attrs), so stores from several scrolls can mix."""
         global NORM, UMBILICUS
+        if self.stream:
+            return self._open_stream()
         if self.rungs is not None:
             return self._open_rungs()
         NORM, UMBILICUS = self.norm, self.umbilicus  # forkserver workers start with fresh module globals
@@ -782,6 +914,9 @@ class Patches(torch.utils.data.IterableDataset):
     def __iter__(self):
         if self.arrs is None:
             self._open()
+        if self.stream:
+            yield from self._replay()
+            return
         info = torch.utils.data.get_worker_info()
         rng = np.random.default_rng(self.seed + 1000 * (info.id if info else 0))
         p = self.patch

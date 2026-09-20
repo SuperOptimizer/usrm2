@@ -203,7 +203,8 @@ def warm_start(src, cin, cout):
 def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=4, warmup=200,
           eval_every=500, val_patches=32, resume=False, device=None, aug="geo", no_radial=False, accum=1,
           ema_decay=0.999, lr_floor=0.0, ridge_w=0.0, dense_pow=0.0, norm="patch", ctx=(), init_from=None, wtgt=(),
-          compile=False, ckpt_act=0, add_skip=0, deep=0, rungs=None, rung_boost=None, val_rungs=data.VAL_RUNGS, require_targets=False, **kw):
+          compile=False, ckpt_act=0, add_skip=0, deep=0, rungs=None, rung_boost=None, val_rungs=data.VAL_RUNGS,
+          require_targets=False, stream=None, **kw):
     """accum: gradient accumulation (micro-batches per optimizer step), for big models on small cards.
     lr_floor: the cosine decays to lr_floor * lr instead of 0. norm: "patch" (per-patch z-score) or "global"
     (fixed scan mean/std, stored in the checkpoint). dense_pow / ridge_w: see data.Patches / losses.
@@ -216,7 +217,12 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     `ct_base,target_group[,...]` lines of whole-scroll pyramids, a sample is (source, rung, corner), the input
     carries the constant scale plane (k - 2) / 9 right before the radial vector, and the loader's per-voxel
     weights go into the loss. `rungs` is True (every usable rung) or the allowed rungs; rung_boost {k: m}
-    skews the mix; val_rungs are the rungs the held-out box (kw["val"], given at rung 2) is scored at."""
+    skews the mix; val_rungs are the rungs the held-out box (kw["val"], given at rung 2) is scored at.
+    stream: a queue directory filled by `usrm2 stream-plan` (usrm2/stream.py). The loader then replays that
+    queue out of a rolling local buffer instead of sampling, and every 20 steps `train.jsonl` carries
+    `stream_wait_ms` (how long the workers waited for the planner, 0 once the buffer is ahead) and
+    `stream_idx` (the highest queue index consumed, also written to <stream>/consumed for the planner's
+    eviction bound)."""
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
     main = rank == 0
     if world > 1:
@@ -288,7 +294,8 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     dl = data.loader(patch, batch, workers, ct=kw.get("ct", data.CT), stores=kw.get("stores", data.TRAIN),
                      exclude=kw.get("val", data.VAL), seed=step + 7919 * rank, sym=cfg.get("sym", True), aug=cfg, dense_pow=dense_pow, ctx=ctx,
                      stores_file=kw.get("stores_file"),  # a stores file is re-read as it grows (data.Patches)
-                     **(dict(rungs=rungs, rung_boost=rung_boost, channels=args.get("channels"), require_targets=require_targets) if rungs is not None else {}))
+                     **(dict(rungs=rungs, rung_boost=rung_boost, channels=args.get("channels"), require_targets=require_targets) if rungs is not None else {}),
+                     **(dict(stream=stream) if stream else {}))
     model = torch.nn.parallel.DistributedDataParallel(net, device_ids=[dev.index]) if world > 1 else net
     if compile:
         model = torch.compile(model)
@@ -309,7 +316,13 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         print(name, rec, flush=True)
 
     log("train.jsonl", {"step": step, "aug": aug, "cfg": cfg, "size": size, "patch": patch, "batch": batch})
+    if stream:
+        args["stream"] = str(stream)
     t0, micro, rung_n = time.time(), 0, {}
+    wait_ms, stream_idx = 0.0, -1
+    # the planner may evict a chunk once every worker is past it; the DataLoader is up to this many entries
+    # ahead of what the training loop has actually seen
+    margin = max(workers, 1) * batch * (2 + 2)
     for item in dl:
         if step >= steps:
             break
@@ -317,6 +330,9 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         if isinstance(item, dict):  # rung mode: uint8 cubes + metadata; the input is built on the device
             for r in item["rung"].tolist():
                 rung_n[r] = rung_n.get(r, 0) + 1
+            if "wait" in item:
+                wait_ms += float(item["wait"].sum())
+                stream_idx = max(stream_idx, int(item["idx"].max()))
             ct, tg, wt = prep.prepare(item, dev, norad=no_radial)
             tg = torch.cat([tg, wt], 1)  # the weights ride along as extra target channels so every
         else:                            # geometric aug transforms them identically
@@ -343,8 +359,14 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
             log("train.jsonl", {"step": step, "loss": loss.item(), "bce": bce.item(), "dice": dice.item(),
                                 "lr": sched.get_last_lr()[0], "vox_s": round(20 * accum * batch * world * int(np.prod(data.shape3(patch))) / dt),
                                 "vram_MiB": round(torch.cuda.max_memory_allocated() / 2 ** 20) if dev.type == "cuda" else 0,
-                                **({"rung": {str(k): rung_n[k] for k in sorted(rung_n)}} if rung_n else {})})
-            rung_n = {}
+                                **({"rung": {str(k): rung_n[k] for k in sorted(rung_n)}} if rung_n else {}),
+                                **({"stream_wait_ms": round(wait_ms), "stream_idx": stream_idx} if stream else {})})
+            rung_n, wait_ms = {}, 0.0
+            if stream and main and stream_idx >= 0:  # the planner's eviction bound
+                tmp = os.path.join(str(stream), "consumed.tmp")
+                with open(tmp, "w") as f:
+                    json.dump({"i": stream_idx, "margin": margin}, f)
+                os.replace(tmp, os.path.join(str(stream), "consumed"))
             t0 = time.time()
         if (step % eval_every == 0 or step == steps) and main:
             evnet.load_state_dict(ema)
