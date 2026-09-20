@@ -85,3 +85,16 @@ async def main():
     print(f"MIRRORDONE {nbytes / 2**30:.1f} GiB in {time.time() - t0:.0f} s", flush=True)
 
 asyncio.run(main())
+
+# what the mirror knows: levels fetched whole are complete; level 0 only inside the boxes (see data.chunk_index)
+try:
+    for l in (1, 2):
+        json.dump({"complete": True}, open(f"{DST}/{l}/mirror.json", "w"))
+    if boxes_file:
+        bx = [[int(q) for q in line.split()] for line in open(boxes_file) if len(line.split()) == 6]
+        json.dump({"boxes": [[max(b[0] - margin, 0), max(b[1] - margin, 0), max(b[2] - margin, 0),
+                              b[3] + 2 * margin, b[4] + 2 * margin, b[5] + 2 * margin] for b in bx]},
+                  open(f"{DST}/0/mirror.json", "w"))
+    print("mirror.json markers written")
+except Exception as e:
+    print("mirror.json markers failed:", e)

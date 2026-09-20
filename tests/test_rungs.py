@@ -4,6 +4,7 @@ Everything here is synthetic: tiny pyramids (a CT mirror with integer level name
 groups with micron level names, some written with the real volcomp mask codec) and 32^3 patches.
 """
 import json
+import pathlib
 
 import numpy as np
 import pytest
@@ -400,3 +401,28 @@ def test_require_targets_skips_unpulled_windows(tmp_path, monkeypatch):
     for _ in range(60):
         _, t, _, _ = next(it)
         assert float(t.max()) > 0.0
+
+
+def test_mirror_json_marks_known_chunks(tmp_path, monkeypatch):
+    """mirror.json: {"complete": true} makes a sparse level whole; {"boxes": [...]} marks those chunks known."""
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    ct = ct_pyramid(tmp_path, partial=True)
+    a0 = data.rungs(ct)[2]
+    d = data.array_dir(a0)
+    assert data.coverage(a0) == pytest.approx(0.5)
+    (pathlib.Path(d) / "mirror.json").write_text(json.dumps({"boxes": [[128, 0, 0, 64, 256, 256]]}))
+    data.CHUNK_INDEX.clear()
+    assert data.coverage(a0) > 0.5 and data.covered(a0, (128, 0, 0), (32, 32, 32))
+    (pathlib.Path(d) / "mirror.json").write_text(json.dumps({"complete": True}))
+    data.CHUNK_INDEX.clear()
+    assert data.coverage(a0) == 1.0
+
+
+def test_rungs_include_levels_built_after_the_export(tmp_path, monkeypatch):
+    """A CT mirror whose group metadata lists levels 0..3 but has a level 4 directory on disk exposes rung 6."""
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    ct = ct_pyramid(tmp_path, nlev=4)
+    base = data.pyramid_base(ct)
+    plain_level(pathlib.Path(base) / "4", (16, 16, 16), 7)
+    data.CTX_CACHE.pop(base, None)
+    assert 6 in data.rungs(ct)

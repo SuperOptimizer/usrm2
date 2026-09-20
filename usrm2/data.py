@@ -237,7 +237,8 @@ def rungs(base):
     if base in CTX_CACHE:
         return CTX_CACHE[base]
     ms, at = group_meta(base)
-    names = [str(d["path"]) for d in ms["datasets"]] if ms else sorted(os.listdir(base))
+    names = [str(d["path"]) for d in ms["datasets"]] if ms else []
+    names += [d for d in sorted(os.listdir(base)) if d not in names]  # levels built locally after the export (6-9)
     nat = float((at.get("volcomp") or {}).get("rung_voxel_size_um") or native_um(base))
     out = {}
     for n in names:
@@ -356,6 +357,25 @@ def chunk_index(arr):
     g = np.array(getattr(arr, "shards", None) or arr.chunks, np.int64)[-3:]
     n = -(-np.array(arr.shape[-3:], np.int64) // g)
     pres = np.zeros(tuple(n), bool)
+    # <level>/mirror.json says what the mirror KNOWS (absent keys on the origin are air, so presence on disk
+    # alone cannot tell air from not-mirrored): {"complete": true} = every chunk known; {"boxes": [[z,y,x,Z,Y,X],
+    # ...]} (voxels of this level) = the chunks inside those boxes are known.
+    mj = os.path.join(d, "mirror.json")
+    if os.path.isfile(mj):
+        try:
+            m = json.load(open(mj))
+        except Exception:
+            m = {}
+        if m.get("complete"):
+            out = (g, None)
+            CHUNK_INDEX[d] = out
+            return out
+        for b in m.get("boxes", []):
+            o, sz = np.array(b[:3], np.int64), np.array(b[3:6], np.int64)
+            a = np.maximum(o, 0) // g
+            hi = np.minimum(-(-(o + sz) // g), n)
+            if (hi > a).all():
+                pres[a[0]:hi[0], a[1]:hi[1], a[2]:hi[2]] = True
     if os.path.isdir(d):
         for root, _, files in os.walk(d):
             for f in files:
