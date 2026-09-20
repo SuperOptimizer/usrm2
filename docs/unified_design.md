@@ -411,6 +411,17 @@ targets are fetched before the rejection rules run, the nine context cubes only 
 them. `data.raw` was split into `raw_params` (the rng draws, recorded in the entry) and `raw_apply`, so a
 replayed window is bit-identical to the sampled one without carrying an rng.
 
+**Range fetching, not whole shards.** A volcomp level's object is a 1024^3 SHARD holding 512 inner 128^3
+chunks plus an (offset, nbytes) index at its end (a CT level-0 shard is ~17 MB, a level-2 shard ~35 MB). A
+256^3 window touches about two shards per level, so fetching shard objects would pull ~35 MB per level per
+window -- about 130x what the reads use. The planner instead GETs the shard index by byte range, then only
+the inner chunks the read touches (adjacent ones coalesced into one request), and writes a VALID shard
+locally that holds exactly those: its index marks the rest empty, which is the array's fill value, so zarr
+reads the window correctly and the untouched region reads as air. Later windows merge more inner chunks
+into the same file. A server that ignores `Range` is handled by slicing the whole object. Measured on the
+A6000 against dl.ash2txt.org, a 256^3 rung-2 window with nine context rungs costs ~40 MB and ~250 requests
+instead of the ~5 GB of shard objects it touches.
+
 `usrm2 train ... --stream DIR` makes `data.Patches` replay instead of sample: worker w takes entries
 w, w+W, ..., waits (backoff to 1 s) when the planner has not got there yet, and reads each window from the
 buffer exactly as before (uint8 path, `prep.prepare` on the GPU unchanged). Every sample carries `idx` and
@@ -419,6 +430,8 @@ buffer exactly as before (uint8 path, `prep.prepare` on the GPU unchanged). Ever
 
 Buffer management: the planner stays `--ahead N` windows in front of `consumed`, and once the cache passes
 `--cache-gb` it deletes the chunks of consumed windows, oldest reference first, down to 90 % of the budget.
+Every fetched object is booked (`Planner.charge`), including what a REJECTED candidate pulled before the
+air / foreground rules dropped it: those are referenced by no entry (index -1) and are evicted first.
 Never evicted: whole levels small enough for `data.full_level` (fetched once), the `.absent` markers, any
 `zarr.json`, and the validation grid -- the held-out box at every `--val-rungs` is prefetched and pinned at
 startup, since nothing else would ever fetch it out of an empty mirror.
