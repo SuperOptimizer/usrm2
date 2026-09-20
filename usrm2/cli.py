@@ -39,6 +39,11 @@ def main(argv=None):
     t.add_argument("--compile", action="store_true", help="torch.compile the training step (~1.4x on the 5m)")
     t.add_argument("--stores-file", default=None, help="text file of store groups (one per line), re-read while training as it grows")
     t.add_argument("--val", nargs="+", default=None, help="validation box(es) (default: data.VAL); each a comma-joined teacher group; all are excluded from sampling")
+    t.add_argument("--rungs", default=None, help="train the unified multi-resolution model on the rung ladder "
+                   "(0.6 * 2^k um): 'all', a range '2-11' or a list '2,3,4'. The stores are then "
+                   "'ct_base,target_group[,...]' lines of whole-scroll pyramids")
+    t.add_argument("--rung-boost", nargs="*", default=(), metavar="K=M", help="per-rung sampling multipliers, e.g. 2=2 11=0.5")
+    t.add_argument("--val-rungs", default="2,3,4,6", help="rungs the held-out box is scored at")
     t.add_argument("--aug", default="geo", help="augmentation preset (see aug.PRESETS)")
     t.add_argument("--no-radial", action="store_true", help="zero the radial channels 1..3")
     b = sub.add_parser("ablate", help="train one run per augmentation preset, sequentially")
@@ -68,12 +73,19 @@ def main(argv=None):
     p.add_argument("--size", type=int, nargs=3, required=True, metavar=("Z", "Y", "X"))
     p.add_argument("--window", type=int, default=128)
     p.add_argument("--halo", type=int, default=16)
+    p.add_argument("--rung", type=int, default=None, help="predict at rung k of the volume's pyramid (0.6 * 2^k um); "
+                   "--origin/--size are then rung-k voxels (default: the level the volume names, rung 2)")
     p.add_argument("--plain", action="store_true", help="plain zarr (1,Z,Y,X) instead of volcomp")
     p.add_argument("--ome", action="store_true", help="zarr v2 OME group at full volume shape (tracer drop-in)")
     p.add_argument("--tta", type=int, default=0, help="average over this many axis flips (8 = all)")
     p.add_argument("--head", default="0", help="head index of a multi-teacher student, or mean / prod / max")
     p.add_argument("--radial-sign", type=float, default=1.0, help="-1 negates the radial vector (the student then predicts the verso face)")
     p.add_argument("--lut-to", nargs="*", default=(), metavar="REF", help="also average with the input histogram-matched to REF volumes")
+    rm = sub.add_parser("rung-mix", help="print the rung sampling mix of a stores file and the local CT coverage")
+    rm.add_argument("stores_file")
+    rm.add_argument("--patch", type=int, nargs="+", default=[256])
+    rm.add_argument("--rungs", default="all")
+    rm.add_argument("--rung-boost", nargs="*", default=(), metavar="K=M")
     s = sub.add_parser("evalsurf", help="score a checkpoint or store against the published surfaces")
     s.add_argument("--box", type=int, nargs=6, default=None, metavar=("Z0", "Y0", "X0", "Z", "Y", "X"))
     s.add_argument("--ckpt")
@@ -144,13 +156,33 @@ def main(argv=None):
     b.add_argument("--shard", type=int, nargs=2, default=(0, 1), metavar=("I", "K"), help="(internal) this worker's share")
     a = ap.parse_args(argv)
     from usrm2 import data, model, predict as P, train as T
+
+    def parse_rungs(v):
+        """'all' -> True, '2-11' -> {2..11}, '2,3,4' -> {2,3,4}."""
+        if v is None or str(v).lower() in ("all", "true"):
+            return True
+        if "-" in str(v):
+            lo, hi = str(v).split("-")
+            return set(range(int(lo), int(hi) + 1))
+        return {int(q) for q in str(v).replace(" ", ",").split(",") if q}
+
+    def parse_boost(vs):
+        return {int(q.split("=")[0]): float(q.split("=")[1]) for q in vs}
     if a.umbilicus:
         data.UMBILICUS = a.umbilicus
-    if a.cmd == "train":
+    if a.cmd == "rung-mix":
+        lines = [l.strip() for l in open(a.stores_file) if l.strip() and not l.startswith("#")]
+        rs = parse_rungs(a.rungs)
+        rows = data.rung_mix(lines, patch=a.patch if len(a.patch) > 1 else a.patch[0],
+                             allowed=None if rs is True else rs, boost=parse_boost(a.rung_boost))
+        print(data.format_rung_mix(rows))
+    elif a.cmd == "train":
         T.train(a.out_dir, accum=a.accum, ema_decay=a.ema, lr_floor=a.lr_floor, ridge_w=a.ridge_w, dense_pow=a.dense_pow,
                 norm=a.norm, ctx=tuple(a.ctx), init_from=a.init_from, wtgt=tuple(a.wtgt), compile=a.compile, ckpt_act=a.ckpt_act, add_skip=a.add_skip, deep=a.deep, size=a.size, steps=a.steps, patch=a.patch if len(a.patch) > 1 else a.patch[0], batch=a.batch, lr=a.lr,
                 workers=a.workers, eval_every=a.eval_every, val_patches=a.val_patches, resume=a.resume,
                 aug=a.aug, no_radial=a.no_radial,
+                **({"rungs": parse_rungs(a.rungs), "rung_boost": parse_boost(a.rung_boost),
+                    "val_rungs": [int(q) for q in a.val_rungs.split(",")]} if a.rungs else {}),
                 **{k: v for k, v in dict(stores=a.stores, stores_file=a.stores_file, val=a.val).items() if v})
     elif a.cmd == "ablate":
         from usrm2 import ablate
@@ -233,7 +265,7 @@ def main(argv=None):
     else:
         from usrm2 import teacher
         vol = a.volume or data.CT
-        P.predict(a.ckpt, vol, *a.origin, *a.size, a.out, window=a.window, halo=a.halo, volcomp=not a.plain, ome=a.ome,
+        P.predict(a.ckpt, vol, *a.origin, *a.size, a.out, window=a.window, halo=a.halo, volcomp=not a.plain, ome=a.ome, rung=a.rung,
                   tta=a.tta, luts=[teacher.lut_to(vol, r) for r in a.lut_to], head=a.head if a.head in P.HEADS or a.head == "all" else int(a.head),
                   radial_sign=a.radial_sign)
 

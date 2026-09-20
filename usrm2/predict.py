@@ -112,7 +112,7 @@ def zscore_t(c):
     return (x - x.mean()) / (x.std() + 1e-3)
 
 
-def out_array(path, shape, origin, volcomp=True, volume=None, umbilicus=None):
+def out_array(path, shape, origin, volcomp=True, volume=None, umbilicus=None, rung=2):
     import zarr
     try:
         from volcomp_zarr import VolcompCodec
@@ -125,7 +125,8 @@ def out_array(path, shape, origin, volcomp=True, volume=None, umbilicus=None):
     else:
         kw["shape"], kw["chunks"] = (1,) + tuple(shape), (1, 128, 128, 128)
         z = zarr.create_array(path, **kw)
-    z.attrs.update({"channels": ["recto"], "voxel_um": 2.4, "origin_zyx": [int(v) for v in origin], "scale": 1.0,
+    z.attrs.update({"channels": ["recto"], "voxel_um": data.rung_um(rung), "rung": int(rung),
+                    "origin_zyx": [int(v) for v in origin], "scale": 1.0,
                     "volume": volume or data.CT, "umbilicus": umbilicus or data.UMBILICUS})  # so loaders know the scroll
     return z
 
@@ -140,8 +141,8 @@ def u8(prob):
     return np.clip(np.rint(prob * 255), 0, 255).astype(np.uint8)
 
 
-def write(path, prob, origin, volcomp=True, volume=None):
-    a = out_array(path, prob.shape, origin, volcomp=volcomp, volume=volume)
+def write(path, prob, origin, volcomp=True, volume=None, rung=2):
+    a = out_array(path, prob.shape, origin, volcomp=volcomp, volume=volume, rung=rung)
     p = u8(prob)
     a[:] = p[None] if a.ndim == 4 else p
 
@@ -198,7 +199,7 @@ def flips_vec(fn, n=8):
 HEADS = {"mean": lambda p: p.mean(1), "prod": lambda p: p.prod(1) ** (1 / p.shape[1]), "max": lambda p: p.max(1).values}
 
 
-def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, tta=0, luts=(), head=0, radial_sign=1.0, batch=1):
+def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, tta=0, luts=(), head=0, radial_sign=1.0, batch=1, rung=None):
     """Sliding-window recto probability (float32) over a box; returns (prob, checkpoint state).
     tta: number of axis flips to average; luts: intensity LUTs (uint8->float) whose predictions are averaged in;
     head: which head of a multi-teacher student (int), "mean" / "prod" / "max" over all heads, or "all" for a
@@ -210,13 +211,22 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
     net = M.build(st["args"]["size"], verbose=False, cout=st["args"].get("cout", 1), cin=st["args"].get("cin", 4), add_skip=st["args"].get("add_skip", 0), deep=st["args"].get("deep", 0)).to(dev)
     net.load_state_dict(st["ema"])
     net.eval()
-    roi, ax = data.open_zarr(volume)[z0:z0 + Z, y0:y0 + Y, x0:x0 + X], data.axis()
+    scale = bool(st["args"].get("scale_plane"))
+    k = int(rung) if rung is not None else (data.base_rung(volume) if scale else 2)
+    ax = data.axis()
+    if rung is None:
+        roi = data.open_zarr(volume)[z0:z0 + Z, y0:y0 + Y, x0:x0 + X]
+    else:  # read the CT at that rung of the pyramid (a rung above its top is pooled from the top)
+        roi = data.read_rung(data.rungs(volume), k, (z0, y0, x0), (Z, Y, X)).astype(np.uint8)
+    ax = data.axis_at(ax, k)
     r = 0.0 if st["args"].get("no_radial") else float(radial_sign)  # training zeroed the radial channels
     data.NORM = tuple(st["args"]["norm_stats"]) if st["args"].get("norm") == "global" else None  # as trained
     rad = lambda c, o: data.radial(ax, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape) * r
     ctx = tuple(st["args"].get("ctx") or ())
-    cx = (lambda c, o: data.context(volume, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape, ctx)) if ctx else (lambda c, o: ())
-    preps = [lambda c, o: data.inputs(c, rad(c, o), cx(c, o))] + [(lambda c, o, l=l: data.inputs(l[c], rad(c, o), cx(c, o))) for l in luts]
+    kk = k if scale else None  # the scale plane only exists in checkpoints trained with it
+    kr = k if (rung is not None or scale) else None  # legacy: let context() take the rung from the level path
+    cx = (lambda c, o: data.context(volume, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape, ctx, rung=kr)) if ctx else (lambda c, o: ())
+    preps = [lambda c, o: data.inputs(c, rad(c, o), cx(c, o), rung=kk)] + [(lambda c, o, l=l: data.inputs(l[c], rad(c, o), cx(c, o), rung=kk)) for l in luts]
     pick = (lambda p: p) if head == "all" else HEADS[head] if isinstance(head, str) else (lambda p: p[:, int(head)])
     fn = lambda t: pick(torch.sigmoid(net(t)))  # (B,C,...) -> (B,...)  (or (B,C,...) for "all")
     if tta > 1:
@@ -236,11 +246,11 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
     return sum(slide(fn, roi, window, halo, dev, pr) for pr in preps) / len(preps), st
 
 
-def predict(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=None, volcomp=True, ome=False, tta=0, luts=(), head=0, radial_sign=1.0):
-    prob, st = probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=window, halo=halo, device=device, tta=tta, luts=luts, head=head, radial_sign=radial_sign)
+def predict(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=None, volcomp=True, ome=False, tta=0, luts=(), head=0, radial_sign=1.0, rung=None):
+    prob, st = probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=window, halo=halo, device=device, tta=tta, luts=luts, head=head, radial_sign=radial_sign, rung=rung)
     if ome:
         write_ome(out, u8(prob), (z0, y0, x0), full_shape=data.open_zarr(volume).shape[-3:],
                   meta={"checkpoint": str(ckpt), "step": int(st.get("step", 0)), "volume": volume})
     else:
-        write(out, prob, (z0, y0, x0), volcomp=volcomp, volume=volume)
+        write(out, prob, (z0, y0, x0), volcomp=volcomp, volume=volume, rung=2 if rung is None else int(rung))
     return out

@@ -6,6 +6,10 @@ A store entry "a.zarr,a_m7.zarr" names several teachers over the SAME box: one t
 (a multi-head student); the first one supplies the box, volume and umbilicus.
 """
 import itertools
+import json
+import math
+import os
+import re
 
 import numpy as np
 import torch
@@ -83,6 +87,11 @@ def axis(path=None):
     assert os.path.exists(path), f"no umbilicus at {path}: every scroll needs one (create it, then pass --umbilicus)"
     pts = sorted((p["z"], p["y"], p["x"]) for p in json.load(open(path))["control_points"])
     return np.array(pts, np.float64).T
+
+
+def axis_at(ax, rung):
+    """The scroll axis control points (given in rung-2 / level-0 voxels) expressed in rung-k voxels."""
+    return np.asarray(ax, np.float64) / (2.0 ** (int(rung) - 2))
 
 
 def radial(ax, origin, shape):
@@ -169,57 +178,286 @@ def augment(rng, x, tg):
     return np.ascontiguousarray(x), tg
 
 
-CTX_CACHE = {}
+# --------------------------------------------------------------------------------- the rung ladder
+# Rung k has voxel size 0.6 * 2^k um (docs/unified_design.md section 1): 2.4 um = rung 2, 1228.8 um = rung 11.
+# A pyramid group is either an exported prediction group (levels named by the exact voxel size in um, with
+# OME multiscales in the group's zarr.json) or a CT mirror (integer level names: level l of a <native> um
+# volume is rung l + um_rung(native)).
+
+CTX_CACHE = {}  # {group base: {rung: array}} and {f"{base}#{rung}": ndarray} for arrays small enough to keep
+
+RUNG0_UM = 0.6   # rung 0
+NRUNGS = 12      # rungs 0 .. 11
+NCTX = 9         # context cubes of a sample: rungs k+1 .. k+9
+SMALL_RUNG = 96 ** 3  # a rung this small is read once and kept in memory (the top of every pyramid)
 
 
-def levels(volume):
-    """The pyramid levels of a volume path '.../name.zarr/0' -> {level: zarr array} for the levels on disk
-    (a streamed URL is mapped to its local mirror first: stores made in the cloud record the URL)."""
-    import os
-    base = str(local(str(volume))).rstrip("/").rsplit("/", 1)[0]
-    if base not in CTX_CACHE:
-        d = {}
-        for l in range(1, 10):  # 4.8 um .. 1.23 mm (level 8: the cross-section, level 9: the whole scroll in one 256^3 cube)
-            if "://" not in base and not os.path.isdir(f"{base}/{l}"):
-                break  # a level missing from the local mirror is pooled from the one below, never streamed
-            try:
-                d[l] = open_zarr(f"{base}/{l}")
-            except Exception:
-                break
-        CTX_CACHE[base] = d
-    return CTX_CACHE[base]
+def rung_um(k):
+    """Voxel size of rung k, in micrometres."""
+    return RUNG0_UM * 2.0 ** int(k)
 
 
-def context(volume, origin, shape, ctx):
-    """Coarse cubes of the SAME size centred on the same point as the level-0 patch at `origin`/`shape`:
-    one (Z,Y,X) uint8 cube per level in `ctx` (1 = 4.8um, 2 = 9.6um, 3 = 19.2um), read from the pyramid;
-    a level that is not on disk is made by 2x mean-pooling the level below. Outside the volume = 0 (air)."""
-    lv, out = levels(volume), []
-    c0 = np.asarray(origin, np.int64) + np.asarray(shape, np.int64) // 2  # centre, level-0 voxels
-    for l in ctx:
-        src = l if l in lv else max(lv) if lv else None
-        assert src is not None, f"{volume} has no pyramid levels for context channels"
-        f_read, extra = 2 ** src, 2 ** (l - src)  # read at `src`, pool by `extra`
-        n = np.asarray(shape, np.int64) * extra
-        lo = c0 // f_read - n // 2
-        a = lv[src]
-        hi = np.minimum(lo + n, a.shape[-3:])
-        lo_c = np.maximum(lo, 0)
-        cube = np.zeros(tuple(n), np.uint8)
-        if (hi > lo_c).all():
-            blk = a[lo_c[0]:hi[0], lo_c[1]:hi[1], lo_c[2]:hi[2]]
-            s = lo_c - lo
-            cube[s[0]:s[0] + blk.shape[0], s[1]:s[1] + blk.shape[1], s[2]:s[2] + blk.shape[2]] = blk
-        if extra > 1:
-            e = extra
-            cube = cube.reshape(shape[0], e, shape[1], e, shape[2], e).mean((1, 3, 5)).astype(np.uint8)
-        out.append(cube)
+def um_rung(um):
+    """The rung a voxel size belongs to (nearest in log2): 2.4 -> 2, 9.6 -> 4, 1228.8 -> 11."""
+    return int(round(math.log2(float(um) / RUNG0_UM)))
+
+
+def pyramid_base(path):
+    """'<name>.zarr/0', '<name>.zarr/2.4' or '<name>.zarr' -> the group '<name>.zarr'."""
+    p = str(path).rstrip("/")
+    head, _, last = p.rpartition("/")
+    return head if head and re.fullmatch(r"[0-9]+(\.[0-9]+)?", last) else p
+
+
+def native_um(base):
+    """The native voxel size of a pyramid, from its volume name ('...-2.400um-...'); 2.4 um by default."""
+    m = re.search(r"([0-9]+(?:\.[0-9]+)?)um", os.path.basename(str(base).rstrip("/")))
+    return float(m.group(1)) if m else 2.4
+
+
+def group_meta(base):
+    """(multiscales dict | None, attributes dict) of a pyramid group, read straight off disk."""
+    for name in ("zarr.json", ".zattrs"):
+        p = f"{base}/{name}"
+        if os.path.exists(p):
+            j = json.load(open(p))
+            at = j.get("attributes", j) if isinstance(j, dict) else {}
+            ms = (at.get("ome") or at).get("multiscales") if isinstance(at, dict) else None
+            return (ms[0] if ms else None), (at if isinstance(at, dict) else {})
+    return None, {}
+
+
+def rungs(base):
+    """{rung: zarr array} of a pyramid group (a level path such as '.../x.zarr/0' names its group).
+    Levels named by voxel size ('2.4', '1228.8': the exported prediction groups) are placed by that size;
+    integer level names (the CT mirrors) by the group's native voxel size plus the level index. Only the
+    levels actually on disk are returned, and nothing is ever streamed (data.local first)."""
+    base = pyramid_base(local(str(base)))
+    assert "://" not in base, f"{base}: the rung ladder is read from local mirrors only, never over HTTP"
+    if base in CTX_CACHE:
+        return CTX_CACHE[base]
+    ms, at = group_meta(base)
+    names = [str(d["path"]) for d in ms["datasets"]] if ms else sorted(os.listdir(base))
+    nat = float((at.get("volcomp") or {}).get("rung_voxel_size_um") or native_um(base))
+    out = {}
+    for n in names:
+        if not re.fullmatch(r"[0-9]+(\.[0-9]+)?", n) or not os.path.isdir(f"{base}/{n}"):
+            continue
+        k = um_rung(float(n)) if "." in n else um_rung(nat) + int(n)  # um name vs integer level name
+        try:
+            out[k] = open_zarr(f"{base}/{n}")
+        except Exception:
+            pass
+    assert out, f"{base}: no pyramid levels on disk"
+    CTX_CACHE[base] = out
     return out
 
 
-def inputs(ct, rad, ctx=()):
-    """Model input (1+len(ctx)+3, Z,Y,X): z-scored CT, z-scored coarse context cubes, radial unit vector."""
-    return np.concatenate([zscore(ct)[None]] + [zscore(c)[None] for c in ctx] + [rad])
+def base_rung(path):
+    """The rung of the level a path names ('.../x.zarr/0'), or the finest rung of the group."""
+    p = str(local(str(path))).rstrip("/")
+    base = pyramid_base(p)
+    pyr = rungs(base)
+    last = p.rpartition("/")[2]
+    if base != p and re.fullmatch(r"[0-9]+(\.[0-9]+)?", last):
+        if "." in last:
+            return um_rung(float(last))
+        ms, at = group_meta(base)
+        return um_rung(float((at.get("volcomp") or {}).get("rung_voxel_size_um") or native_um(base))) + int(last)
+    return min(pyr)
+
+
+def levels(volume):
+    """Backward compatibility: {level offset: array} of the rungs ABOVE the level `volume` names."""
+    k0, pyr = base_rung(volume), rungs(volume)
+    return {k - k0: a for k, a in pyr.items() if k > k0}
+
+
+def read_block(pyr, k, lo, hi):
+    """pyr[k][lo:hi] as float32, keeping a small rung entirely in memory (CTX_CACHE)."""
+    a = pyr[k]
+    if int(np.prod(a.shape[-3:])) <= SMALL_RUNG:
+        key = f"{a.store_path}#{k}"
+        if key not in CTX_CACHE:
+            CTX_CACHE[key] = np.asarray(a[:] if a.ndim == 3 else a[0])
+        a = CTX_CACHE[key]
+        return a[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]].astype(np.float32)
+    s = (slice(int(lo[0]), int(hi[0])), slice(int(lo[1]), int(hi[1])), slice(int(lo[2]), int(hi[2])))
+    return np.asarray(a[(0,) + s] if a.ndim == 4 else a[s], np.float32)
+
+
+def read_rung(pyr, k, lo, p):
+    """The (Z,Y,X) float32 cube of a pyramid at rung k, corner `lo`, size `p` (both in rung-k voxels).
+    A rung above the top of the pyramid is made by 2x mean pooling the highest rung that exists -- the
+    physical extent is the same, so the scroll simply shrinks inside the cube. Outside the array = 0."""
+    src = max((r for r in pyr if r <= k), default=None)
+    assert src is not None, f"pyramid has no rung at or below {k} (has {sorted(pyr)})"
+    e = 1 << (k - src)
+    p = shape3(p)
+    n, slo = p * e, np.asarray(lo, np.int64) * e
+    cube = np.zeros(tuple(n), np.float32)
+    lo_c, hi = np.maximum(slo, 0), np.minimum(slo + n, np.array(pyr[src].shape[-3:], np.int64))
+    if (hi > lo_c).all():
+        blk = read_block(pyr, src, lo_c, hi)
+        s = lo_c - slo
+        cube[s[0]:s[0] + blk.shape[0], s[1]:s[1] + blk.shape[1], s[2]:s[2] + blk.shape[2]] = blk
+    if e > 1:
+        cube = cube.reshape(p[0], e, p[1], e, p[2], e).mean((1, 3, 5))
+    return cube
+
+
+def context(volume, origin, shape, ctx, rung=None):
+    """Coarse cubes of the SAME size centred on the same point as the patch at `origin`/`shape`:
+    one (Z,Y,X) uint8 cube per OFFSET in `ctx` (1 = one rung coarser, 2 = two rungs, ...), read from the
+    pyramid of `volume`. `origin`/`shape` are voxels of rung `rung` (default: the rung `volume` names).
+    A rung above the top of the pyramid is pooled from the highest one that exists; outside = 0 (air)."""
+    pyr, out = rungs(volume), []
+    k0 = base_rung(volume) if rung is None else int(rung)
+    c0 = np.asarray(origin, np.int64) + shape3(shape) // 2  # centre, rung-k0 voxels
+    for d in ctx:
+        lo = c0 // (1 << int(d)) - shape3(shape) // 2  # the same centre, in rung-(k0+d) voxels
+        out.append(read_rung(pyr, k0 + int(d), lo, shape).astype(np.uint8))
+    return out
+
+
+def scale_plane(rung, shape):
+    """The constant scale channel of a sample at rung k: (k - 2) / 9, 0 at 2.4 um."""
+    return np.full(tuple(shape3(shape)), (int(rung) - 2) / 9.0, np.float32)
+
+
+def inputs(ct, rad, ctx=(), rung=None):
+    """Model input (1 + len(ctx) + (rung is not None) + 3, Z,Y,X): z-scored CT, z-scored coarse context
+    cubes, the constant scale plane (only when a rung is given) and the radial unit vector. The scale
+    plane sits right before the radial channels, so warm-starting a 13-channel checkpoint zero-fills it."""
+    sc = [scale_plane(rung, ct.shape)[None]] if rung is not None else []
+    return np.concatenate([zscore(ct)[None]] + [zscore(c)[None] for c in ctx] + sc + [rad])
+
+
+# ------------------------------------------------------------- which chunks of a level exist locally
+# The desk's CT mirror has a PARTIAL level 0 (rung 2): only the chunks under earlier teacher boxes were
+# pulled, and a missing chunk reads as zeros. Sampling must not land on one.
+
+CHUNK_INDEX = {}
+
+
+def array_dir(arr):
+    p = str(getattr(arr.store, "root", "") or arr.store_path)
+    p = p[len("file://"):] if p.startswith("file://") else p
+    sub = getattr(arr, "path", "") or ""
+    return os.path.join(p, sub) if sub and not p.endswith(sub) else p
+
+
+def chunk_index(arr):
+    """((gz, gy, gx) write-chunk size, present[bool array]) of a local array: which chunk (shard) keys are
+    on disk. Scanned once per array and cached. Returns (grid, None) when every chunk is present."""
+    d = array_dir(arr)
+    if d in CHUNK_INDEX:
+        return CHUNK_INDEX[d]
+    g = np.array(getattr(arr, "shards", None) or arr.chunks, np.int64)[-3:]
+    n = -(-np.array(arr.shape[-3:], np.int64) // g)
+    pres = np.zeros(tuple(n), bool)
+    if os.path.isdir(d):
+        for root, _, files in os.walk(d):
+            for f in files:
+                rel = os.path.relpath(os.path.join(root, f), d).replace("\\", "/")
+                parts = [q for q in rel.split("/") if q != "c"]
+                if len(parts) == 1 and parts[0].count(".") == 2:  # zarr v2 "z.y.x"
+                    parts = parts[0].split(".")
+                if len(parts) == 3 and all(q.isdigit() for q in parts):
+                    i = tuple(int(q) for q in parts)
+                    if all(a < b for a, b in zip(i, n)):
+                        pres[i] = True
+    out = (g, None if pres.all() else pres)
+    CHUNK_INDEX[d] = out
+    return out
+
+
+def covered(arr, lo, n):
+    """Is every chunk of arr overlapping [lo, lo+n) present on disk?"""
+    g, pres = chunk_index(arr)
+    if pres is None:
+        return True
+    lo, n = np.asarray(lo, np.int64), np.asarray(n, np.int64)
+    a = np.maximum(lo, 0) // g
+    b = -(-np.minimum(lo + n, np.array(arr.shape[-3:], np.int64)) // g)
+    if (b <= a).any():  # the window is entirely outside the array: nothing to read
+        return True
+    return bool(pres[a[0]:b[0], a[1]:b[1], a[2]:b[2]].all())
+
+
+def coverage(arr):
+    """The fraction of an array's chunks that are on disk."""
+    _, pres = chunk_index(arr)
+    return 1.0 if pres is None else float(pres.mean())
+
+
+# --------------------------------------------------------------------------------- rung sources
+# A source is one line of the stores file: `ct_base,target_group[,target_group...]`. The CT base is a
+# pyramid group (or one of its levels); every target group is a whole-scroll (or boxed) prediction
+# pyramid on the ladder, one output CHANNEL each. Both are read at the same rung and the same grid.
+
+
+def group_attrs(base):
+    return group_meta(pyramid_base(local(str(base))))[1]
+
+
+def rung_shape(pyr, k):
+    """The (Z,Y,X) shape a pyramid has at rung k (pooled from the highest rung below when k is above it)."""
+    src = max(r for r in pyr if r <= k)
+    return -(-np.array(pyr[src].shape[-3:], np.int64) // (1 << (k - src)))
+
+
+def target_box(t, k):
+    """(lo, size) of a target at rung k, in rung-k voxels: its `box` attr (given at its native rung) or
+    the whole array."""
+    if t["box"] is None:
+        return np.zeros(3, np.int64), rung_shape(t["pyr"], k)
+    o, s = np.array(t["box"][0], np.int64), np.array(t["box"][1], np.int64)
+    d = k - t["native"]
+    return (o >> d, np.maximum(-(-s >> d), 1)) if d >= 0 else (o << -d, s << -d)
+
+
+def source_groups(lines):
+    """Parse and open `ct_base,target_group[,target_group...]` lines. Each source:
+    {ct, ct_pyr, targets: {channel: {pyr, weight, box, native}}, native, umbilicus, voxels}."""
+    out = []
+    for line in lines:
+        parts = [q.strip() for q in str(line).split(",") if q.strip()]
+        assert len(parts) >= 2, f"{line!r}: a rung source is 'ct_base,target_group[,target_group...]'"
+        src = {"ct": parts[0], "ct_pyr": rungs(parts[0]), "line": ",".join(parts), "targets": {}}
+        umb = None
+        for g in parts[1:]:
+            pyr, at = rungs(g), group_attrs(g)
+            ch = at.get("channel") or (at.get("channels") or ["recto"])[0]
+            assert ch not in src["targets"], f"{line!r}: two targets for channel {ch}"
+            bx = at.get("box")
+            src["targets"][ch] = {"path": g, "pyr": pyr, "native": min(pyr),
+                                  "weight": float(at.get("weight", 1.0)),
+                                  "box": (bx[0], bx[1]) if bx else None}
+            umb = umb or at.get("umbilicus")
+        src["native"] = min(t["native"] for t in src["targets"].values())
+        src["umbilicus"] = umb or group_attrs(parts[0]).get("umbilicus") or UMBILICUS
+        src["voxels"] = float(np.prod(target_box(next(iter(src["targets"].values())), src["native"])[1]))
+        out.append(src)
+    return out
+
+
+def usable_rungs(src, allowed=None):
+    """The rungs a source can be sampled at: its native rung .. NRUNGS - 1, intersected with `allowed`."""
+    ks = list(range(src["native"], NRUNGS))
+    return [k for k in ks if allowed is None or k in allowed]
+
+
+def rung_probs(src, patch, allowed=None, boost=None):
+    """{rung: probability} within a source: proportional to n_k ** 0.5 with n_k = (target voxels at rung k)
+    / (voxels per patch), floored at 1, times an optional per-rung multiplier (`boost`)."""
+    per = float(np.prod(shape3(patch)))
+    ks = usable_rungs(src, allowed)
+    assert ks, f"{src['line']}: no usable rung (native {src['native']}) among {sorted(allowed or [])}"
+    t = next(iter(src["targets"].values()))
+    w = np.array([max(float(np.prod(target_box(t, k)[1])) / per, 1.0) ** 0.5 *
+                  float((boost or {}).get(k, 1.0)) for k in ks])
+    return dict(zip(ks, w / w.sum()))
 
 
 class Patches(torch.utils.data.IterableDataset):
@@ -227,19 +465,46 @@ class Patches(torch.utils.data.IterableDataset):
 
     def __init__(self, patch=128, ct=CT, stores=TRAIN, exclude=VAL, seed=0, air_keep=0.1, fg_min=0.05,
                  fg_keep=0.25, sym=True, aug=None, dense_pow=0.0, dense_ref=0.2, ctx=(), stores_file=None,
-                 recheck=200):
+                 recheck=200, rungs=None, rung_boost=None, channels=None):
         """dense_pow > 0 biases sampling towards sheet-dense patches: a patch whose target mean m is below
         dense_ref is kept with probability (m / dense_ref) ** dense_pow (crushed windings are where students fail).
         stores_file: instead of `stores`, a text file with one comma-joined group per line that is re-read
         whenever its mtime changes (checked every `recheck` patches): a training run picks up new stores as
-        they are generated, and keeps sampling the old ones (by voxel count) when nothing new arrived."""
+        they are generated, and keeps sampling the old ones (by voxel count) when nothing new arrived.
+
+        rungs: switches on the MULTI-RESOLUTION mode (docs/unified_design.md). Every line of `stores` /
+        `stores_file` is then `ct_base,target_group[,target_group...]`: a CT pyramid plus one whole-scroll
+        target pyramid per output channel, both addressed by rung (rung k = 0.6 * 2^k um). A sample is
+        (source, rung k, corner): the CT and the targets are read at rung k, the context cubes at rungs
+        k + ctx[0] .. k + ctx[-1], and the loader yields (x, target, weight, rung). `rungs` is the set of
+        allowed rungs (None inside rung mode = every usable one), `rung_boost` {rung: multiplier} skews the
+        rung mix, `channels` fixes the output channel order (default: order of first appearance).
+
+        The rung mix within a source is p_k ~ n_k ** 0.5, n_k = target voxels at rung k / voxels per patch
+        (floored at 1): n_k falls 8x per rung, so each rung is 2 * sqrt(2) times rarer than the one below
+        until the floor flattens the top. Measured mix for the Paris 4 bootstrap at 256^3 (`usrm2 rung-mix`,
+        whole scroll = 75784 x 32693^2 at rung 2), two sources -- the recto mask pulled from the published
+        4.8 um level (native rung 3) and the m7 mask (native rung 4) -- weighted by their voxel counts
+        (recto 88.9 %, m7 11.1 %):
+
+            rung          3      4      5      6      7      8     9    10    11
+            recto      64.6%  22.8%   8.1%   2.9%   1.0%   0.4%  0.1%  0.1%  0.1%
+            m7            -   64.5%  22.8%   8.1%   2.9%   1.0%  0.4%  0.2%  0.2%
+            overall    57.4%  27.5%   9.7%   3.4%   1.2%   0.4%  0.1%  0.1%  0.1%
+
+        Rung 2 appears once a rung-2 target is added (the boxed level-0 recto mask); `--rung-boost 2=4`
+        skews the mix by hand."""
         super().__init__()
+        self.rungs, self.rung_boost, self.channels = rungs, dict(rung_boost or {}), channels
         self.norm, self.umbilicus = NORM, UMBILICUS  # module state the (spawned) workers must inherit explicitly
         self.stores_file, self.recheck, self.file_mtime = stores_file, recheck, None
         if stores_file:
             stores = self.read_groups()
         self.patch, self.ct_path, self.paths, self.seed = shape3(patch), ct, [str(s).split(",") for s in stores], seed
-        self.exclude = [e for e in (exclude if isinstance(exclude, (list, tuple)) else [exclude]) if e]
+        ex = exclude if isinstance(exclude, (list, tuple)) else [exclude]
+        if len(ex) == 2 and not isinstance(ex[0], str) and np.ndim(ex[0]) == 1:
+            ex = [exclude]  # a single (origin, size) box, not two excludes
+        self.exclude = [e for e in ex if e is not None and (isinstance(e, tuple) or len(e))]
         self.dense_pow, self.dense_ref, self.ctx = dense_pow, dense_ref, tuple(ctx)  # coarse context levels
         self.sym = sym  # the 48 cube symmetries; the GPU augs are in aug.py
         self.aug = aug or {}  # the worker-side raw-uint8 stage: window / volcomp / blank
@@ -258,9 +523,99 @@ class Patches(torch.utils.data.IterableDataset):
         except OSError:  # being rewritten
             return False
 
+    def _open_rungs(self):
+        """Rung mode: open the source lines (CT pyramid + target pyramids), their rung mixes and the
+        held-out boxes (given at rung 2 and scaled to every rung)."""
+        global NORM, UMBILICUS
+        NORM, UMBILICUS = self.norm, self.umbilicus
+        if self.stores_file:
+            self.paths = [g.split(",") for g in self.read_groups()]
+            assert self.paths, f"{self.stores_file} lists no store groups"
+        self.srcs = source_groups([",".join(ps) for ps in self.paths])
+        if self.channels is None:
+            self.channels = list(dict.fromkeys(c for s in self.srcs for c in s["targets"]))
+        allowed = None if self.rungs is True else set(self.rungs)
+        for s in self.srcs:
+            s["probs"] = rung_probs(s, self.patch, allowed, self.rung_boost)
+            s["axis"] = axis(s["umbilicus"])
+        self.w = np.array([s["voxels"] for s in self.srcs], np.float64)
+        self.w /= self.w.sum()
+        self.ex = [e if isinstance(e, (tuple, list)) and len(e) == 2 and not isinstance(e[0], str)
+                   else val_box(e) for e in self.exclude]  # (origin, size) at rung 2
+        self.arrs = self.srcs
+
+    def _rung_sample(self, rng):
+        """One (x, tgt, w, rung) draw, or None when the corner is rejected."""
+        p = self.patch
+        i = rng.choice(len(self.srcs), p=self.w)
+        s = self.srcs[i]
+        ks, pk = list(s["probs"]), np.array(list(s["probs"].values()))
+        k = int(rng.choice(ks, p=pk))
+        t0 = next(iter(s["targets"].values()))
+        blo, bs = target_box(t0, k)
+        lo_min, lo_max = np.minimum(blo, blo + bs - p), np.maximum(blo, blo + bs - p)
+        lo = rng.integers(lo_min, lo_max + 1)
+        for o, sz in self.ex:  # the held-out box, given at rung 2
+            d = k - 2
+            eo, es = (np.array(o) >> d, np.maximum(np.array(sz) >> d, 1)) if d >= 0 else (np.array(o) << -d, np.array(sz) << -d)
+            if np.all(lo < eo + es) and np.all(lo + p > eo):
+                return None
+        cpyr = s["ct_pyr"]
+        csrc = max(r for r in cpyr if r <= k)
+        e = 1 << (k - csrc)
+        if not covered(cpyr[csrc], lo * e, p * e):  # a partially mirrored level (level 0 of the desk's CT)
+            return None
+        bl = self.aug.get("blank")
+        if bl and rng.random() < bl["p"]:  # an all-air patch (CT 0 = air) with target 0
+            ct = np.zeros(tuple(p), np.uint8)
+            tg = np.zeros((len(self.channels),) + tuple(p), np.float32)
+            w = np.zeros_like(tg)
+        else:
+            ct = read_rung(cpyr, k, lo, p).astype(np.uint8)
+            if (ct == 0).mean() > 0.9 and rng.random() > self.air_keep:
+                return None
+            tg, w = self._rung_target(s, k, lo, ct)
+            m = float((tg * (w > 0)).sum() / max((w > 0).sum(), 1))
+            if m < self.fg_min and rng.random() > self.fg_keep:
+                return None
+            if self.dense_pow > 0 and m < self.dense_ref and rng.random() > (m / self.dense_ref) ** self.dense_pow:
+                return None
+            ct = raw(rng, ct, self.aug)
+        cx = context(s["ct"], lo, ct.shape, self.ctx, rung=k) if self.ctx else ()
+        rad = radial(axis_at(s["axis"], k), lo, ct.shape)
+        x = inputs(ct, rad, cx, rung=k)
+        if self.sym:
+            x, tw = augment(rng, x, np.concatenate([tg, w]))
+            tg, w = tw[:len(self.channels)], tw[len(self.channels):]
+        return x, tg, w, k
+
+    def _rung_target(self, s, k, lo, ct):
+        """(target, weight) at rung k: one channel per output channel, 0 (weight 0) for a channel this
+        source does not provide; weight 1 inside the target's box and where CT > 0, times its source weight."""
+        p = self.patch
+        tg = np.zeros((len(self.channels),) + tuple(p), np.float32)
+        w = np.zeros_like(tg)
+        inside_ct = (ct > 0).astype(np.float32)
+        for c, chan in enumerate(self.channels):
+            t = s["targets"].get(chan)
+            if t is None:
+                continue  # per-channel ignore: this source says nothing about that channel
+            tg[c] = np.clip(read_rung(t["pyr"], k, lo, p) / 255.0, 0, 1)
+            blo, bs = target_box(t, k)
+            ins = np.zeros(tuple(p), np.float32)
+            a = np.maximum(blo - lo, 0)
+            b = np.minimum(blo + bs - lo, p)
+            if (b > a).all():
+                ins[a[0]:b[0], a[1]:b[1], a[2]:b[2]] = 1.0
+            w[c] = ins * inside_ct * t["weight"]
+            tg[c] *= inside_ct  # masked CT (0) carries no surface
+        return tg, w
+
     def _open(self):
         """Each teacher store names its CT volume and scroll axis (attrs), so stores from several scrolls can mix."""
         global NORM, UMBILICUS
+        if self.rungs is not None:
+            return self._open_rungs()
         NORM, UMBILICUS = self.norm, self.umbilicus  # forkserver workers start with fresh module globals
         if self.stores_file:
             self.paths = [g.split(",") for g in self.read_groups()]
@@ -297,6 +652,15 @@ class Patches(torch.utils.data.IterableDataset):
                 self._open()  # the group list grew (or changed): re-open everything, new weights
                 print(f"stores file changed: {n0} -> {len(self.paths)} groups", flush=True)
                 served += 1
+            if self.rungs is not None:
+                got = self._rung_sample(rng)
+                if got is None:
+                    continue
+                x, tg, w, k = got
+                rejected, served = 0, served + 1
+                yield torch.from_numpy(np.ascontiguousarray(x)), torch.from_numpy(np.ascontiguousarray(tg)), \
+                    torch.from_numpy(np.ascontiguousarray(w)), k
+                continue
             i = rng.choice(len(self.arrs), p=self.w)
             o, s = self.boxes[i]
             m = np.where(p > s - 2 * MARGIN, 0, MARGIN)  # a patch spanning a whole axis (384 z) may use the edges
@@ -350,6 +714,89 @@ def val_grid(patch=128, ct=CT, store=VAL, limit=32, ctx=()):
         vol = tga.attrs.get("volume", ct)
         cx = context(vol, g, c.shape, ctx) if ctx else ()
         out.append((torch.from_numpy(inputs(c, radial(ax, g, c.shape), cx)), torch.from_numpy(t)))
+    return out
+
+
+def rung_mix(lines, patch=256, allowed=None, boost=None):
+    """The sampling mix of a stores file: one row per (source, rung) with the target size at that rung,
+    n_k = target voxels / patch voxels, the probability inside the source and overall, and how much of the
+    CT level that rung reads is mirrored locally."""
+    srcs = source_groups(lines)
+    sw = np.array([s["voxels"] for s in srcs], np.float64)
+    sw /= sw.sum()
+    per, rows = float(np.prod(shape3(patch))), []
+    for s, ws in zip(srcs, sw):
+        for k, p in rung_probs(s, patch, allowed, boost).items():
+            t = next(iter(s["targets"].values()))
+            shp = target_box(t, k)[1]
+            csrc = max(r for r in s["ct_pyr"] if r <= k)
+            rows.append({"source": s["line"], "rung": k, "um": rung_um(k), "shape": tuple(int(v) for v in shp),
+                         "n": max(float(np.prod(shp)) / per, 1.0), "p_src": float(p), "p": float(ws * p),
+                         "ct_rung": csrc, "ct_coverage": coverage(s["ct_pyr"][csrc])})
+    return rows
+
+
+def format_rung_mix(rows):
+    out = []
+    for line in dict.fromkeys(r["source"] for r in rows):
+        out.append(line)
+        out.append(f"  {'rung':>4} {'um':>8} {'target at rung':>22} {'n_k':>12} {'p|src':>7} {'p':>7} "
+                   f"{'CT rung':>7} {'CT local':>9}")
+        for r in [q for q in rows if q["source"] == line]:
+            out.append(f"  {r['rung']:>4} {r['um']:>8.1f} {str(r['shape']):>22} {r['n']:>12.1f} "
+                       f"{100 * r['p_src']:>6.1f}% {100 * r['p']:>6.1f}% {r['ct_rung']:>7} {100 * r['ct_coverage']:>8.1f}%")
+    return "\n".join(out)
+
+
+def val_box(store=VAL):
+    """(origin, size) of a held-out region in rung-2 voxels: a 'z0,y0,x0,Z,Y,X' string, a pair already,
+    or a teacher store whose attrs carry origin_zyx and shape."""
+    if isinstance(store, (tuple, list)):
+        if len(store) == 1:  # argparse nargs="+" hands over a one-element list
+            return val_box(store[0])
+        if len(store) == 6 and not isinstance(store[0], str):
+            return np.array(store[:3], np.int64), np.array(store[3:], np.int64)
+        if len(store) == 2 and not isinstance(store[0], str):
+            return np.array(store[0], np.int64), np.array(store[1], np.int64)
+    s = str(store)
+    if re.fullmatch(r"[-0-9]+(,[-0-9]+){5}", s):
+        v = [int(q) for q in s.split(",")]
+        return np.array(v[:3], np.int64), np.array(v[3:], np.int64)
+    return box(open_zarr(s.split(",")[0]))
+
+
+VAL_RUNGS = (2, 3, 4, 6)  # the rungs the held-out box is scored at
+
+
+def val_grid_rungs(patch, stores, box2, rungs=VAL_RUNGS, limit=8, ctx=(), channels=None):
+    """Per-rung validation: the held-out box (given at rung 2) read at each rung from the same pyramids
+    as training. Returns [(x, target, weight, rung)] -- the same tuples the rung loader yields."""
+    srcs = source_groups(stores)
+    if channels is None:
+        channels = list(dict.fromkeys(c for s in srcs for c in s["targets"]))
+    ds = Patches(patch=patch, stores=stores, exclude=[], rungs=True, ctx=ctx, channels=channels, sym=False)
+    ds._open_rungs()
+    p3, out = shape3(patch), []
+    o2, s2 = val_box(box2)
+    for k in rungs:
+        d = k - 2
+        o = (o2 >> d, np.maximum(s2 >> d, 1)) if d >= 0 else (o2 << -d, s2 << -d)
+        org, sz = o
+        corners = [(z, y, x) for z in range(0, max(int(sz[0]) - int(p3[0]), 0) + 1, int(p3[0]))
+                   for y in range(0, max(int(sz[1]) - int(p3[1]), 0) + 1, int(p3[1]))
+                   for x in range(0, max(int(sz[2]) - int(p3[2]), 0) + 1, int(p3[2]))]
+        if limit and len(corners) > limit:
+            corners = [corners[i] for i in np.linspace(0, len(corners) - 1, limit).astype(int)]
+        for s in ds.srcs[:1]:  # the first source supplies the validation CT and targets
+            for c in corners:
+                lo = org + np.array(c, np.int64)
+                ct = read_rung(s["ct_pyr"], k, lo, p3).astype(np.uint8)
+                tg, w = ds._rung_target(s, k, lo, ct)
+                cx = context(s["ct"], lo, ct.shape, ctx, rung=k) if ctx else ()
+                x = inputs(ct, radial(axis_at(s["axis"], k), lo, ct.shape), cx, rung=k)
+                out.append((torch.from_numpy(np.ascontiguousarray(x)), torch.from_numpy(tg),
+                            torch.from_numpy(w), k))
+    assert out, "the validation box is smaller than one patch at every rung"
     return out
 
 

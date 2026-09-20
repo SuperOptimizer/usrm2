@@ -194,3 +194,27 @@ The training loader then reads these directly as target pyramids (values / 255),
 The first training of the unified model uses ONLY the exported upstream predictions (the Paris 4 recto and m7 mask
 pyramids, then the other scrolls' m7), not our own teacher probability stores and not the verso stores. Those come
 back in later rounds. Every rung 2..11 of Paris 4 is covered by the upstream masks alone.
+
+## 11. Implemented (2026-09-19, this commit)
+
+Sections 1-4 and 7.2-7.4 are in the code; the importer of 7.1 is not needed any more (section 9: the
+exported pyramids are read directly).
+
+- `data.rungs(base)` -> {rung: array} for both naming schemes (um level names via the group's OME
+  multiscales, integer level names via the volume's native um), `data.read_rung` (pooling above the top of a
+  pyramid), `data.context(..., rung=k)` (offsets, so `--ctx 1 2 3` means rungs k+1..k+3), `data.scale_plane`,
+  `data.inputs(..., rung=k)`.
+- `data.Patches(..., rungs=...)`: sources are `ct_base,target_group[,...]` lines, a sample is
+  (source, rung, corner), the loader yields `(x, target, weight, rung)`. Rung probability ~ n_k ** 0.5 with an
+  optional `--rung-boost`; the measured Paris 4 mix is in the `Patches` docstring and `usrm2 rung-mix` prints
+  it for any stores file. `data.chunk_index` / `covered` keep sampling off the partially mirrored CT level 0.
+- `train.losses` / `deep_losses` / `evaluate` take the weight tensor (deep heads pool targets and weights);
+  the old `wtgt` channel convention still works for old runs. Per-rung validation (`dice_r2`, `dice_r3`, ...,
+  `dice` = their mean) on the held-out box read at `--val-rungs`; `train.jsonl` carries the rung histogram.
+  `train.warm_start` widens 13 -> 14 input channels (the scale plane sits before the radial vector and is
+  zero-filled) and takes head 0 of a 4-head checkpoint.
+- `usrm2 predict --rung k` slides over rung k of the CT pyramid (origin and size in rung-k voxels) and
+  records `rung` / `voxel_um` in the output attrs; without `--rung` nothing changes for old checkpoints.
+
+Not done here: the target importer / exporter side (volume-compressor does it), `cloud/mirror_scroll.py` and
+the fine-scan resampler (section 7.5), and the verso head.

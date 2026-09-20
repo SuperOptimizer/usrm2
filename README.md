@@ -25,6 +25,24 @@ input is a z-scored CT patch, output is one recto-probability logit per voxel.
   calibrated on PHercParis4 vs PHerc1667), `tone`, `thick`, `volcomp`, `blank` and the ESRF/nabu
   recon set (`haze`, `unsharp`, `quant`, `cor`); `all2_light` halves every `p`.
 
+## The rung ladder (unified multi-resolution model, `docs/unified_design.md`)
+- Rung `k` has voxel size `0.6 * 2^k` um: 2.4 um is rung 2, 1228.8 um rung 11 (12 rungs). Level `l` of a
+  2.4 um CT mirror is rung `l + 2`; the exported prediction pyramids name their levels by the exact voxel
+  size in um (`2.4/`, `4.8/`, ... `1228.8/`) and state it in the group's OME `multiscales`. `data.rungs(base)`
+  reads either scheme, always from the local mirror (never over HTTP).
+- A training source is one line `ct_base,target_group[,target_group...]`: a CT pyramid plus one whole-scroll
+  target pyramid per output channel (group attrs: `channel`, `weight`, `box`, `umbilicus`). A sample is
+  (source, rung, corner); the loader yields `(x, target, weight, rung)` with
+  `x = [CT at rung k, 9 context cubes at rungs k+1..k+9, scale plane (k-2)/9, radial vector]` = 14 channels.
+  The weight is 1 inside the target box where CT > 0, times the source weight, and 0 for a channel a source
+  does not provide. The desk's partially mirrored CT level 0 is handled by a per-level chunk index: corners
+  whose CT chunks are not on disk are never drawn.
+
+    usrm2 train RUN --rungs 2-11 --ctx 1 2 3 4 5 6 7 8 9 --patch 256 --stores-file stores.txt \
+        --rung-boost 2=2 --val-rungs 2,3,4,6
+    usrm2 rung-mix stores.txt --patch 256      # the sampling mix and the local CT coverage per rung
+    usrm2 predict RUN/ckpt.pt out.zarr --rung 4 --origin ... --size ...   # origin/size in rung-4 voxels
+
 ## Commands
     usrm2 train /vesuvius/usrm2/runs/p4_1m --size 1m --steps 20000 --patch 128 --batch 1
     usrm2 eval  /vesuvius/usrm2/runs/p4_1m/ckpt.pt
