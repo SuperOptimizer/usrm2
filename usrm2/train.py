@@ -197,12 +197,12 @@ def val_png(path, net, grid, dev, norad=False, cascade=None):
             c = (c - c.min()) / (c.max() - c.min() + 1e-6) * 255 * 0.9
             gray = np.repeat(c[..., None], 3, -1)
 
-            def overlay(chans):  # channel 0 red, channel 1 blue, on the same tile (no threshold)
-                out = gray.copy()
-                for a, col in zip(chans, ([255, 40, 40], [40, 90, 255])):
-                    al = np.clip(a, 0, 1)[..., None] * 0.85
-                    out = out * (1 - al) + np.array(col) * al
-                return out
+            def overlay(chans):  # channel 0 red, channel 1 blue, mixed on one tile (overlap = purple)
+                a = [np.clip(v, 0, 1)[..., None] for v in chans]
+                cols = [np.array([255, 40, 40]), np.array([40, 90, 255])]
+                wsum = sum(a); al = np.maximum.reduce(a) * 0.85
+                col = sum(ai * ci for ai, ci in zip(a, cols)) / np.maximum(wsum, 1e-6)
+                return gray * (1 - al) + col * al
             tt, pp = t[:, z].numpy(), p[:, z].numpy()
             if pp.shape[0] == 2:  # --verso: CT | targets (recto red + verso blue) | prediction (recto red + verso blue)
                 tiles = [gray, overlay(tt[:2]), overlay(pp[:2])]
