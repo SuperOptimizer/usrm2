@@ -177,8 +177,8 @@ def grid_cout(item):
 def val_png(path, net, grid, dev, norad=False, cascade=None):
     """Middle z-slice of the first 4 val patches: CT (gray), each teacher target and each student OUTPUT
     CHANNEL as a red opacity overlay (no threshold), tiled patches x [CT, targets..., channels...]. With
-    `--verso` (cout 2) that is CT, recto target, verso target, recto prediction, verso prediction; a verso
-    target the val box has no store for is simply black."""
+    `--verso` (cout 2) it is three tiles: CT | recto target red + verso target blue | recto prediction red +
+    verso prediction blue, both on the same tile; a verso target the val box has no store for adds nothing."""
     from PIL import Image
     rows = []
     with torch.no_grad():
@@ -195,10 +195,19 @@ def val_png(path, net, grid, dev, norad=False, cascade=None):
             z = x.shape[1] // 2
             c = x[0, z].numpy()
             c = (c - c.min()) / (c.max() - c.min() + 1e-6) * 255 * 0.9
-            tiles = [np.repeat(c[..., None], 3, -1)]
-            for a in list(t[:, z].numpy()) + list(p[:, z].numpy()):
-                al = np.clip(a, 0, 1)[..., None] * 0.85
-                tiles.append(np.repeat(c[..., None], 3, -1) * (1 - al) + np.array([255, 40, 40]) * al)
+            gray = np.repeat(c[..., None], 3, -1)
+
+            def overlay(chans):  # channel 0 red, channel 1 blue, on the same tile (no threshold)
+                out = gray.copy()
+                for a, col in zip(chans, ([255, 40, 40], [40, 90, 255])):
+                    al = np.clip(a, 0, 1)[..., None] * 0.85
+                    out = out * (1 - al) + np.array(col) * al
+                return out
+            tt, pp = t[:, z].numpy(), p[:, z].numpy()
+            if pp.shape[0] == 2:  # --verso: CT | targets (recto red + verso blue) | prediction (recto red + verso blue)
+                tiles = [gray, overlay(tt[:2]), overlay(pp[:2])]
+            else:
+                tiles = [gray] + [overlay([a]) for a in list(tt) + list(pp)]
             rows.append(np.concatenate(tiles, 1))
     Image.fromarray(np.concatenate(rows, 0).astype(np.uint8)).save(path)
 
