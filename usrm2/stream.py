@@ -206,7 +206,8 @@ async def fetch_group_meta(f, base):
 
 # ------------------------------------------------------------------ the no-repeat walk
 
-def region_walk(stores, rungs=True, seed=0, patch=256, region=1024, boost=None, exclude=(), records=False):
+def region_walk(stores, rungs=True, seed=0, patch=256, region=1024, boost=None, exclude=(), records=False,
+                walk="once", visits_max=64, epoch=0):
     """THE region walk, as a plain list -- the contract between the stream planner and anything else that
     has to visit the same regions in the same order (cloud/teacher_regions.py runs the upstream teacher
     over them and writes `data.teacher_region_path` stores, which the loader then prefers as the rung-2/3
@@ -220,7 +221,8 @@ def region_walk(stores, rungs=True, seed=0, patch=256, region=1024, boost=None, 
     ordered by `data.walk_order`, and every one of those is an input to both. At rung 2 an origin is a
     multiple of 1024 (the CT and the export are both 1024^3-sharded there), which is the region name.
 
-    `stores` is a stores file path or the lines themselves; `rungs` True or the allowed set."""
+    `stores` is a stores file path or the lines themselves; `rungs` True or the allowed set. `walk`/`visits_max`/
+    `epoch` must match the planner's (`--walk mix` = region_visits then the shuffle; a region is listed at its first visit)."""
     if isinstance(stores, str) and os.path.exists(stores):
         stores = [l.strip() for l in open(stores) if l.strip() and not l.startswith("#")]
     lines = [stores] if isinstance(stores, str) else list(stores)
@@ -228,8 +230,15 @@ def region_walk(stores, rungs=True, seed=0, patch=256, region=1024, boost=None, 
           for e in ([exclude] if isinstance(exclude, str) else list(exclude or []))]
     regs = data.region_list(data.source_groups(lines), patch=patch, region=region,
                             allowed=None if rungs is True else set(rungs), boost=boost, exclude=ex)
-    order = data.walk_order([r["w"] for r in regs], seed)
-    out = [regs[int(j)] for j in order]
+    if walk == "mix":  # exactly what the planner does in --walk mix: visits, then the seeded shuffle
+        regs = data.region_visits(regs, visits_max)
+    order = data.walk_order([r["w"] for r in regs], seed + 7919 * epoch)
+    out, seen = [], set()
+    for j in order:  # a region visited several times is listed once, at its first visit
+        r = regs[int(j)]
+        key = (r["s"], r["k"], tuple(r["lo"]))
+        if key not in seen:
+            seen.add(key); out.append(r)
     return out if records else [(lines[r["s"]], r["k"], tuple(r["lo"])) for r in out]
 
 

@@ -39,6 +39,19 @@ def regions(seed=0):
     return out
 
 
+def walk_regions(stores, seed, boost, walk="mix", rungs=range(2, 12)):
+    """The rung-2 regions of the Paris 4 recto in the ORDER the stream planner will visit them (the same stores,
+    rungs, boosts, seed and walk mode as the training run), so finished stores are found by the run as soon as
+    possible. Regions touching the val box are excluded by the walk itself."""
+    from usrm2 import stream
+    out = []
+    for line, k, lo in stream.region_walk(stores, rungs=set(rungs), seed=seed, patch=256, region=R, boost=boost,
+                                          exclude=data.VAL, walk=walk):
+        if k == 2 and MASK.rsplit("/", 1)[0] in line:
+            out.append(tuple(int(v) for v in lo))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="/vesuvius/usrm2/teacher_regions/recto")
@@ -50,9 +63,18 @@ def main():
     ap.add_argument("--backend", default="trt")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--order", choices=["shuffle", "walk"], default="walk",
+                    help="walk = the stream planner's visit order for --stores/--boost/--seed (default); shuffle = a plain seeded shuffle")
+    ap.add_argument("--stores", default=os.path.expanduser("~/u1_stores.txt"))
+    ap.add_argument("--boost", nargs="*", default=["2=2", "8=4", "9=16", "10=40", "11=80"], metavar="K=M")
+    ap.add_argument("--walk", default="mix")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
-    regs = regions(a.seed)
+    if a.order == "walk":
+        boost = {int(q.split("=")[0]): float(q.split("=")[1]) for q in a.boost}
+        regs = walk_regions(a.stores, a.seed, boost, a.walk)
+    else:
+        regs = regions(a.seed)
     print(f"{len(regs)} occupied regions; this process takes every {a.shard[1]}th from {a.shard[0]}", flush=True)
     ct = data.open_zarr(data.CT)
     n = 0
