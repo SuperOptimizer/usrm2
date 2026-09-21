@@ -131,7 +131,11 @@ def out_array(path, shape, origin, volcomp=True, volume=None, umbilicus=None, ru
     kw = dict(shape=shape, chunks=(128, 128, 128), shards=sh, dtype="uint8", fill_value=0, overwrite=True)
     if volcomp and VolcompCodec is not None:  # volcomp requires exactly 128^3 chunks, hence 3D
         assert all(s % 128 == 0 for s in shape), "volcomp output needs box sizes that are multiples of 128"
-        z = zarr.create_array(path, serializer=VolcompCodec(q=8), **kw)
+        # compressors=None: the inner codec chain is exactly [volcomp]. zarr-python otherwise appends its
+        # default zstd AFTER the serializer, and zstd on volcomp output is worthless -- measured 0.2% on a
+        # real region store, for a decode step on every chunk read. The C-tool exports and the CT volumes
+        # are volcomp-only, so this also makes our stores byte-comparable with theirs.
+        z = zarr.create_array(path, serializer=VolcompCodec(q=8), compressors=None, **kw)
     else:
         kw["shape"], kw["chunks"], kw["shards"] = (1,) + tuple(shape), (1, 128, 128, 128), (1,) + sh
         z = zarr.create_array(path, **kw)

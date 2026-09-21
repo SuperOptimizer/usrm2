@@ -24,8 +24,12 @@ if resume:
     out = zarr.open(tmp, mode="r+")
 else:
     shutil.rmtree(tmp, ignore_errors=True)
+    # compressors=None: inner codecs exactly [volcomp]. zarr-python's default zstd after the volcomp
+    # serializer saves 0.2% (measured) and costs a decode step per chunk read; the C-tool exports and the
+    # CT volumes are volcomp-only. `cloud/repack_regions.py --strip-zstd` fixes stores written before this.
     out = zarr.create_array(tmp, shape=tuple(int(v) for v in T), chunks=(128, 128, 128), shards=SHARD,
-                            dtype="uint8", fill_value=0, overwrite=True, serializer=VolcompCodec(q=q))
+                            dtype="uint8", fill_value=0, overwrite=True, serializer=VolcompCodec(q=q),
+                            compressors=None)
 out.attrs.update(dict(a.attrs)); out.attrs.update({"level": dst, "pooled_from": src, "volcomp_q": q})
 # One job = one SHARD (up to 1024^3): the level is written one whole shard at a time, so a shard file is
 # never rewritten and resume is per shard file (c/<sz>/<sy>/<sx>) instead of per 128^3 chunk.

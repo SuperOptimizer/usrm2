@@ -90,6 +90,41 @@ def open_zarr(path):
     return zarr.open(path, mode="r")
 
 
+# A store CONVERTED IN PLACE under a live reader (cloud/repack_regions.py: the sharding repack, or
+# --strip-zstd) is the one way a read of a finished store can fail: an open zarr array caches its metadata,
+# so a worker that opened the store before the swap decodes the NEW bytes with the OLD codec chain and
+# raises "numcodecs Zstd decompression error: invalid input data". That took the A100 u2 run down on
+# 2026-09-21. Converting under a live reader is now forbidden (see the repack docstring), but a training
+# run must not die if it happens anyway: every read that goes through this module retries ONCE with a
+# freshly opened array, which picks up the new metadata.
+
+DECODE_HINTS = ("decompress", "invalid input", "codec", "crc", "checksum", "chunk", "zstd", "volcomp")
+
+
+def reopen(arr):
+    """A fresh handle on the same array, with no cached metadata."""
+    return open_zarr(array_dir(arr))
+
+
+def read_slice(arr, sl, on_reopen=None):
+    """`arr[sl]` (tolerating a (1,Z,Y,X) store) with one retry on a DECODE error: the array is re-opened,
+    the read is repeated, and `on_reopen(fresh)` lets the caller keep the new handle."""
+    ix = (0,) + tuple(sl) if arr.ndim == 4 else tuple(sl)
+    try:
+        return arr[ix]
+    except Exception as e:  # noqa: BLE001
+        if not any(h in repr(e).lower() for h in DECODE_HINTS):
+            raise
+        fresh = reopen(arr)
+        print(f"read_slice: {array_dir(arr)} failed to decode ({e!r}); re-opened and retrying once",
+              flush=True)
+        ix = (0,) + tuple(sl) if fresh.ndim == 4 else tuple(sl)
+        out = fresh[ix]
+        if on_reopen is not None:
+            on_reopen(fresh)
+        return out
+
+
 def box(arr):
     """(origin_zyx, shape_zyx) of a teacher store."""
     return np.array(arr.attrs["origin_zyx"], np.int64), np.array(arr.shape[-3:], np.int64)
@@ -103,7 +138,7 @@ def shape3(p):
 def read3(arr, o, p):
     """Read a patch (cube or (Z,Y,X)) at store-local offset o, tolerating (1,Z,Y,X) stores."""
     s = tuple(slice(int(a), int(a) + int(n)) for a, n in zip(o, shape3(p)))
-    return arr[(0,) + s] if arr.ndim == 4 else arr[s]
+    return read_slice(arr, s)
 
 
 def axis(path=None):
@@ -364,7 +399,7 @@ def read_block(pyr, k, lo, hi):
     if a is None:
         a = pyr[k]
         s = (slice(int(lo[0]), int(hi[0])), slice(int(lo[1]), int(hi[1])), slice(int(lo[2]), int(hi[2])))
-        return np.asarray(a[(0,) + s] if a.ndim == 4 else a[s], np.uint8)
+        return np.asarray(read_slice(a, s, lambda f: pyr.__setitem__(k, f)), np.uint8)
     return a[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]]
 
 
@@ -399,7 +434,8 @@ def full_level(pyr, k):
         return None
     if k == src:
         a = pyr[src]
-        v = np.ascontiguousarray(np.asarray(a[:] if a.ndim == 3 else a[0], np.uint8))
+        v = np.ascontiguousarray(np.asarray(read_slice(a, (slice(None),) * 3,
+                                                       lambda f: pyr.__setitem__(src, f)), np.uint8))
     else:
         below = full_level(pyr, k - 1)
         if below is None:  # the level below is too big to keep: pool it in z slabs, keeping only the result
@@ -408,7 +444,8 @@ def full_level(pyr, k):
             below = np.zeros(tuple(-(-S // e)), np.uint8)
             step = max(e, (1 << 24) // max(int(S[1] * S[2]), 1) // e * e)
             for z in range(0, int(S[0]), step):
-                blk = np.asarray(a[z:z + step] if a.ndim == 3 else a[0, z:z + step], np.uint8)
+                blk = np.asarray(read_slice(a, (slice(z, z + step), slice(None), slice(None)),
+                                            lambda f: pyr.__setitem__(src, f)), np.uint8)
                 if e > 1:
                     m = -(-np.array(blk.shape, np.int64) // e)
                     pad = m * e - np.array(blk.shape)
@@ -838,7 +875,7 @@ def verso_region_url(lo2, base=None):
     return f"{str(base or VERSO_REGIONS_URL).rstrip('/')}/region_{z}_{y}_{x}.zarr"
 
 
-def read_teacher(a, k, lo, p):
+def read_teacher(a, k, lo, p, on_reopen=None):
     """(cube, inside) of a region teacher store read at rung k (2, or 3 = its 2x mean pool): the uint8
     probability over the window at corner `lo` (rung-k voxels) and the mask of the voxels the store
     actually covers. The store's own grid is rung 2, its corner `origin_zyx`."""
@@ -849,7 +886,7 @@ def read_teacher(a, k, lo, p):
     aa, bb = np.maximum(lo2, 0), np.minimum(lo2 + n2, S)
     if (bb > aa).all():
         sl = tuple(slice(int(x), int(y)) for x, y in zip(aa, bb))
-        blk = np.asarray(a[(0,) + sl] if a.ndim == 4 else a[sl], np.uint8)
+        blk = np.asarray(read_slice(a, sl, on_reopen), np.uint8)
         st = aa - lo2
         out[st[0]:st[0] + blk.shape[0], st[1]:st[1] + blk.shape[1], st[2]:st[2] + blk.shape[2]] = blk
     for _ in range(d):
@@ -1228,6 +1265,13 @@ class Patches(torch.utils.data.IterableDataset):
             a = self._tstore[path] = (z, _t.time())
         return a[0] or None
 
+    def _read_region(self, arr, path, k, lo):
+        """`read_teacher` on a region store, keeping the handle `read_slice` re-opened on a decode error
+        (a store converted in place under this reader: see `read_slice`)."""
+        import time as _t
+        return read_teacher(arr, k, lo, self.patch,
+                            on_reopen=lambda f: self._tstore.__setitem__(path, (f, _t.time())))
+
     def _rung_target(self, s, k, lo, ct, teacher=None, verso=None):
         """(target, weight) at rung k as uint8 (255 = 1.0): one channel per output channel, 0 (weight 0) for
         a channel this source does not provide; weight 1 inside the target's box and where CT > 0, times its
@@ -1244,13 +1288,13 @@ class Patches(torch.utils.data.IterableDataset):
         for c, chan in enumerate(self.channels):
             if chan == VERSO:
                 if va is not None:
-                    v, ins = read_teacher(va, k, lo, p)
+                    v, ins = self._read_region(va, verso, k, lo)
                     np.copyto(tg[c], v, where=inside_ct)
                     w[c] = np.where(ins & inside_ct, np.uint8(255), np.uint8(0))
                 continue  # no store here: weight 0, i.e. the verso channel is ignored on this sample
             if ta is not None and chan == (ta.attrs.get("channel") or
                                            (list(ta.attrs.get("channels") or []) or [None])[0] or self.channels[0]):
-                v, ins = read_teacher(ta, k, lo, p)
+                v, ins = self._read_region(ta, teacher, k, lo)
                 np.copyto(tg[c], v, where=inside_ct)
                 w[c] = np.where(ins & inside_ct, np.uint8(255), np.uint8(0))
                 continue

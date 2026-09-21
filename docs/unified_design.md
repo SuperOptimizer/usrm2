@@ -991,3 +991,54 @@ surfaces exist, `--head verso` on evalsurf is a smoke test plus a thickness read
 `val_png` needs no change: it already tiles every target channel and every output channel, so a cout=2 grid
 shows CT, recto target, verso target, recto prediction, verso prediction (a verso target with no store is
 black).
+
+## 24. The codec chain of the stores we write (2026-09-21)
+
+`zarr.create_array(..., serializer=VolcompCodec(q=8))` leaves zarr-python's DEFAULT compressor in place, so
+every store `predict.out_array` and `cloud/make_levels.py` wrote had inner codecs **[volcomp q8, zstd]** --
+zstd running over already-compressed volcomp output. Measured on a real 1024^3 region store that zstd layer
+saves **0.2 %**, and it costs a decode step on every chunk read. The upstream C-tool exports and the CT
+volumes are volcomp-only, so our stores were also not byte-comparable with theirs.
+
+Both creators now pass `compressors=None`: the inner codec chain is exactly `[volcomp]`
+(`tests/test_verso_out.py` writes a real store and asserts the `sharding_indexed` configuration's `codecs`
+is a single `volcomp` entry, then reads it back).
+
+Stores written before this are converted in place, losslessly, by
+
+    python cloud/repack_regions.py DIR --strip-zstd [--jobs N] [--verify]
+
+which, per shard file, zstd-decodes every chunk payload, rebuilds the payload region, the uint64 LE
+(offset, nbytes) index and the index crc32c, and rewrites `zarr.json` without the zstd codec. The volcomp
+bytes are never touched, so the decoded array is bit-identical; attributes (including `done`), the
+`.published` marker and the atomic `<store>.tmp` swap work as in the sharding repack, and not-done stores
+are skipped so the converter never races a writer. Run over the desk
+(`/vesuvius/usrm2/teacher_regions/recto --jobs 8`) and the A100 (`~/teacher_regions/recto --jobs 2`, niced).
+
+`--check` is the cheap audit that goes with it: it reads FOUR bytes -- the first stored chunk's first four
+-- and compares the zstd frame magic against what `zarr.json` declares. That catches a store whose shard
+came from one side of a swap and whose `zarr.json` came from the other.
+
+### An in-place conversion under a live reader corrupts that reader (2026-09-21, learned the hard way)
+
+The directory swap is atomic, but an OPEN zarr array CACHES ITS METADATA. A training worker or a stream
+planner that opened a store before the swap keeps decoding with the old codec chain and old chunk grid, and
+its first read after the swap raises `numcodecs Zstd decompression error: invalid input data`. That is how
+the earlier in-place SHARDING repack killed the A100 `u2_30m6_stream` run at 18:01 UTC on 2026-09-21: a
+worker still holding the unsharded `zarr.json` read the new `c/0/0/0` shard file as chunk (0,0,0). An rsync
+reading a store across the rename is the same hazard one level out -- it can ship the shard from one side
+and the `zarr.json` from the other.
+
+So neither conversion may run while a reader is running:
+
+- **A100** (`~/teacher_regions/recto`): only in a restart window, with no trainer and no planner up.
+- **desk** (`/vesuvius/usrm2/teacher_regions/recto`): `bash ~/sync_stop.sh && bash ~/publish_stop.sh`, then
+  the strip, then `bash ~/sync_start.sh && bash ~/publish_restart.sh 2`. The two teacher WRITERS may keep
+  running: they never read a finished store, and the converter skips stores without `done`.
+
+As a backstop -- not a licence -- every read `usrm2/data.py` makes now retries ONCE against a freshly
+opened array when it fails with something that looks like a decode error (`data.read_slice`, used by
+`read3`, `read_block`, `full_level` and `read_teacher`; the pyramid and the region-store cache keep the
+re-opened handle, so the retry costs one open, not one per read). `tests/test_verso_out.py` reproduces the
+A100 failure exactly -- open a store, strip it underneath, watch the raw read raise -- and checks the
+recovery, and that a non-decode error is still raised rather than retried.

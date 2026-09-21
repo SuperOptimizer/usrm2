@@ -400,3 +400,121 @@ def test_the_planners_meta_carries_the_verso_settings(tmp_path, published, monke
     m = pl._meta(["a,b"])
     assert m["verso"] is True and m["verso_url"] == url and m["verso_regions"] == str(local)
     assert m["channels"][-1] == "verso"
+
+
+# --------------------------------------------------------------------------------- the codec chain
+
+def volcomp_json(path):
+    j = json.load(open(os.path.join(str(path), "zarr.json")))
+    c = j["codecs"]
+    assert len(c) == 1 and c[0]["name"] == "sharding_indexed"
+    return [q["name"] for q in c[0]["configuration"]["codecs"]], j
+
+
+def smooth(n=128, seed=0):
+    """Something volcomp-like: a smooth field, not noise (q8 on noise is meaningless)."""
+    z, y, x = np.mgrid[:n, :n, :n].astype(np.float32)
+    return np.clip(120 + 100 * np.sin(z / 19) * np.cos(y / 23) + 20 * np.sin(x / 31), 0, 255).astype(np.uint8)
+
+
+def test_a_store_written_here_has_exactly_the_volcomp_codec(tmp_path):
+    """zarr-python otherwise appends its default zstd AFTER the serializer; on volcomp output that saves
+    0.2% and costs a decode step on every chunk read."""
+    import zarr
+    p = tmp_path / "s.zarr"
+    v = smooth()
+    a = P.out_array(str(p), v.shape, (0, 0, 0), volcomp=True, rung=2, channels=["verso"])
+    a[:] = v
+    names, j = volcomp_json(p)
+    assert names == ["volcomp"], names
+    assert j["codecs"][0]["configuration"]["codecs"][0]["configuration"]["q"] == 8
+    back = np.asarray(zarr.open(str(p), mode="r")[:], np.uint8)
+    assert back.shape == v.shape and int(np.abs(back.astype(int) - v.astype(int)).max()) <= 24
+    assert data.read_teacher(data.open_zarr(str(p)), 2, (0, 0, 0), np.array([32, 32, 32]))[1].all()
+
+
+def test_strip_zstd_is_lossless_and_rewrites_the_codec_chain(tmp_path):
+    """A store written the old way ([volcomp, zstd]) is rewritten as [volcomp] by decoding the zstd layer
+    away; the volcomp payload -- and so the decoded array -- is untouched."""
+    import zarr
+    from volcomp_zarr import VolcompCodec
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cloud"))
+    import repack_regions as R
+    p = tmp_path / "old.zarr"
+    v = smooth()
+    a = zarr.create_array(str(p), shape=v.shape, chunks=(128,) * 3, shards=(128,) * 3, dtype="uint8",
+                          fill_value=0, overwrite=True, serializer=VolcompCodec(q=8))  # default zstd
+    a[:] = v
+    a.attrs.update({"origin_zyx": [0, 0, 0], "done": True, "channels": ["verso"]})
+    (p / ".published").write_text("x")
+    assert volcomp_json(p)[0] == ["volcomp", "zstd"], "zarr-python stopped appending its default compressor"
+    before = np.asarray(zarr.open(str(p), mode="r")[:], np.uint8)
+    assert R.strip_zstd(str(p), dry=True)[0] == "would"
+    assert R.strip_zstd(str(p), verify=True)[0] == "ok"
+    assert volcomp_json(p)[0] == ["volcomp"]
+    after = np.asarray(zarr.open(str(p), mode="r")[:], np.uint8)
+    assert np.array_equal(before, after)                       # lossless, bit for bit
+    j = volcomp_json(p)[1]
+    assert j["attributes"]["done"] is True and j["attributes"]["channels"] == ["verso"]
+    assert (p / ".published").exists() and not (p / ".tmp").exists()
+    assert R.strip_zstd(str(p))[0] == "clean"                  # idempotent
+    # a store still being written is never touched
+    q = tmp_path / "wip.zarr"
+    b = zarr.create_array(str(q), shape=v.shape, chunks=(128,) * 3, shards=(128,) * 3, dtype="uint8",
+                          fill_value=0, overwrite=True, serializer=VolcompCodec(q=8))
+    b[:] = v
+    assert R.strip_zstd(str(q))[0] == "notdone"
+    # and a store this repo writes today needs no stripping at all
+    r = tmp_path / "new.zarr"
+    c = P.out_array(str(r), v.shape, (0, 0, 0), volcomp=True)
+    c[:] = v
+    c.attrs["done"] = True
+    assert R.strip_zstd(str(r))[0] == "clean"
+    # --check: the payload matches the declared codec chain, before and after, and catches a store whose
+    # zarr.json and shard were copied from different sides of a conversion
+    for q in (p, r):
+        assert R.check(str(q))[0] == "ok"
+    j = json.load(open(str(r / "zarr.json")))
+    j["codecs"][0]["configuration"]["codecs"].append({"name": "zstd", "configuration": {"level": 0}})
+    json.dump(j, open(str(r / "zarr.json"), "w"))
+    assert R.check(str(r))[0] == "MISMATCH"
+
+
+def test_a_reader_survives_a_store_converted_under_it(tmp_path):
+    """This is the failure that killed the A100 u2 run on 2026-09-21: an open zarr array caches its
+    metadata, so a worker that opened a store before an in-place repack decodes the NEW bytes with the OLD
+    codec chain. Converting under a live reader is forbidden (cloud/repack_regions.py says so loudly), but
+    a training run must not die if it happens: the read is retried once against a freshly opened array."""
+    import zarr
+    from volcomp_zarr import VolcompCodec
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cloud"))
+    import repack_regions as R
+    p = tmp_path / "r.zarr"
+    v = smooth()
+    a = zarr.create_array(str(p), shape=v.shape, chunks=(128,) * 3, shards=(128,) * 3, dtype="uint8",
+                          fill_value=0, overwrite=True, serializer=VolcompCodec(q=8))
+    a[:] = v
+    a.attrs.update({"done": True, "origin_zyx": [0, 0, 0]})
+    held = data.open_zarr(str(p))                       # a worker that opened it before the conversion
+    want = np.asarray(held[:], np.uint8)
+    assert R.strip_zstd(str(p))[0] == "ok"
+    with pytest.raises(Exception):                      # the raw read fails, as it did on the A100
+        held[:]
+    got = data.read_slice(held, (slice(None),) * 3)
+    assert np.array_equal(np.asarray(got, np.uint8), want)
+    # and through the loader's own entry points
+    assert np.array_equal(np.asarray(data.read3(held, (0, 0, 0), 32), np.uint8), want[:32, :32, :32])
+    assert int(data.read_teacher(held, 2, (0, 0, 0), np.array([32, 32, 32]))[0].max()) == int(want[:32, :32, :32].max())
+    # the pyramid path keeps the re-opened handle, so the retry happens once and not per read
+    pyr = {2: data.open_zarr(str(p))}
+    assert int(data.read_block(pyr, 2, (0, 0, 0), (32, 32, 32)).max()) == int(want[:32, :32, :32].max())
+    assert pyr[2] is not held and np.array_equal(np.asarray(pyr[2][:16, :16, :16], np.uint8),
+                                                 want[:16, :16, :16])
+
+    class Bad:                       # a failure that is NOT a decode failure is re-raised, not retried
+        ndim = 3
+
+        def __getitem__(self, ix):
+            raise ValueError("the disk is on fire")
+    with pytest.raises(ValueError, match="on fire"):
+        data.read_slice(Bad(), (slice(None),) * 3)
