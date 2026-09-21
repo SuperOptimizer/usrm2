@@ -159,7 +159,8 @@ def png(path, ct, p_u8, origin, pts, thr=0.5):
 
 
 def run(origin=VAL_BOX[0], size=VAL_BOX[1], ckpt=None, store=None, teacher=None, tifxyz=TIFXYZ,
-        volume=None, window=128, halo=16, device=None, png_path=None, cache=None, tta=0, luts=(), head=0):
+        volume=None, window=128, halo=16, device=None, png_path=None, cache=None, tta=0, luts=(), head=0,
+        cascade=None, cascade_depth=3):
     o, s = tuple(origin), tuple(size)
     import hashlib
     key = hashlib.md5(f"{s}|{tifxyz}|{data.UMBILICUS}".encode()).hexdigest()[:8]
@@ -169,7 +170,8 @@ def run(origin=VAL_BOX[0], size=VAL_BOX[1], ckpt=None, store=None, teacher=None,
     pts, nrm = pts[keep], nrm[keep]
     print(json.dumps({"box": [*o, *s], "surfaces": counts, "masked_points_dropped": int((~keep).sum())}))
     if ckpt:
-        prob, st = P.probs(ckpt, volume or data.CT, *o, *s, window=window, halo=halo, device=device, tta=tta, luts=luts, head=head)
+        prob, st = P.probs(ckpt, volume or data.CT, *o, *s, window=window, halo=halo, device=device, tta=tta, luts=luts, head=head,
+                           cascade=cascade, cascade_depth=cascade_depth)
         p_u8, name = P.u8(prob), f"{ckpt}@{st.get('step')}" + (f"+tta{tta}" if tta > 1 else "") + (f"+lut{len(luts)}" if luts else "") + f"+head{head}"
     else:
         p_u8, name = read_box(store, o, s), store

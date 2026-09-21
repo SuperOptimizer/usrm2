@@ -95,7 +95,7 @@ def autocast(dev):
 
 
 @torch.no_grad()
-def evaluate(net, grid, dev, wtgt=(), norad=False):
+def evaluate(net, grid, dev, wtgt=(), norad=False, cascade=None):
     """bce / dice / mae over the val patches. A grid entry is (x, tgt) -- the old convention, optionally with
     `wtgt` weight channels -- or a compact rung sample (data.rung_item), whose input is built on the device
     by `prep.prepare`; its weights then scale every metric and each rung is also scored on its own
@@ -107,7 +107,7 @@ def evaluate(net, grid, dev, wtgt=(), norad=False):
     per = {}
     for item in grid:
         if isinstance(item, dict):
-            ct, tg, ww = prep.prepare(prep.batch1(item), dev, norad=norad)
+            ct, tg, ww = prep.prepare(prep.batch1(item), dev, norad=norad, cascade=cascade)
             ct, rung = ct.to(memory_format=M.memfmt()), int(item["rung"])
         else:
             ct, tg = item[0], item[1]
@@ -151,7 +151,7 @@ def grid_cout(item):
     return grid_cin_cout(item)[1]
 
 
-def val_png(path, net, grid, dev, norad=False):
+def val_png(path, net, grid, dev, norad=False, cascade=None):
     """Middle z-slice of the first 4 val patches: CT (gray), each teacher target and each student head as a red
     opacity overlay (no threshold), tiled patches x [CT, targets..., heads...]."""
     from PIL import Image
@@ -159,7 +159,7 @@ def val_png(path, net, grid, dev, norad=False):
     with torch.no_grad():
         for item in grid[:4]:
             if isinstance(item, dict):
-                xd, td = prep.prepare(prep.batch1(item), dev, norad=norad)[:2]
+                xd, td = prep.prepare(prep.batch1(item), dev, norad=norad, cascade=cascade)[:2]
                 x, t = xd[0].cpu(), td[0].cpu()
             else:
                 x, t = item[0], item[1]
@@ -178,18 +178,30 @@ def val_png(path, net, grid, dev, norad=False):
     Image.fromarray(np.concatenate(rows, 0).astype(np.uint8)).save(path)
 
 
-def warm_start(src, cin, cout):
+def warm_start(src, cin, cout, cascade=False, src_scale=False):
     """Adapt another run's weights to (cin, cout). Extra input channels get zero weights, so the net starts
     with the same output: the image channels stay first and the radial vector stays last, which is what
     zero-fills the scale plane of the unified model (13 -> 14 channels). Heads: more heads are copies of the
     source heads (head j <- source head j mod n), fewer keep the first cout (a 4-head recto/m7 student warm-
-    starting the single-headed unified model keeps head 0); the deep-supervision heads follow."""
+    starting the single-headed unified model keeps head 0); the deep-supervision heads follow.
+
+    `cascade`: the DESTINATION has a cascade channel, so its stem is [image..., CASCADE, scale, radial(3)].
+    A source that already carries a scale plane (`src_scale`, 14 channels) must have it lined up with the
+    destination's scale plane and only the cascade slot zeroed -- "image channels first, radial last" alone
+    would slide the scale weights into the cascade slot and zero the scale plane instead, which changes the
+    output at every rung but 2. With both flags the 14 -> 15 warm start is exact: the new channel's weights
+    are zero, so it contributes nothing whatever the channel holds, and the outputs agree with the source's
+    to a float32 ulp (the stem convolution accumulates 15 products instead of 14)."""
     src = dict(src)
     w = src["enc.0.0.weight"]
     if w.shape[1] != cin:
         assert w.shape[1] < cin, "cannot drop input channels on a warm start"
+        n = w.shape[1]
         w2 = torch.zeros(w.shape[0], cin, *w.shape[2:], device=w.device, dtype=w.dtype)
-        w2[:, :w.shape[1] - 3], w2[:, cin - 3:] = w[:, :w.shape[1] - 3], w[:, w.shape[1] - 3:]  # image chans first, radial last
+        if cascade and src_scale:  # [img..., scale, radial] -> [img..., CASCADE(0), scale, radial]
+            w2[:, :n - 4], w2[:, cin - 4], w2[:, cin - 3:] = w[:, :n - 4], w[:, n - 4], w[:, n - 3:]
+        else:
+            w2[:, :n - 3], w2[:, cin - 3:] = w[:, :n - 3], w[:, n - 3:]  # image chans first, radial last
         src["enc.0.0.weight"] = w2
     for hk in [k for k in src if k == "head.weight" or (k.startswith("deep_heads.") and k.endswith(".weight"))]:
         hw, hb = src[hk], src[hk[:-6] + "bias"]
@@ -204,7 +216,8 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
           eval_every=500, val_patches=32, resume=False, device=None, aug="geo", no_radial=False, accum=1,
           ema_decay=0.999, lr_floor=0.0, ridge_w=0.0, dense_pow=0.0, norm="patch", ctx=(), init_from=None, wtgt=(),
           compile=False, ckpt_act=0, add_skip=0, deep=0, rungs=None, rung_boost=None, val_rungs=data.VAL_RUNGS,
-          require_targets=False, stream=None, **kw):
+          require_targets=False, stream=None, cascade="off", cascade_self_p=0.5, cascade_drop=0.1,
+          cascade_noise=True, **kw):
     """accum: gradient accumulation (micro-batches per optimizer step), for big models on small cards.
     lr_floor: the cosine decays to lr_floor * lr instead of 0. norm: "patch" (per-patch z-score) or "global"
     (fixed scan mean/std, stored in the checkpoint). dense_pow / ridge_w: see data.Patches / losses.
@@ -218,6 +231,11 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     carries the constant scale plane (k - 2) / 9 right before the radial vector, and the loader's per-voxel
     weights go into the loss. `rungs` is True (every usable rung) or the allowed rungs; rung_boost {k: m}
     skews the mix; val_rungs are the rungs the held-out box (kw["val"], given at rung 2) is scored at.
+    cascade: the CASCADE input channel (docs/unified_design.md section 22), "off" | "mask" | "self" | "mix".
+    The model then takes 15 channels, [CT, ctx_1..9, CASCADE, scale, radial(3)]: the rung-(k+1) prediction
+    over the same field of view, upsampled 2x. `cascade_self_p` is P in "mix", `cascade_drop` the per-sample
+    probability the channel is zeroed (so a missing coarse prediction is in distribution), `cascade_noise`
+    the roughening of the mask-derived channel. "off" (the default) leaves every existing run untouched.
     stream: a queue directory filled by `usrm2 stream-plan` (usrm2/stream.py). The loader then replays that
     queue out of a rolling local buffer instead of sampling, and every 20 steps `train.jsonl` carries
     `stream_wait_ms` (how long the workers waited for the planner, 0 once the buffer is ahead) and
@@ -240,6 +258,12 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
                 no_radial=no_radial, accum=accum, ema_decay=ema_decay, lr_floor=lr_floor, ridge_w=ridge_w, wtgt=list(wtgt),
                 dense_pow=dense_pow, norm=norm, ctx=list(ctx), world=world,
                 stream=str(stream) if stream else None, **kw)
+    cascade = str(cascade or "off")
+    assert cascade in data.CASCADE_MODES, f"--cascade {cascade}: one of {data.CASCADE_MODES}"
+    assert cascade == "off" or rungs is not None, "--cascade needs the rung ladder (--rungs)"
+    if cascade != "off":
+        args.update(cascade=cascade, cascade_self_p=float(cascade_self_p), cascade_drop=float(cascade_drop),
+                    cascade_noise=bool(cascade_noise))
     if norm == "global":
         args["norm_stats"] = data.global_norm(kw.get("ct", data.CT))
         main and print("global normalization", args["norm_stats"], flush=True)
@@ -250,7 +274,8 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         lines = [",".join(q) for q in lines]
         args["rungs"], args["rung_boost"], args["val_rungs"] = rungs if rungs is True else list(rungs), dict(rung_boost or {}), list(val_rungs)
         args["scale_plane"] = True
-        grid = data.val_grid_rungs(patch, lines, kw.get("val", data.VAL), rungs=val_rungs, limit=val_patches, ctx=ctx)
+        grid = data.val_grid_rungs(patch, lines, kw.get("val", data.VAL), rungs=val_rungs, limit=val_patches,
+                                   ctx=ctx, cascade=cascade)
         args["channels"] = list(dict.fromkeys(c for s in data.source_groups(lines) for c in s["targets"]))
     else:
         grid = data.val_grid(patch=patch, ct=kw.get("ct", data.CT), store=kw.get("val", data.VAL), limit=val_patches, ctx=ctx)
@@ -260,7 +285,9 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     net = M.build(size, cout=cout, cin=cin, ckpt_act=ckpt_act, add_skip=add_skip, deep=deep).to(dev)
     args["ckpt_act"], args["add_skip"], args["deep"] = ckpt_act, add_skip, deep
     if init_from:  # warm start from another run's EMA weights; extra input channels get zero weights (same output at step 0)
-        src = warm_start(torch.load(init_from, map_location=dev)["ema"], cin, cout)
+        sst = torch.load(init_from, map_location=dev)
+        src = warm_start(sst["ema"], cin, cout, cascade=cascade != "off",
+                         src_scale=bool(sst.get("args", {}).get("scale_plane")))
         own = net.state_dict()
         skipped = [k for k, v in src.items() if k in own and tuple(own[k].shape) != tuple(v.shape)]
         src = {k: v for k, v in src.items() if k not in skipped}  # e.g. dec.0 under --add-skip, new deeper levels
@@ -294,12 +321,25 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
             if not isinstance(item, dict):
                 item[0][-3:] = 0
     evnet = M.build(size, verbose=False, cout=cout, cin=cin, add_skip=add_skip, deep=deep).to(dev)
+    # CASCADE: one Cascade builds the training channel (stochastic: mix / dropout / noise), the other the
+    # validation one (deterministic: self when the run trains with self, mask otherwise, no noise, no drop).
+    # The self mode runs its own copy of the net, kept on the EMA weights (`cas.sync`) -- never the DDP or
+    # compiled module, and never with a grad path.
+    cas = casval = None
+    if cascade != "off":
+        casnet = None
+        if cascade in ("self", "mix"):
+            casnet = M.build(size, verbose=False, cout=cout, cin=cin, add_skip=add_skip, deep=deep).to(dev)
+            casnet.eval()
+        cas = prep.Cascade(cascade, self_p=cascade_self_p, drop=cascade_drop, noise=cascade_noise, net=casnet)
+        casval = prep.Cascade("self" if cascade in ("self", "mix") else "mask", self_p=1.0, drop=0.0,
+                              noise=False, net=evnet)
     dl = data.loader(patch, batch, workers, ct=kw.get("ct", data.CT), stores=kw.get("stores", data.TRAIN),
                      exclude=kw.get("val", data.VAL), seed=step + 7919 * rank, sym=cfg.get("sym", True), aug=cfg, dense_pow=dense_pow, ctx=ctx,
                      stores_file=kw.get("stores_file"),  # a stores file is re-read as it grows (data.Patches)
                      # region mode / the region teacher stores reach the DATASET, not just the args record
                      **(dict(rungs=rungs, rung_boost=rung_boost, channels=args.get("channels"),
-                             require_targets=require_targets,
+                             require_targets=require_targets, cascade=cascade,
                              **{q: kw[q] for q in ("region", "windows_per_region", "region_fails",
                                                    "teacher_regions") if kw.get(q)}) if rungs is not None else {}),
                      **(dict(stream=stream) if stream else {}))
@@ -339,11 +379,13 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
             if "wait" in item:
                 wait_ms += float(item["wait"].sum())
                 stream_idx = max(stream_idx, int(item["idx"].max()))
-            ct, tg, wt = prep.prepare(item, dev, norad=no_radial)
+            if cas is not None:
+                cas.sync(ema)  # the self-mode coarse pass always runs on the current EMA weights
+            ct, tg, wt = prep.prepare(item, dev, norad=no_radial, cascade=cas)
             tg = torch.cat([tg, wt], 1)  # the weights ride along as extra target channels so every
         else:                            # geometric aug transforms them identically
             ct, tg = item[0].to(dev, non_blocking=True), item[1].to(dev, non_blocking=True)
-        ct, tg = A.apply(ct, tg, cfg)
+        ct, tg = A.apply(ct, tg, cfg, nimg=(cin - 5) if cascade != "off" else None)
         if wt is not None:
             tg, wt = tg[:, :cout], tg[:, cout:]
         ct = ct.to(memory_format=M.memfmt())
@@ -376,9 +418,9 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
             t0 = time.time()
         if (step % eval_every == 0 or step == steps) and main:
             evnet.load_state_dict(ema)
-            log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev, wtgt, norad=no_radial)})
+            log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev, wtgt, norad=no_radial, cascade=casval)})
             try:
-                val_png(out / f"val_{step:06d}.png", evnet, grid, dev, norad=no_radial)
+                val_png(out / f"val_{step:06d}.png", evnet, grid, dev, norad=no_radial, cascade=casval)
             except Exception as e:  # a missing PIL must not stop training
                 print("val_png:", repr(e))
             save()
@@ -390,7 +432,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
                                    if os.path.exists(os.path.join(str(stream), "epoch_done")) else {})})
             if main:
                 evnet.load_state_dict(ema)
-                log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev, wtgt, norad=no_radial)})
+                log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev, wtgt, norad=no_radial, cascade=casval)})
     save()
     if world > 1:
         dist.barrier()

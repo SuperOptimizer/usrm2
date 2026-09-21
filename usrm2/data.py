@@ -259,6 +259,7 @@ CTX_CACHE = {}  # {group base: {rung: array}} and {f"{level dir}#{rung}": ndarra
 RUNG0_UM = 0.6   # rung 0
 NRUNGS = 12      # rungs 0 .. 11
 NCTX = 9         # context cubes of a sample: rungs k+1 .. k+9
+CASCADE_MODES = ("off", "mask", "self", "mix")  # source of the cascade input channel (section 22)
 CACHE_VOX = 48 << 20     # a level of at most this many voxels is decoded once and kept whole in the worker
 CACHE_BUDGET = 192 << 20  # ... up to this many bytes of them per process
 SMALL_RUNG = CACHE_VOX   # backward-compatible name
@@ -476,15 +477,21 @@ def scale_plane(rung, shape):
     return np.full(tuple(shape3(shape)), (int(rung) - 2) / 9.0, np.float32)
 
 
-def inputs(ct, rad, ctx=(), rung=None):
-    """Model input (1 + len(ctx) + (rung is not None) + 3, Z,Y,X): z-scored CT, z-scored coarse context
-    cubes, the constant scale plane (only when a rung is given) and the radial unit vector. The scale
-    plane sits right before the radial channels, so warm-starting a 13-channel checkpoint zero-fills it."""
+def inputs(ct, rad, ctx=(), rung=None, cascade=None):
+    """Model input (1 + len(ctx) + (cascade is not None) + (rung is not None) + 3, Z,Y,X): z-scored CT,
+    z-scored coarse context cubes, the CASCADE channel, the constant scale plane (only when a rung is
+    given) and the radial unit vector.
+
+    Channel order is [CT, ctx..., CASCADE, scale, radial(3)]: the image channels stay first and the radial
+    vector stays last, so `train.warm_start` widens a stem by zero-filling the new planes. The cascade
+    channel is the model's own rung-(k+1) prediction over the same field of view upsampled 2x -- a
+    probability in 0..1, NOT z-scored (it is not an image channel), exactly like the scale plane."""
     sc = [scale_plane(rung, ct.shape)[None]] if rung is not None else []
-    return np.concatenate([zscore(ct)[None]] + [zscore(c)[None] for c in ctx] + sc + [rad])
+    cs = [np.asarray(cascade, np.float32)[None]] if cascade is not None else []
+    return np.concatenate([zscore(ct)[None]] + [zscore(c)[None] for c in ctx] + cs + sc + [rad])
 
 
-def rung_item(ct, tg, w, k, lo, ax, sym=0, norm=None):
+def rung_item(ct, tg, w, k, lo, ax, sym=0, norm=None, cm=None, cx=None, lo1=None):
     """The compact sample the rung loader yields: everything uint8, so a 256^3 sample is ~200 MB instead
     of the ~1 GB of float32 `inputs` + `augment` used to build in the worker. `usrm2.prep.prepare` turns a
     collated batch of these into the model input on the GPU.
@@ -495,19 +502,40 @@ def rung_item(ct, tg, w, k, lo, ax, sym=0, norm=None):
     lo  (3,) int64: the corner, in rung-k voxels
     cyx (2, Z) float64: the scroll axis (y, x) at each z of the cube -- what `radial` interpolates
     sym (): the cube symmetry index drawn by the worker (0 = identity), applied on the GPU
-    rung (), norm (2,): the rung k and the (mean, std) of the z-score (std 0 = per-patch)"""
+    rung (), norm (2,): the rung k and the (mean, std) of the z-score (std 0 = per-patch)
+
+    The CASCADE extras (`--cascade`, docs/unified_design.md section 22), all uint8/int64 like the rest:
+    cm  (Z/2, Y/2, X/2) uint8: the rung-(k+1) target block over the patch footprint -- the `mask` source of
+        the cascade channel, upsampled 2x on the GPU. Its presence is what makes the sample 15-channel.
+    cx  (1, Z, Y, X) uint8: the TENTH context cube (rung k + ctx[-1] + 1), the one extra cube the
+        rung-(k+1) input needs that the rung-k input does not (its own contexts are ctx_2..ctx_9).
+    lo1 (3,) int64: the corner of that rung-(k+1) cube; `cyx1` (2, Z) is its scroll axis, so `prep` can
+        recompute the radial vector at the coarser rung."""
     lo = np.asarray(lo, np.int64)
     a = axis_at(ax, k)
     z = np.arange(ct.shape[-3]) + lo[0]
     cyx = np.stack([np.interp(z, a[0], a[1]), np.interp(z, a[0], a[2])])
     nm = (0.0, 0.0) if (norm or NORM) is None else tuple(float(v) for v in (norm or NORM))
-    return {"ct": torch.from_numpy(np.ascontiguousarray(ct)),
-            "tgt": torch.from_numpy(np.ascontiguousarray(tg)),
-            "w": torch.from_numpy(np.ascontiguousarray(w)),
-            "lo": torch.from_numpy(np.ascontiguousarray(lo)),
-            "cyx": torch.from_numpy(np.ascontiguousarray(cyx)),
-            "sym": torch.tensor(int(sym)), "rung": torch.tensor(int(k)),
-            "norm": torch.tensor(nm, dtype=torch.float32)}
+    out = {"ct": torch.from_numpy(np.ascontiguousarray(ct)),
+           "tgt": torch.from_numpy(np.ascontiguousarray(tg)),
+           "w": torch.from_numpy(np.ascontiguousarray(w)),
+           "lo": torch.from_numpy(np.ascontiguousarray(lo)),
+           "cyx": torch.from_numpy(np.ascontiguousarray(cyx)),
+           "sym": torch.tensor(int(sym)), "rung": torch.tensor(int(k)),
+           "norm": torch.tensor(nm, dtype=torch.float32)}
+    if cm is not None:
+        out["cm"] = torch.from_numpy(np.ascontiguousarray(np.asarray(cm, np.uint8)))
+    if cx is not None:
+        cx = np.asarray(cx, np.uint8)
+        out["cx"] = torch.from_numpy(np.ascontiguousarray(cx if cx.ndim == 4 else cx[None]))
+    if lo1 is not None:
+        a1 = axis_at(ax, k + 1)
+        lo1 = np.asarray(lo1, np.int64)
+        z1 = np.arange(ct.shape[-3]) + lo1[0]
+        out["lo1"] = torch.from_numpy(np.ascontiguousarray(lo1))
+        out["cyx1"] = torch.from_numpy(np.ascontiguousarray(
+            np.stack([np.interp(z1, a1[0], a1[1]), np.interp(z1, a1[0], a1[2])])))
+    return out
 
 
 # ------------------------------------------------------------- which chunks of a level exist locally
@@ -845,7 +873,7 @@ class Patches(torch.utils.data.IterableDataset):
     def __init__(self, patch=128, ct=CT, stores=TRAIN, exclude=VAL, seed=0, air_keep=0.1, fg_min=0.05,
                  fg_keep=0.25, sym=True, aug=None, dense_pow=0.0, dense_ref=0.2, ctx=(), stores_file=None,
                  recheck=200, rungs=None, rung_boost=None, channels=None, require_targets=False, stream=None,
-                 region=0, windows_per_region=64, region_fails=0, teacher_regions=None):
+                 region=0, windows_per_region=64, region_fails=0, teacher_regions=None, cascade="off"):
         """dense_pow > 0 biases sampling towards sheet-dense patches: a patch whose target mean m is below
         dense_ref is kept with probability (m / dense_ref) ** dense_pow (crushed windings are where students fail).
         stores_file: instead of `stores`, a text file with one comma-joined group per line that is re-read
@@ -892,6 +920,11 @@ class Patches(torch.utils.data.IterableDataset):
         # for any rung-2/3 window that lies inside one finished region store
         self.teacher_regions = None if teacher_regions in (None, "") else str(teacher_regions)
         self._tstore = {}
+        # CASCADE (docs/unified_design.md section 22): the rung-(k+1) prediction as an extra input channel.
+        # "off" (nothing changes), "mask" (the rung-(k+1) target block), "self" (the model's own coarse
+        # prediction, built on the GPU in prep) or "mix". The worker's job is only to READ the extras.
+        self.cascade = str(cascade or "off")
+        assert self.cascade in CASCADE_MODES, f"--cascade {cascade}: one of {CASCADE_MODES}"
         self.rungs, self.rung_boost, self.channels = rungs, dict(rung_boost or {}), channels
         self.norm, self.umbilicus = NORM, UMBILICUS  # module state the (spawned) workers must inherit explicitly
         self.stores_file, self.recheck, self.file_mtime = stores_file, recheck, None
@@ -1054,19 +1087,21 @@ class Patches(torch.utils.data.IterableDataset):
         desc = {"s": int(i), "k": k, "lo": [int(v) for v in lo], "y": sym, "b": int(blank), "r": prm}
         if not blank and tea:  # the replaying worker reads the same teacher store, not the mask pyramid
             desc["t"] = tea
-        if hook is not None and self.ctx:
+        if hook is not None and (self.ctx or self.cascade != "off"):
             hook.ctx(s, k, lo)
         if not build:
             return desc, None
         cx = context(s["ct"], lo, ct.shape, self.ctx, rung=k) if self.ctx else ()
-        return desc, rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, s["axis"], sym)
+        ex = self._cascade_extras(s, k, lo, ct.shape, blank=blank)
+        return desc, rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, s["axis"], sym, **ex)
 
     def _rung_build(self, d):
         """A queue descriptor (`_rung_draw`) -> the compact sample, read from the local buffer. No rng: the
         rejection rules and every random draw happened in the planner."""
         p, s, k = self.patch, self.srcs[int(d["s"])], int(d["k"])
         lo = np.array(d["lo"], np.int64)
-        if d.get("b"):
+        blank = bool(d.get("b"))
+        if blank:
             ct = np.zeros(tuple(p), np.uint8)
             tg = np.zeros((len(self.channels),) + tuple(p), np.uint8)
             w = np.zeros_like(tg)
@@ -1075,7 +1110,41 @@ class Patches(torch.utils.data.IterableDataset):
             tg, w = self._rung_target(s, k, lo, ct, teacher=d.get("t"))
             ct = raw_apply(ct, d.get("r") or {})
         cx = context(s["ct"], lo, ct.shape, self.ctx, rung=k) if self.ctx else ()
-        return rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, s["axis"], int(d.get("y", 0)))
+        ex = self._cascade_extras(s, k, lo, ct.shape, blank=blank)
+        return rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, s["axis"], int(d.get("y", 0)), **ex)
+
+    def cascade_ctx(self):
+        """The context offset of the TENTH cube: the one rung the coarse (rung k+1) input needs and the
+        rung-k input does not. `--ctx 1..9` -> 10, so the coarse cube's own contexts are ctx_2..ctx_9
+        (rungs k+2..k+9) plus rung k+10. Past the top of a pyramid it is pooled like any other."""
+        return (int(self.ctx[-1]) + 1) if self.ctx else 1
+
+    def _cascade_extras(self, s, k, lo, shape, blank=False):
+        """What a cascade sample reads on top of the ordinary one (see `rung_item`): `cm`, the rung-(k+1)
+        target block over the patch FOOTPRINT (half the patch on every axis, so 1/8 of a cube), and, for the
+        self/mix modes, the tenth context cube `cx` and the corner `lo1` of the rung-(k+1) cube.
+
+        Rung 11 is the top of the ladder: there is no rung 12, so its cascade channel is zero (which is also
+        what `--cascade-drop` teaches the model to expect). A corner with an odd coordinate puts the coarse
+        block half a rung-(k+1) voxel off the footprint; that is one rung-k voxel and is left as it is.
+        `blank`: the all-air patch of the blank aug -- target 0 everywhere, so the coarse block is 0 too."""
+        if self.cascade == "off":
+            return {}
+        p = shape3(shape)
+        lo = np.asarray(lo, np.int64)
+        hp = np.maximum(p // 2, 1)
+        t = s["targets"].get(self.channels[0]) if self.channels else None
+        if blank or int(k) + 1 >= NRUNGS or t is None:
+            cm = np.zeros(tuple(hp), np.uint8)
+        else:
+            cm = read_rung(t["pyr"], int(k) + 1, lo // 2, hp, dtype=np.uint8)
+        out = {"cm": cm}
+        if self.cascade in ("self", "mix"):
+            d, c0 = self.cascade_ctx(), lo + p // 2
+            out["cx"] = (np.zeros(tuple(p), np.uint8) if blank else
+                         read_rung(s["ct_pyr"], int(k) + d, c0 // (1 << d) - p // 2, p, dtype=np.uint8))
+            out["lo1"] = c0 // 2 - p // 2
+        return out
 
     def _teacher_store(self, s, k, lo):
         """The finished region teacher store that covers this whole window, or None. Only rungs 2 and 3
@@ -1140,6 +1209,9 @@ class Patches(torch.utils.data.IterableDataset):
         assert [int(v) for v in m["patch"]] == [int(v) for v in self.patch], \
             f"--stream was planned at patch {m['patch']}, not {[int(v) for v in self.patch]}"
         assert tuple(m["ctx"]) == tuple(self.ctx), f"--stream was planned with --ctx {m['ctx']}"
+        assert str(m.get("cascade", "off")) == self.cascade, \
+            f"--stream was planned with --cascade {m.get('cascade', 'off')}, not {self.cascade} " \
+            "(the planner fetches the coarse target block and the tenth context cube)"
         self.paths, self.stores_file = [g.split(",") for g in m["stores"]], None
         self.teacher_regions = self.teacher_regions or m.get("teacher_regions")
         if self.channels is None:
@@ -1366,14 +1438,15 @@ def val_box(store=VAL):
 VAL_RUNGS = (2, 3, 4, 6)  # the rungs the held-out box is scored at
 
 
-def val_grid_rungs(patch, stores, box2, rungs=VAL_RUNGS, limit=8, ctx=(), channels=None):
+def val_grid_rungs(patch, stores, box2, rungs=VAL_RUNGS, limit=8, ctx=(), channels=None, cascade="off"):
     """Per-rung validation: the held-out box (given at rung 2) read at each rung from the same pyramids
     as training. Returns the same compact uint8 items the rung loader yields (`rung_item`), so 8 patches x
     3 rungs at 256^3 cost ~1.6 GB of host memory instead of the ~22 GB of 14-channel float32 they used to."""
     srcs = source_groups(stores)
     if channels is None:
         channels = list(dict.fromkeys(c for s in srcs for c in s["targets"]))
-    ds = Patches(patch=patch, stores=stores, exclude=[], rungs=True, ctx=ctx, channels=channels, sym=False)
+    ds = Patches(patch=patch, stores=stores, exclude=[], rungs=True, ctx=ctx, channels=channels, sym=False,
+                 cascade=cascade)
     ds._open_rungs()
     p3, out = shape3(patch), []
     o2, s2 = val_box(box2)
@@ -1392,7 +1465,8 @@ def val_grid_rungs(patch, stores, box2, rungs=VAL_RUNGS, limit=8, ctx=(), channe
                 ct = read_rung(s["ct_pyr"], k, lo, p3, dtype=np.uint8)
                 tg, w = ds._rung_target(s, k, lo, ct)
                 cx = context(s["ct"], lo, ct.shape, ctx, rung=k) if ctx else ()
-                out.append(rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, s["axis"]))
+                ex = ds._cascade_extras(s, k, lo, ct.shape)
+                out.append(rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, s["axis"], **ex))
     assert out, "the validation box is smaller than one patch at every rung"
     return out
 

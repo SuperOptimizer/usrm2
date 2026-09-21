@@ -9,6 +9,10 @@ One region = one teacher.run call over the whole 1024^3 box (--tile 1024): the t
 so a single tile computes exactly the same windows as the 2x2 tiling did, with none of the overlap - 1.4x fewer
 windows. --backend trt (usrm2/trt.py, fp16 engine for this GPU) is another 2x on the desk; on virtualized cloud
 GPUs the untimed engine is slower, so pass --backend torch there.
+
+There is deliberately NO --cascade here: this script runs the UPSTREAM villa teacher (usrm2/teacher.py), not
+a usrm2 student, so it has no cascade channel to feed. The cascade flags live on the commands that run our
+own net: `usrm2 predict`, `usrm2 evalsurf`, `usrm2 verso` (docs/unified_design.md section 22).
 """
 import argparse, os, sys, time
 import numpy as np

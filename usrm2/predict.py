@@ -176,13 +176,39 @@ def flips_vec(fn, n=8):
 HEADS = {"mean": lambda p: p.mean(1), "prod": lambda p: p.prod(1) ** (1 / p.shape[1]), "max": lambda p: p.max(1).values}
 
 
-def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, tta=0, luts=(), head=0, radial_sign=1.0, batch=1, rung=None):
+CASCADE_HALO = 16  # rung-(k+1) voxels of margin around a coarse prediction's footprint
+
+
+def crop_pad(a, off, shape):
+    """`a[off : off + shape]` zero-padded where it runs past the end: `slide` pads an ROI thinner than one
+    window and then asks for windows the cascade array does not cover."""
+    out = np.zeros(tuple(int(v) for v in shape), np.float32)
+    if a is None:
+        return out
+    s = tuple(slice(int(o), min(int(o) + int(n), int(d))) for o, n, d in zip(off, shape, a.shape))
+    blk = a[s]
+    out[:blk.shape[0], :blk.shape[1], :blk.shape[2]] = blk
+    return out
+
+
+def up2x_np(a):
+    """2x trilinear upsample of a (Z,Y,X) float32 array, the same `model.up2x` training uses."""
+    t = torch.from_numpy(np.ascontiguousarray(a, np.float32))[None, None]
+    return M.up2x(t, tuple(2 * int(q) for q in a.shape))[0, 0].numpy()
+
+
+def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, tta=0, luts=(), head=0, radial_sign=1.0, batch=1, rung=None,
+          cascade=None, cascade_depth=3):
     """Sliding-window recto probability (float32) over a box; returns (prob, checkpoint state).
     tta: number of axis flips to average; luts: intensity LUTs (uint8->float) whose predictions are averaged in;
     head: which head of a multi-teacher student (int), "mean" / "prod" / "max" over all heads, or "all" for a
     (heads, Z, Y, X) result. radial_sign=-1 negates the radial vector: a recto-trained student then places its
     band on the other face of the sheet (the verso; see verso.py). batch > 1: windows batched on the GPU
-    (slide_gpu; CT + radial inputs only, no context channels / luts / tta)."""
+    (slide_gpu; CT + radial inputs only, no context channels / luts / tta).
+    cascade: None = whatever the checkpoint was trained with (`args["cascade"]`), False / "off" = force the
+    channel to zero. cascade_depth: how many rungs above k are predicted top-down to fill it (default 3;
+    the cost is geometric, 1/8 per level, so three levels add ~14 %). A checkpoint trained without the
+    cascade channel ignores both and runs on 14 channels exactly as before."""
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     st = torch.load(ckpt, map_location=dev)
     net = M.build(st["args"]["size"], verbose=False, cout=st["args"].get("cout", 1), cin=st["args"].get("cin", 4), add_skip=st["args"].get("add_skip", 0), deep=st["args"].get("deep", 0)).to(dev)
@@ -190,40 +216,93 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
     net.eval()
     scale = bool(st["args"].get("scale_plane"))
     k = int(rung) if rung is not None else (data.base_rung(volume) if scale else 2)
-    ax = data.axis()
+    ax0 = data.axis()
     if rung is None:
         roi = data.open_zarr(volume)[z0:z0 + Z, y0:y0 + Y, x0:x0 + X]
     else:  # read the CT at that rung of the pyramid (a rung above its top is pooled from the top)
         roi = data.read_rung(data.rungs(volume), k, (z0, y0, x0), (Z, Y, X)).astype(np.uint8)
-    ax = data.axis_at(ax, k)
+    ax = data.axis_at(ax0, k)
     r = 0.0 if st["args"].get("no_radial") else float(radial_sign)  # training zeroed the radial channels
     data.NORM = tuple(st["args"]["norm_stats"]) if st["args"].get("norm") == "global" else None  # as trained
-    rad = lambda c, o: data.radial(ax, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape) * r
     ctx = tuple(st["args"].get("ctx") or ())
     kk = k if scale else None  # the scale plane only exists in checkpoints trained with it
     kr = k if (rung is not None or scale) else None  # legacy: let context() take the rung from the level path
-    cx = (lambda c, o: data.context(volume, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape, ctx, rung=kr)) if ctx else (lambda c, o: ())
-    preps = [lambda c, o: data.inputs(c, rad(c, o), cx(c, o), rung=kk)] + [(lambda c, o, l=l: data.inputs(l[c], rad(c, o), cx(c, o), rung=kk)) for l in luts]
+    # CASCADE (docs/unified_design.md section 22): a checkpoint trained with --cascade takes a 15th channel,
+    # the rung-(k+1) prediction over the same field of view. Inference is TOP-DOWN and recursive: the box's
+    # footprint is predicted at rung k+1 first (half the size on every axis, so 1/8 of the work, plus a halo),
+    # upsampled 2x and fed in. `cascade_depth` rungs above that the channel is zero, which is exactly the
+    # `--cascade-drop` case the model was trained on. A checkpoint trained without it is unaffected.
+    cmode = str(st["args"].get("cascade", "off") or "off")
+    use_cas = cmode != "off"                       # the checkpoint HAS the channel: it must always be fed
+    off = cascade is not None and (cascade is False or str(cascade) == "off")
+    depth0 = 0 if (off or not use_cas) else max(int(cascade_depth), 0)  # 0 = the channel is fed as zeros
     pick = (lambda p: p) if head == "all" else HEADS[head] if isinstance(head, str) else (lambda p: p[:, int(head)])
     fn = lambda t: pick(torch.sigmoid(net(t)))  # (B,C,...) -> (B,...)  (or (B,C,...) for "all")
     if tta > 1:
         assert head != "all", "tta and head=all do not combine"
         fn = flips_vec(fn, tta)
+    fn0 = lambda t: torch.sigmoid(net(t))[:, 0]  # the coarse passes only ever need head 0
+
+    def cascade_for(kk_, o, s, depth):
+        """The rung-(kk_+1) prediction over the footprint of the box (o, s), upsampled 2x onto that box's
+        own grid; None when nothing above may be predicted (depth exhausted, or the top of the ladder)."""
+        if depth <= 0 or kk_ + 1 >= data.NRUNGS:
+            return None
+        m = CASCADE_HALO
+        o1 = [max(int(v) // 2 - m, 0) for v in o]
+        s1 = [(int(v) + 1) // 2 + 2 * m for v in s]
+        p1 = at_rung(kk_ + 1, o1, s1, depth - 1)
+        up = up2x_np(p1)
+        a = [int(o[i]) - 2 * o1[i] for i in range(3)]
+        return np.ascontiguousarray(up[a[0]:a[0] + int(s[0]), a[1]:a[1] + int(s[1]), a[2]:a[2] + int(s[2])])
+
+    def make_prep(kk_, o, casc, lut=None):
+        axk = data.axis_at(ax0, kk_)
+
+        def pr(c, off):
+            g = (int(o[0]) + off[0], int(o[1]) + off[1], int(o[2]) + off[2])
+            cc = crop_pad(casc, off, c.shape) if use_cas else None
+            cxs = data.context(volume, g, c.shape, ctx, rung=kk_) if ctx else ()
+            return data.inputs(c if lut is None else lut[c], data.radial(axk, g, c.shape) * r, cxs,
+                               rung=(kk_ if scale else None), cascade=cc)
+        return pr
+
+    def at_rung(kk_, o, s, depth):
+        """Head-0 probability over a box at rung kk_ (rung-kk_ voxels), cascading `depth` rungs above it."""
+        sub = data.read_rung(data.rungs(volume), kk_, o, s).astype(np.uint8)
+        return slide(fn0, sub, window, halo, dev, make_prep(kk_, o, cascade_for(kk_, o, s, depth)))
+
+    casc = cascade_for(k, (z0, y0, x0), (Z, Y, X), depth0) if use_cas else None
+    rad = lambda c, o: data.radial(ax, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape) * r
+    cx = (lambda c, o: data.context(volume, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape, ctx, rung=kr)) if ctx else (lambda c, o: ())
+    cas_at = (lambda c, o: crop_pad(casc, o, c.shape)) if use_cas else (lambda c, o: None)
+    preps = [lambda c, o: data.inputs(c, rad(c, o), cx(c, o), rung=kk, cascade=cas_at(c, o))] + \
+            [(lambda c, o, l=l: data.inputs(l[c], rad(c, o), cx(c, o), rung=kk, cascade=cas_at(c, o))) for l in luts]
     if batch > 1:
         assert not ctx and not luts and tta <= 1, "batched inference: CT + radial inputs only"
         R = torch.from_numpy(data.radial(ax, (z0, y0, x0), roi.shape) * r).to(dev)
+        C = None if casc is None else torch.from_numpy(casc).to(dev)
         norm = data.NORM
 
         def prep_t(c, o):
             x = c.float()
             x = (x - norm[0]) / norm[1] if norm else (x - x.mean()) / (x.std() + 1e-3)
             z, y, xx = o
-            return torch.cat([x[None], R[:, z:z + window, y:y + window, xx:xx + window]])
+            sl = (slice(z, z + window), slice(y, y + window), slice(xx, xx + window))
+            parts = [x[None]]
+            if use_cas:  # the cascade channel sits before the scale plane; the compiled net never sees the recursion
+                parts.append((torch.zeros_like(x) if C is None else C[sl]).float()[None])
+            if scale:
+                parts.append(torch.full_like(x, (k - 2) / 9.0)[None])
+            parts.append(R[(slice(None),) + sl])
+            return torch.cat(parts)
         return slide_gpu(fn, roi, window, halo, dev, prep_t, batch=batch), st
     return sum(slide(fn, roi, window, halo, dev, pr) for pr in preps) / len(preps), st
 
 
-def predict(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=None, volcomp=True, tta=0, luts=(), head=0, radial_sign=1.0, rung=None):
-    prob, _ = probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=window, halo=halo, device=device, tta=tta, luts=luts, head=head, radial_sign=radial_sign, rung=rung)
+def predict(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=None, volcomp=True, tta=0, luts=(), head=0, radial_sign=1.0, rung=None,
+            cascade=None, cascade_depth=3):
+    prob, _ = probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=window, halo=halo, device=device, tta=tta, luts=luts, head=head, radial_sign=radial_sign, rung=rung,
+                    cascade=cascade, cascade_depth=cascade_depth)
     write(out, prob, (z0, y0, x0), volcomp=volcomp, volume=volume, rung=2 if rung is None else int(rung))
     return out

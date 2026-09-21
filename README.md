@@ -38,8 +38,18 @@ input is a z-scored CT patch, output is one recto-probability logit per voxel.
   does not provide. The desk's partially mirrored CT level 0 is handled by a per-level chunk index: corners
   whose CT chunks are not on disk are never drawn.
 
+- `--cascade` adds a 15th channel, the CASCADE channel (`docs/unified_design.md` section 22): the model's own
+  rung-(k+1) prediction over the same field of view, upsampled 2x, inserted between the context cubes and the
+  scale plane -- `x = [CT, ctx_1..ctx_9, CASCADE, scale, radial]`. Sources: `mask` (the rung-(k+1) target block,
+  roughened), `self` (an extra no-grad forward of the EMA net at rung k+1), `mix` (self with probability
+  `--cascade-self-p`, else mask; the production mode). `--cascade-drop` zeroes the channel for a fraction of
+  samples, and rung 11 always gets zero, so a missing coarse prediction stays in distribution. Inference is
+  top-down and recursive (`--cascade-depth`, default 3 rungs, 1/8 of the work per level). A 14-channel
+  checkpoint warm-starts into it exactly (the cascade weights start at zero).
+
     usrm2 train RUN --rungs 2-11 --ctx 1 2 3 4 5 6 7 8 9 --patch 256 --stores-file stores.txt \
         --rung-boost 2=2 --val-rungs 2,3,4,6
+    usrm2 train RUN --rungs 2-11 --ctx 1..9 --cascade mix --init-from OLD/ckpt.pt   # 14 -> 15 channels
     usrm2 rung-mix stores.txt --patch 256      # the sampling mix and the local CT coverage per rung
     usrm2 predict RUN/ckpt.pt out.zarr --rung 4 --origin ... --size ...   # origin/size in rung-4 voxels
 

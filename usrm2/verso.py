@@ -138,7 +138,7 @@ def read_tile(arr, z, y, x, Z, Y, X):
 
 
 def run(stores, ckpt, window=128, halo=16, tile=512, margin=32, device=None, volume=None, force=False, batch=1,
-        modes=("skin", "raw")):
+        modes=("skin", "raw"), cascade=None, cascade_depth=3):
     """Write the verso target store(s) of every teacher store in a comma-joined group (one lineage per store, head k
     of the student paired with store k), one per mode: "skin" (anchored outer skin, lossless 255/WEAK/0) and/or
     "raw" (the flipped student's probability, volcomp like a teacher store). Returns the output paths (mode ->
@@ -175,7 +175,8 @@ def run(stores, ckpt, window=128, halo=16, tile=512, margin=32, device=None, vol
                     put(o_arrs[mk], np.zeros(tuple(s.stop - s.start for s in core), np.uint8), 0, y0, x0)
                 continue
             flip, _ = probs(ckpt, vol, int(origin[0]), int(origin[1] + ya), int(origin[2] + xa), Z, yb - ya, xb - xa,
-                            window=window, halo=halo, device=dev, head="all", radial_sign=-1.0, batch=batch)
+                            window=window, halo=halo, device=dev, head="all", radial_sign=-1.0, batch=batch,
+                            cascade=cascade, cascade_depth=cascade_depth)
             if flip.ndim == 3:
                 flip = flip[None]
             rad = torch.from_numpy(data.radial(ax, (origin[0], origin[1] + ya, origin[2] + xa), ct.shape)).to(dev)

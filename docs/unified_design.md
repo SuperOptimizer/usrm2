@@ -747,3 +747,115 @@ since the first 3x3x3 layers learn them. The user picked these to pursue, in ord
 5. Existing segmentation meshes as a sparse known-surface channel: later (refinement / interactive mode only).
 
 Angular position about the axis and absolute z stay out: they break the symmetry augmentations and carry little.
+
+## 22. The cascade input channel (implemented 2026-09-21)
+
+Section 21 item 1. At rung k the model also receives, as ONE extra input channel, the prediction at rung
+k+1 over the same field of view, upsampled 2x onto the patch grid. Channel order becomes
+
+    [CT, ctx_1..ctx_9, CASCADE, scale plane, radial(3)]   = 15 channels
+
+The cascade channel sits right after the context cubes and before the scale plane. Its value is a
+probability in 0..1 and it is NOT z-scored -- it is not an image channel, exactly like the scale plane. The
+cube symmetry (`prep.sym_apply_t`) applies to it like any image channel: it is a spatial field with no
+vector part, so it is permuted and flipped and never negated. `--cascade off` (the default) changes
+nothing: every existing run and checkpoint stays 14-channel.
+
+### Where the channel comes from while training (`--cascade off|mask|self|mix`)
+
+- **mask**: the target pyramid at rung k+1 over the patch FOOTPRINT -- a 128^3 block for a 256^3 patch, read
+  by the worker (`data.Patches._cascade_extras` -> `rung_item["cm"]`) with the same `read_rung` machinery the
+  rung-k target uses, so beyond the top of a pyramid it is pooled like everything else -- upsampled 2x
+  (`model.up2x`, the training-time trilinear) on the GPU. NOTE THE LEAK: the rung-(k+1) level of an exported
+  mask pyramid is the 2x pool of the rung-k target, so without noise this channel is a blurred copy of the
+  answer and the model will learn to copy it. `--cascade-noise` is therefore ON by default and adds, on top
+  of the blur the 2x pool + 2x upsample already applies, a one-voxel erosion or dilation (probability 0.3
+  together) and 32^3 block dropout (probability 0.2, four blocks).
+- **self**: the model's OWN prediction at rung k+1, computed on the fly with the EMA weights, no grad,
+  autocast bf16. The rung-(k+1) input is already mostly in the sample: its CT cube IS ctx_1 (same 256^3 size,
+  same centre), its contexts are ctx_2..ctx_9 plus ONE more cube at rung k+10 (the loader loads a tenth
+  context cube when cascade is on, pooled past the pyramid top like the others), its scale plane is
+  (k+1-2)/9, its radial vector is recomputed at rung k+1 (`prep.radial_t` with the coarser corner and axis,
+  carried in the sample as `lo1` / `cyx1`), and its own cascade channel is ZERO -- a one-level truncation, so
+  the recursion never runs away. The central 128^3 of that 256^3 output (sigmoid of head 0) is the patch
+  footprint; upsampled 2x it is the channel. Cost: one extra forward per sample.
+- **mix**: per sample, `self` with probability `--cascade-self-p` (default 0.5), else `mask` (+ noise). This
+  is the recommended production mode. `mask` alone leaks the target; `self` alone never shows the model a
+  coarse prediction better than its own current one, so early training teaches it that the channel is noise.
+  The mixture brackets what inference actually feeds it: at inference the channel is a real prediction from
+  the same weights, which is closer to `self`, but a good coarse prediction looks like a soft `mask`.
+- All modes: with probability `--cascade-drop` (default 0.1) the channel is zeroed, so inference with a
+  MISSING coarse prediction is in distribution -- that is rung 11 (there is no rung 12), `--cascade-depth 0`,
+  and the deepest level of any top-down run. Rung 11 samples always get zero.
+
+The exposure mismatch is the whole reason for the mixture and the dropout: the model is trained on one
+distribution of coarse channels and run on another. Noise widens the training distribution, dropout puts its
+degenerate end (nothing at all) inside it, and `mix` puts a real self-prediction inside it too.
+
+### The tenth context cube
+
+`--ctx 1..9` gives the rung-k input nine context cubes. The rung-(k+1) input needs rungs k+2..k+10, i.e.
+ctx_2..ctx_9 plus one more. So with cascade in `self`/`mix` the worker reads a tenth cube at offset
+`ctx[-1] + 1` and ships it as `cx`; the stream planner fetches its shards in `fetch_ctx`, and the queue's
+`meta.json` records `cascade` so a queue can only be replayed by a run with the same mode.
+
+### Inference: top-down
+
+`predict.probs(..., cascade=..., cascade_depth=3)` runs TOP-DOWN. To predict rung k over a box it first
+predicts rung k+1 over the box's footprint (half size on every axis, plus a 16-voxel halo) with cascade
+recursively, up to `cascade_depth` rungs above; above that the channel is zero. Each coarse level is
+upsampled 2x with the same `model.up2x` and cropped to the box. The cost is geometric, 1/8 per level: three
+levels add 1/8 + 1/64 + 1/512 = 14.3 %.
+
+The recursion is OUTSIDE the net: `slide` and `slide_gpu` are unchanged and the compiled / TRT path is just
+called on 15-channel input, so nothing about the batched GPU path or an engine build changes. `--cascade
+auto|on|off` on `predict`, `evalsurf` and `verso` reads the mode from the checkpoint args by default: a
+checkpoint trained with `cascade != off` infers with the channel on, a checkpoint trained with it off is
+14-channel as before. `off` still FEEDS the channel (a 15-channel checkpoint always needs 15 channels) --
+it feeds zeros, which is exactly the `--cascade-drop` case. `cloud/teacher_regions.py` has no `--cascade`:
+it runs the upstream villa teacher, not a usrm2 student, so there is no cascade to pass.
+
+### Checkpoint, resume and the warm start
+
+`cascade`, `cascade_self_p`, `cascade_drop` and `cascade_noise` go into the checkpoint args (only when
+cascade is on, so an old checkpoint's args are untouched and an old run resumes unchanged), and `cin`
+becomes 15. They are NOT in the resume `grow` tuple: they must match on resume, as `cin` does.
+
+`train.warm_start(src, cin, cout, cascade=True, src_scale=True)` widens 14 -> 15 by keeping the image cubes
+first, the radial vector last, the SCALE PLANE lined up with the destination's scale plane, and zeroing only
+the cascade slot. The generic "image channels first, radial last" rule is not enough here: it would slide
+the source's scale weights into the cascade slot and zero the scale plane instead, which changes the output
+at every rung but 2. With the fix the warm start is exact -- with the cascade channel zero the outputs agree
+to a float32 ulp (1.3e-6 relative, the stem convolution accumulating 15 products instead of 14), so
+`u1_30m6_p4` / `u2_30m6_stream` warm-start into a cascade run with no jump at step 0.
+
+### Measured step cost
+
+`cloud/cascade_bench.py` (synthetic samples, so it isolates the cascade work), A100 while the
+`u2_30m6_stream` run was training, so the absolute numbers are contended and only the ratios matter:
+
+| config | off | mask | self | mix (P=0.5) |
+|---|---|---|---|---|
+| 30m6, 128^3, batch 2, ctx 9, deep 3 | 1.000 (369 ms) | 1.073 | 1.535 | 1.350 |
+| 5m, 128^3, batch 1, ctx 9, deep 3 | 1.000 (240 ms) | 1.053 | 1.424 | |
+
+`mask` costs ~6 % (a 1/8-size block, a 2x upsample and one more stem channel). `self` costs ~50 %: one
+no-grad forward against a forward+backward+step is about half the work. `mix` at P = 0.5 lands halfway, ~35 %.
+Expected A100 throughput for `mix` at the production config (30m6, 256^3, batch 2): 27 / 1.35 = **~20
+Mvox/s** (mask would be ~25). The run is often loader-bound rather than GPU-bound, in which case the real
+loss is smaller, since the cascade adds GPU work only -- the worker reads one extra 1/8-size target block
+and, in self/mix, one more context cube.
+
+The desk could not be measured: both 5060 Ti's were at 100 % with ~0.9 GB free while the teacher region jobs
+ran, and taking the last of their VRAM risks failing THEIR allocations.
+
+### One aug detail
+
+`aug.apply` takes the leading `C - 3` channels as "image channels" for the INTENSITY augs, which in a
+14-channel run means the scale plane is gamma'd and brightness-shifted along with the cubes. Under
+`--cascade` that would also hit the cascade channel, and a brightness shift would move a DROPPED (zero)
+channel off the value the model is taught to read as "no coarse prediction". So `apply` now takes an
+optional `nimg` and `train` passes the cube count when cascade is on: the intensity augs then act on the
+CT and context cubes only, and the cascade channel and the scale plane are left alone. Spatial augs still
+act on every channel (the cascade channel is a spatial field and must ride the same grid). A run with
+`--cascade off` is bit-for-bit what it was.

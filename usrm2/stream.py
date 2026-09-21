@@ -335,7 +335,7 @@ class Planner:
                  ahead=400, cache_gb=20.0, ctx=(), aug="geo", dense_pow=0.0, require_targets=False,
                  val=None, jobs=48, report=30.0, limit=0, val_rungs=data.VAL_RUNGS, val_patches=32,
                  region=0, windows_per_region=64, walk=None, active_regions=4, epochs=1, region_fails=0,
-                 teacher_regions=None, visits_max=64):
+                 teacher_regions=None, visits_max=64, cascade="off"):
         from usrm2 import aug as A
         self.dir = str(queue)
         self.stores_file, self.seed, self.W, self.ahead = str(stores_file), int(seed), int(workers), int(ahead)
@@ -346,7 +346,9 @@ class Planner:
                        aug=self.cfg, sym=self.cfg.get("sym", True), dense_pow=dense_pow,
                        require_targets=bool(require_targets), seed=int(seed),
                        region=int(region or 0), windows_per_region=int(windows_per_region),
-                       region_fails=int(region_fails or 0), teacher_regions=teacher_regions)
+                       region_fails=int(region_fails or 0), teacher_regions=teacher_regions,
+                       cascade=str(cascade or "off"))
+        self.cascade = str(cascade or "off")
         self.walk_mode = None if not walk else str(walk)
         assert self.walk_mode in (None, "once", "mix"), f"--walk {walk}: 'once' or 'mix'"
         assert not self.walk_mode or region, "--walk needs --region (the walk is over regions)"
@@ -456,10 +458,20 @@ class Planner:
         return bool(any(res[1:])) if self.require_targets and s["targets"] else True
 
     async def fetch_ctx(self, hook, s, k, lo):
-        """The nine context cubes, fetched only once the window has been accepted."""
+        """The nine context cubes, fetched only once the window has been accepted -- plus, under
+        `--cascade`, what the cascade channel reads: the rung-(k+1) TARGET block over the patch footprint
+        (`mask`/`mix`) and, for `self`/`mix`, the TENTH context cube (rung k + ctx[-1] + 1)."""
         c0 = np.asarray(lo, np.int64) + self.patch // 2
-        await asyncio.gather(*[self._need(hook, s["ct_pyr"], k + int(d),
-                                          c0 // (1 << int(d)) - self.patch // 2) for d in self.ctx])
+        jobs = [self._need(hook, s["ct_pyr"], k + int(d), c0 // (1 << int(d)) - self.patch // 2)
+                for d in self.ctx]
+        if self.cascade != "off":
+            d = (int(self.ctx[-1]) + 1) if self.ctx else 1
+            if self.cascade in ("self", "mix"):
+                jobs.append(self._need(hook, s["ct_pyr"], k + d, c0 // (1 << d) - self.patch // 2))
+            if k + 1 < data.NRUNGS:  # the coarse target block is half a patch, but shards are shards
+                jobs += [self._need(hook, t["pyr"], k + 1, np.asarray(lo, np.int64) // 2)
+                         for t in s["targets"].values()]
+        await asyncio.gather(*jobs)
         return True
 
     # ---- the queue ---------------------------------------------------------
@@ -512,7 +524,7 @@ class Planner:
                 "workers": self.W, "seed": self.seed, "ctx": list(self.ctx),
                 "rungs": self.kw["rungs"] if self.kw["rungs"] is True else sorted(self.kw["rungs"]),
                 "rung_boost": {str(k): v for k, v in self.kw["rung_boost"].items()},
-                "aug": self.cfg, "dense_pow": self.kw["dense_pow"],
+                "aug": self.cfg, "dense_pow": self.kw["dense_pow"], "cascade": self.cascade,
                 "require_targets": self.require_targets, "channels": self.ds.channels,
                 "region": self.kw["region"], "windows_per_region": self.kw["windows_per_region"],
                 "walk": self.walk_mode, "active_regions": self.K, "epochs": self.epochs,

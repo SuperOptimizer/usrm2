@@ -403,15 +403,22 @@ def intensity(c, cfg):
     return c
 
 
-def apply(x, tg, cfg):
+def apply(x, tg, cfg, nimg=None):
     """(B,C,Z,Y,X) input (image channels, then the 3 radial-vector channels) + (B,T,Z,Y,X) target -> augmented
-    pair (float32). Intensity augs act on every image channel with the same per-sample parameters."""
+    pair (float32). Intensity augs act on every image channel with the same per-sample parameters.
+
+    `nimg`: how many leading channels are IMAGE channels. The default (C - 3, everything but the radial
+    vector) is what the 13/14-channel stacks always used. A cascade run passes the cube count, so the
+    intensity augs leave the CASCADE channel and the scale plane alone: they are not images, and a
+    brightness shift would move a dropped (zero) cascade channel off the "no coarse prediction" value the
+    model is taught to read. Spatial augs always act on every channel."""
     if not cfg:
         return x, tg
     ni = x.shape[1] - 3
+    nim = ni if nimg is None else int(nimg)
     x, tg = spatial(x.float(), tg.float(), cfg)
     if any(cfg.get(name) for name, _ in INTENS):  # no intensity aug configured (e.g. "geo"): the cat below
-        x = torch.cat([intensity(x[:, :ni], cfg), x[:, ni:]], 1)  # would only copy the whole batch
+        x = torch.cat([intensity(x[:, :nim], cfg), x[:, nim:]], 1)  # would only copy the whole batch
     if cfg.get("cor"):  # needs the radial channels for the shift direction, so not in `intensity`
         x = _cor(x, cfg["cor"], _m(x.shape[0], x.device, cfg["cor"]["p"]))
     if cfg.get("norad"):

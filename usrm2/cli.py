@@ -54,6 +54,10 @@ def main(argv=None):
     t.add_argument("--teacher-regions", default=None, help="prefer a region's teacher probability store "
                    "(usrm2.data.teacher_region_path under this root) over the exported mask as the rung-2/3 "
                    "target; rung 3 is its 2x mean pool")
+    t.add_argument("--cascade", default="off", choices=["off", "mask", "self", "mix"], help="cascade input channel (docs/unified_design.md section 22): the rung-(k+1) prediction over the same field of view, upsampled 2x. off = 14 channels as before; mask = the rung-(k+1) target block (+ noise); self = the model's own coarse prediction (one extra forward per sample); mix = self with probability --cascade-self-p, else mask")
+    t.add_argument("--cascade-self-p", type=float, default=0.5, help="--cascade mix: probability a sample uses the self source")
+    t.add_argument("--cascade-drop", type=float, default=0.1, help="probability a sample's cascade channel is zeroed (a missing coarse prediction stays in distribution)")
+    t.add_argument("--no-cascade-noise", action="store_true", help="do NOT roughen the mask-derived cascade channel (it is then a blurred copy of the target: a leak)")
     t.add_argument("--stream", default=None, help="replay a `usrm2 stream-plan` queue directory instead of "
                    "sampling: the windows come from the rolling local buffer the planner fills")
     sp = sub.add_parser("stream-plan", help="plan and stream the training windows into a rolling disk buffer "
@@ -91,6 +95,8 @@ def main(argv=None):
     sp.add_argument("--teacher-regions", default=None, help="see `train --teacher-regions`")
     sp.add_argument("--region-fails", type=int, default=0, help="consecutive rejected draws that abandon a "
                     "region (0 = 8 x --windows-per-region)")
+    sp.add_argument("--cascade", default="off", choices=["off", "mask", "self", "mix"], help="must match the "
+                    "training run's --cascade: the planner fetches the coarse target block and the tenth context cube")
     sp.add_argument("--val-rungs", default="2,3,4,6", help="rungs the held-out box is scored at (prefetched and pinned)")
     sp.add_argument("--val-patches", type=int, default=32)
     sp.add_argument("--limit", type=int, default=0, help="stop after this many queued windows (0 = forever)")
@@ -128,6 +134,9 @@ def main(argv=None):
     p.add_argument("--head", default="0", help="head index of a multi-teacher student, or mean / prod / max")
     p.add_argument("--radial-sign", type=float, default=1.0, help="-1 negates the radial vector (the student then predicts the verso face)")
     p.add_argument("--lut-to", nargs="*", default=(), metavar="REF", help="also average with the input histogram-matched to REF volumes")
+    p.add_argument("--cascade", default="auto", choices=["auto", "on", "off"], help="top-down cascade inference: "
+                   "'auto' follows the checkpoint's own --cascade, 'off' feeds a zero cascade channel")
+    p.add_argument("--cascade-depth", type=int, default=3, help="rungs above k predicted top-down to fill the cascade channel")
     ub = sub.add_parser("umbilicus", help="put a scroll's axis where the loader looks for it "
                         "(a published file if there is one, otherwise derived from the scroll's own CT)")
     ub.add_argument("ct_base", nargs="+", help="CT pyramid group(s), or a stores file with --stores-file")
@@ -152,6 +161,8 @@ def main(argv=None):
     s.add_argument("--head", default="0", help="head index of a multi-teacher student, or mean / prod / max")
     s.add_argument("--lut-to", nargs="*", default=(), metavar="REF")
     s.add_argument("--halo", type=int, default=16)
+    s.add_argument("--cascade", default="auto", choices=["auto", "on", "off"], help="see `predict --cascade`")
+    s.add_argument("--cascade-depth", type=int, default=3)
     s.add_argument("--device", default=None)
     t = sub.add_parser("teacher", help="run the upstream teacher over a box")
     t.add_argument("out")
@@ -191,6 +202,8 @@ def main(argv=None):
     v.add_argument("--force", action="store_true", help="rewrite outputs marked done")
     v.add_argument("--reverse", action="store_true", help="take the groups from the end (a second machine working towards the first)")
     v.add_argument("--modes", nargs="+", default=["skin", "raw"], choices=["skin", "raw"], help="skin: anchored outer skin (_v); raw: flipped probability as is (_vraw)")
+    v.add_argument("--cascade", default="auto", choices=["auto", "on", "off"], help="see `predict --cascade`")
+    v.add_argument("--cascade-depth", type=int, default=3)
     b = sub.add_parser("teacher-boxes", help="run the teacher over many random non-air boxes")
     b.add_argument("out_dir")
     b.add_argument("--n", type=int, default=50)
@@ -232,6 +245,10 @@ def main(argv=None):
 
     def parse_boost(vs):
         return {int(q.split("=")[0]): float(q.split("=")[1]) for q in vs}
+
+    def parse_cascade(v):
+        """`--cascade auto|on|off` at INFERENCE -> what predict.probs wants: None = follow the checkpoint."""
+        return None if str(v) == "auto" else (str(v) != "off")
     if a.umbilicus:
         data.UMBILICUS = a.umbilicus
     if a.cmd == "rung-mix":
@@ -245,6 +262,8 @@ def main(argv=None):
                 norm=a.norm, ctx=parse_ctx(a.ctx), stream=a.stream, init_from=a.init_from, wtgt=tuple(a.wtgt), compile=a.compile, ckpt_act=a.ckpt_act, add_skip=a.add_skip, deep=a.deep, size=a.size, steps=a.steps, patch=a.patch if len(a.patch) > 1 else a.patch[0], batch=a.batch, lr=a.lr,
                 workers=a.workers, eval_every=a.eval_every, val_patches=a.val_patches, resume=a.resume,
                 aug=a.aug, no_radial=a.no_radial,
+                cascade=a.cascade, cascade_self_p=a.cascade_self_p, cascade_drop=a.cascade_drop,
+                cascade_noise=not a.no_cascade_noise,
                 **({"rungs": parse_rungs(a.rungs), "rung_boost": parse_boost(a.rung_boost),
                     "val_rungs": [int(q) for q in a.val_rungs.split(",")], "require_targets": a.require_targets,
                     "region": a.region, "windows_per_region": a.windows_per_region,
@@ -269,7 +288,7 @@ def main(argv=None):
                val_rungs=[int(q) for q in a.val_rungs.split(",")], val_patches=a.val_patches,
                region=a.region, windows_per_region=a.windows_per_region, walk=a.walk,
                active_regions=a.active_regions, epochs=a.epochs, region_fails=a.region_fails,
-               teacher_regions=a.teacher_regions, visits_max=a.visits_max)
+               teacher_regions=a.teacher_regions, visits_max=a.visits_max, cascade=a.cascade)
     elif a.cmd == "ablate":
         from usrm2 import ablate
         ablate.sweep(a.out_dir, a.presets.split(","), size=a.size, steps=a.steps, patch=a.patch,
@@ -297,7 +316,8 @@ def main(argv=None):
         luts = [teacher.lut_to(a.volume or data.CT, r) for r in a.lut_to]
         E.run(b[:3], b[3:], ckpt=a.ckpt, store=a.store, teacher=a.teacher, tifxyz=a.tifxyz or E.TIFXYZ,
               volume=a.volume, window=a.window, halo=a.halo, device=a.device, png_path=a.png, tta=a.tta, luts=luts,
-              head=a.head if a.head in P.HEADS else int(a.head))
+              head=a.head if a.head in P.HEADS else int(a.head),
+              cascade=parse_cascade(a.cascade), cascade_depth=a.cascade_depth)
     elif a.cmd == "refine":
         from usrm2 import refine
         outs = refine.run(a.surfaces, a.store, a.out, eval_store=a.eval_store, far=a.far, sigma=a.sigma, iters=a.iters, thr=a.thr,
@@ -339,7 +359,8 @@ def main(argv=None):
         for i, g in enumerate(groups):
             t0 = time.time()
             try:
-                outs = verso.run(g, a.ckpt, window=a.window, halo=a.halo, tile=a.tile, margin=a.margin, force=a.force, batch=a.batch, modes=tuple(a.modes))
+                outs = verso.run(g, a.ckpt, window=a.window, halo=a.halo, tile=a.tile, margin=a.margin, force=a.force, batch=a.batch, modes=tuple(a.modes),
+                                 cascade=parse_cascade(a.cascade), cascade_depth=a.cascade_depth)
             except torch.OutOfMemoryError as e:  # one oversized group must not kill the shard: it is left without `done` (a later pass redoes it)
                 failed += 1
                 print(f"verso {i + 1}/{len(groups)} {g} FAILED (OOM: {str(e)[:80]}) ({time.time() - t0:.0f} s)", flush=True)
@@ -353,7 +374,7 @@ def main(argv=None):
         vol = a.volume or data.CT
         P.predict(a.ckpt, vol, *a.origin, *a.size, a.out, window=a.window, halo=a.halo, volcomp=not a.plain, rung=a.rung,
                   tta=a.tta, luts=[teacher.lut_to(vol, r) for r in a.lut_to], head=a.head if a.head in P.HEADS or a.head == "all" else int(a.head),
-                  radial_sign=a.radial_sign)
+                  radial_sign=a.radial_sign, cascade=parse_cascade(a.cascade), cascade_depth=a.cascade_depth)
 
 
 if __name__ == "__main__":
