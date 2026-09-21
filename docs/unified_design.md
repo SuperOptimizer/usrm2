@@ -679,3 +679,11 @@ r3 raw: val dice r2/r3/r4 = 0.740 / 0.740 / 0.682 (0.59/0.51/0.33 at step 500; 0
 32 Mvox/s until ~33k, then ~25 (loader-bound on the boxed mirror). Checkpoint backed up to the desk at
 /vesuvius/usrm2/runs/u1_30m6_p4_final.pt. Next: `u2_30m6_stream` = streaming region walk (--walk mix), full
 augmentation, teacher region stores preferred at rungs 2/3, warm start from this checkpoint, 200k steps.
+
+## 20. Surface metrics: bootstrap final vs the streaming run (2026-09-21)
+
+Val box, head 0, window 128: bootstrap final `u1_30m6_p4` (45M, 256^3, masks only, geo aug): recall@4 0.806,
+continuity 0.656, merge_frac 0.44, offset<=3 0.36 -- far above the desk 5m (0.753/0.600/0.44) and round 3
+(0.729/0.584/0.42). Streaming run `u2_30m6_stream` at ~7.5k steps (full aug, teacher soft targets at rungs 2/3):
+0.748 / 0.623 / 0.48 / 0.29 -- below u1 early on; to be re-measured at 20k and 40k (if it stays below, the
+teacher soft targets or the full aug are the suspects: the published mask th0.45 is crisper than the teacher's band).
