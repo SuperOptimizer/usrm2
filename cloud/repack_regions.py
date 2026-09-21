@@ -45,6 +45,10 @@ So, before converting a directory:
         bash ~/sync_start.sh && bash ~/publish_restart.sh 2
     The two teacher WRITERS may keep running: they never read a finished store, and the converter skips
     stores without `done`.
+`--verify` DECODES, so it needs the volcomp shared library: on the desk run it with
+`VOLCOMP_LIB=$HOME/.cache/usrm/bin/libvolcomp.so` (what `desk.sh` exports). Without it every store comes
+back FAILED -- harmlessly, nothing is swapped, and the half-built `<store>.tmp` is removed.
+
 `--check` afterwards is the cheap audit (4 bytes per store) that nothing ended up mismatched, and
 `usrm2.data.read_slice` retries a decode failure once against a re-opened array so that a run survives
 this happening anyway -- a backstop, not a licence.
@@ -289,6 +293,7 @@ def _job(a):
     try:
         return fn(*a[:-1])
     except Exception as e:
+        shutil.rmtree(a[0] + ".tmp", ignore_errors=True)  # a half-built conversion never survives a failure
         return ("FAILED", a[0], repr(e))
 
 
