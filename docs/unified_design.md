@@ -613,3 +613,52 @@ still get exactly one visit each. A second visit draws its own windows from its 
 sampling of a region, never the same window again -- and it only happens where the weight per region is
 above average, i.e. where the ladder has almost no data to sample. `--walk once` remains the strict
 no-repeat walk; `mix` is what a long run (the A100's 60k steps) should use.
+
+### 18.3 The desk soak (2026-09-20, 20k steps, 8 scrolls, streamed)
+
+`~/soak_plan.sh` + `~/soak_train.sh` on forlindesk2 (GPU 0 only; GPU 1 was running the region teacher
+service): 5m at 128^3, batch 1, deep 3, compile, ctx 1..9, rungs 2-11 with the usual boosts,
+`--require-targets --region 1024 --windows-per-region 64 --walk once --active-regions 4 --region-fails 192
+--workers 8 --cache-gb 60 --ahead 600`, warm-started from `u1_5m_p4` (60k steps, Paris 4 only). Stores:
+10 sources over 8 scrolls (Paris 4 recto + m7; PHerc0139 m7 + recto-090; PHerc0332, PHerc0343, PHercMANB,
+PHerc0175A, PHerc0813, PHerc1447 m7) at 2.399 / 2.400 / 8.640 / 9.362 um. Walk: 36329 regions, 2.33 M
+windows per epoch, enumerated in 18 s; the 7 new scrolls' axes were derived from their own CT in 1.3-6.4 s
+each.
+
+| | |
+|---|---|
+| windows / regions visited | 20816 / 353 of 36329 (max ordinal 452: 99 regions yielded no window) |
+| every window inside its own walk region | 20816 / 20816 |
+| regions re-opened after being closed | 0 (max 64 windows each, `--active-regions` never exceeded 4) |
+| consecutive entries from a different region | 80.6 % |
+| planner cache hit rate | 0.9929 (434009 mirror hits, 3037 shards fetched, 0 failed, 2045 absent) |
+| bytes fetched per training voxel | 0.56 (24.4 GB for 20816 windows at 128^3) |
+| buffer | median 12.3 GiB, high-water 22.7 GiB of the 60 GB budget, 0 evictions |
+| vox_s | 12.14 M (p10 12.09, p90 12.15) -- rock steady over 975 intervals |
+| stream_wait_ms per 20 steps | median 1, p99 2, max 3 = 0.02 % of the 56 min of training |
+| memory | planner 3.3 GB, trainer 4.6 GB, 8 loader workers 13.0 GB together |
+| source mix | 1.5-15.5 % per source, the two Paris 4 sources 28.7 % |
+| rung mix | r2 12.3, r3 2.2, r4 49.1, r5 20.7, r6 8.0, r7 1.5, r8 2.5, r9 1.9, r10 1.0, r11 0.8 % |
+| val dice (Paris 4's held-out box) | r2 0.613, r3 0.656, r4 0.625, r6 0.338 (warm start: 0.644 / 0.682 / 0.607 / 0.373) |
+
+The trainer never waits for the network: the planner stays parked at `--ahead` and `stream_wait_ms` is a
+millisecond per 20 steps. `--cache-gb 60` was never reached, so eviction did not run (the tests cover it).
+Val on Paris 4's box moves as the mix moves -- rung 4 up (0.607 -> 0.625, half the windows are rung 4 now),
+rung 2 and 3 down a little, rung 6 down (its windows come from other scrolls now) -- which is what a 20k-step
+run over eight scrolls at one third the previous rung-2 share should do; it is a pipeline soak, not a
+training result.
+
+**`--active-regions` 1 vs 4**, planner only, 1024 windows from a cold buffer, same walk:
+
+| K | hit rate | B per training voxel | windows/s |
+|---|---|---|---|
+| 1 | 0.955 | 1.91 | 4.6 |
+| 4 | 0.960 | 1.82 | 11.6 |
+
+Interleaving costs no residency (all K stay open) and triples the planner's throughput, because the four
+regions fetch concurrently.
+
+**Region counts** (patch 256, `--region 1024`, rungs 2-11): the Paris 4 stores file is 30365 regions
+(1.94 M windows); the 8-scroll file is 36329 (2.33 M). Per rung, Paris 4 recto is 25093 / 3667 / 599 / 121 /
+20 / 3 / 2 / 1 / 1 / 1 at rungs 2..11 out of 76800 / 9728 / 1216 / 160 / 20 / 3 / 2 / 1 / 1 / 1 tiles -- the
+all-air check drops two thirds of rung 2 and half of rung 4 before a byte is fetched.

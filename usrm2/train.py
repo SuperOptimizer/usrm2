@@ -238,7 +238,8 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     patch = int(patch[0]) if not np.isscalar(patch) and len(patch) == 1 else (patch if np.isscalar(patch) else [int(v) for v in patch])
     args = dict(size=size, steps=steps, patch=patch, batch=batch, lr=lr, aug=aug, aug_cfg=cfg,
                 no_radial=no_radial, accum=accum, ema_decay=ema_decay, lr_floor=lr_floor, ridge_w=ridge_w, wtgt=list(wtgt),
-                dense_pow=dense_pow, norm=norm, ctx=list(ctx), world=world, **kw)
+                dense_pow=dense_pow, norm=norm, ctx=list(ctx), world=world,
+                stream=str(stream) if stream else None, **kw)
     if norm == "global":
         args["norm_stats"] = data.global_norm(kw.get("ct", data.CT))
         main and print("global normalization", args["norm_stats"], flush=True)
@@ -276,7 +277,9 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     if resume and ck.exists():
         st = torch.load(ck, map_location=dev)
         grow = ("steps", "stores", "stores_file", "val", "val_rungs", "val_patches", "compile", "workers",
-                "require_targets", "rung_boost", "eval_every", "continued_from", "ckpt_act")  # a continued run may train longer, on more data, with other bookkeeping
+                "require_targets", "rung_boost", "eval_every", "continued_from", "ckpt_act",
+                "stream", "teacher_regions", "region", "windows_per_region")
+        # a continued run may train longer, on more data, with other bookkeeping -- and from another queue
         diff = {k: (st["args"][k], args.get(k)) for k in st["args"] if k not in grow and k != "aug_cfg" and st["args"][k] != args.get(k)}
         assert not diff, f"resume with different arguments (saved, now): {diff}"
         if st["args"].get("stores") != args.get("stores"):
@@ -320,8 +323,6 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         print(name, rec, flush=True)
 
     log("train.jsonl", {"step": step, "aug": aug, "cfg": cfg, "size": size, "patch": patch, "batch": batch})
-    if stream:
-        args["stream"] = str(stream)
     t0, micro, rung_n = time.time(), 0, {}
     wait_ms, stream_idx = 0.0, -1
     # the planner may evict a chunk once every worker is past it; the DataLoader is up to this many entries
