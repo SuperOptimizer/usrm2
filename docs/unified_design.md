@@ -662,3 +662,12 @@ regions fetch concurrently.
 (1.94 M windows); the 8-scroll file is 36329 (2.33 M). Per rung, Paris 4 recto is 25093 / 3667 / 599 / 121 /
 20 / 3 / 2 / 1 / 1 / 1 at rungs 2..11 out of 76800 / 9728 / 1216 / 160 / 20 / 3 / 2 / 1 / 1 / 1 tiles -- the
 all-air check drops two thirds of rung 2 and half of rung 4 before a byte is fetched.
+
+Measured for the 8-scroll file (patch 256): `--walk mix` turns the 36329 regions into 54914 visits
+(3.51 M windows per epoch) -- 25093 / 3667 / 15530 / 5428 / 1895 / 665 / 837 / 556 / 606 / 637 at rungs
+2..11, i.e. the coarse rungs go from one or two regions each to hundreds of visits spread over the epoch.
+`--visits-max` (64) is what stops that: rung 11 of a scroll would need ~470 visits to reach the share that
+`--rung-boost 11=80` asks for, and a rung-11 region IS one 256^3 window, so those visits would be the same
+16 Mvox over and over. The boosts were written for a sampler that resamples for ever; under a walk they are
+capped by what exists, and `mix` gives the coarse rungs as much of their share as the data can carry
+(~60x their region count at `--visits-max 64`) without repeating a window.
