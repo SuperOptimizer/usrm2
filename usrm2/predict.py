@@ -118,7 +118,7 @@ def shard_shape(shape, chunk=128, cap=1024):
     return tuple(min(cap, -(-int(s) // chunk) * chunk) for s in shape)
 
 
-def out_array(path, shape, origin, volcomp=True, volume=None, umbilicus=None, rung=2):
+def out_array(path, shape, origin, volcomp=True, volume=None, umbilicus=None, rung=2, channels=("recto",)):
     import zarr
     try:
         from volcomp_zarr import VolcompCodec
@@ -135,7 +135,7 @@ def out_array(path, shape, origin, volcomp=True, volume=None, umbilicus=None, ru
     else:
         kw["shape"], kw["chunks"], kw["shards"] = (1,) + tuple(shape), (1, 128, 128, 128), (1,) + sh
         z = zarr.create_array(path, **kw)
-    z.attrs.update({"channels": ["recto"], "voxel_um": data.rung_um(rung), "rung": int(rung),
+    z.attrs.update({"channels": [str(c) for c in channels], "voxel_um": data.rung_um(rung), "rung": int(rung),
                     "origin_zyx": [int(v) for v in origin], "scale": 1.0,
                     "volume": volume or data.CT, "umbilicus": umbilicus or data.UMBILICUS})  # so loaders know the scroll
     return z
@@ -151,8 +151,8 @@ def u8(prob):
     return np.clip(np.rint(prob * 255), 0, 255).astype(np.uint8)
 
 
-def write(path, prob, origin, volcomp=True, volume=None, rung=2):
-    a = out_array(path, prob.shape, origin, volcomp=volcomp, volume=volume, rung=rung)
+def write(path, prob, origin, volcomp=True, volume=None, rung=2, channels=("recto",)):
+    a = out_array(path, prob.shape, origin, volcomp=volcomp, volume=volume, rung=rung, channels=channels)
     p = u8(prob)
     a[:] = p[None] if a.ndim == 4 else p
 
@@ -174,6 +174,32 @@ def flips_vec(fn, n=8):
 
 
 HEADS = {"mean": lambda p: p.mean(1), "prod": lambda p: p.prod(1) ** (1 / p.shape[1]), "max": lambda p: p.max(1).values}
+
+CHANNEL_DEFAULT = ("recto", "verso")  # the unified model's output channel order (section 23)
+
+
+def resolve_head(head, args=None):
+    """`--head` -> what `probs` selects: an output channel INDEX, "all", or a `HEADS` reducer name.
+
+    A channel NAME is looked up in the checkpoint's own channel list (`args["channels"]`, the order the
+    unified model's head was trained in), falling back to recto = 0, verso = 1. `--head verso` on a cout=1
+    checkpoint is an error and says so: the old way to get a verso band out of a recto-only student is
+    `--radial-sign -1` (verso.py), which still works and is a different thing -- a recto model looking at a
+    mirrored world, not a trained verso output."""
+    if not isinstance(head, str):
+        return int(head)
+    h = head.strip()
+    if h in HEADS or h == "all":
+        return h
+    if h.lstrip("+-").isdigit():
+        return int(h)
+    ch = [str(c) for c in ((args or {}).get("channels") or CHANNEL_DEFAULT)]
+    i = ch.index(h) if h in ch else (CHANNEL_DEFAULT.index(h) if h in CHANNEL_DEFAULT else None)
+    assert i is not None, f"--head {head}: an output channel of {ch}, an index, 'all', or one of {sorted(HEADS)}"
+    n = int((args or {}).get("cout", len(ch)))
+    assert i < n, (f"--head {head} is output channel {i} but the checkpoint has cout={n}. A single-output "
+                   "recto checkpoint has no verso channel; --radial-sign -1 is the old flip trick.")
+    return i
 
 
 CASCADE_HALO = 16  # rung-(k+1) voxels of margin around a coarse prediction's footprint
@@ -201,9 +227,11 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
           cascade=None, cascade_depth=3):
     """Sliding-window recto probability (float32) over a box; returns (prob, checkpoint state).
     tta: number of axis flips to average; luts: intensity LUTs (uint8->float) whose predictions are averaged in;
-    head: which head of a multi-teacher student (int), "mean" / "prod" / "max" over all heads, or "all" for a
-    (heads, Z, Y, X) result. radial_sign=-1 negates the radial vector: a recto-trained student then places its
-    band on the other face of the sheet (the verso; see verso.py). batch > 1: windows batched on the GPU
+    head: which OUTPUT CHANNEL to write -- an index, a channel name of the checkpoint ("recto" / "verso",
+    from `args["channels"]`), "mean" / "prod" / "max" over all of them, or "all" for a (channels, Z, Y, X)
+    result. radial_sign=-1 negates the radial vector: a recto-trained student then places its band on the
+    other face of the sheet (the verso; see verso.py) -- the old flip trick, still the only way to get a
+    verso band out of a cout=1 checkpoint, and unrelated to `--head verso`. batch > 1: windows batched on the GPU
     (slide_gpu; CT + radial inputs only, no context channels / luts / tta).
     cascade: None = whatever the checkpoint was trained with (`args["cascade"]`), False / "off" = force the
     channel to zero. cascade_depth: how many rungs above k are predicted top-down to fill it (default 3;
@@ -236,6 +264,7 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
     use_cas = cmode != "off"                       # the checkpoint HAS the channel: it must always be fed
     off = cascade is not None and (cascade is False or str(cascade) == "off")
     depth0 = 0 if (off or not use_cas) else max(int(cascade_depth), 0)  # 0 = the channel is fed as zeros
+    head = resolve_head(head, st["args"])
     pick = (lambda p: p) if head == "all" else HEADS[head] if isinstance(head, str) else (lambda p: p[:, int(head)])
     fn = lambda t: pick(torch.sigmoid(net(t)))  # (B,C,...) -> (B,...)  (or (B,C,...) for "all")
     if tta > 1:
@@ -302,7 +331,15 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
 
 def predict(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=None, volcomp=True, tta=0, luts=(), head=0, radial_sign=1.0, rung=None,
             cascade=None, cascade_depth=3):
-    prob, _ = probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=window, halo=halo, device=device, tta=tta, luts=luts, head=head, radial_sign=radial_sign, rung=rung,
-                    cascade=cascade, cascade_depth=cascade_depth)
-    write(out, prob, (z0, y0, x0), volcomp=volcomp, volume=volume, rung=2 if rung is None else int(rung))
+    prob, st = probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=window, halo=halo, device=device, tta=tta, luts=luts, head=head, radial_sign=radial_sign, rung=rung,
+                     cascade=cascade, cascade_depth=cascade_depth)
+    h = resolve_head(head, st["args"])
+    ch = [str(c) for c in (st["args"].get("channels") or CHANNEL_DEFAULT)]
+    # the store says WHICH output it holds: the region loaders key the verso stores on it
+    names = ch[:int(st["args"].get("cout", 1))] if h == "all" else \
+        [ch[h] if isinstance(h, int) and h < len(ch) else str(h)]
+    if radial_sign < 0 and names == ["recto"]:
+        names = ["verso"]  # the flip trick: a recto head pointed at the other face
+    write(out, prob, (z0, y0, x0), volcomp=volcomp, volume=volume, rung=2 if rung is None else int(rung),
+          channels=names)
     return out

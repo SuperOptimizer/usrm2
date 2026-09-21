@@ -806,11 +806,36 @@ def region_list(srcs, patch=256, region=1024, allowed=None, boost=None, exclude=
 TEACHER_REGIONS = _os.environ.get("USRM2_TEACHER_REGIONS", "/vesuvius/usrm2/teacher_regions")
 REGION = 1024  # the rung-2 region edge the walk and the teacher service agree on
 
+# The VERSO output channel (docs/unified_design.md section 23). The model has ONE recto output and one
+# verso output -- channel 0 and channel 1 of the same 1x1x1 head, not a second branch. The verso target has
+# no exported pyramid: it exists only as region stores, `<root>/verso/region_<z>_<y>_<x>.zarr`, written by
+# the 5090 pod exactly like the recto ones (1024^3 uint8 probability * 255, volcomp q8, attrs `origin_zyx`,
+# `channels: ["verso"]` and `done`). A voxel no finished verso store covers gets WEIGHT 0 in that channel,
+# which is the per-channel ignore the loss already understands; at every rung but 2 and 3 the whole channel
+# is weight 0 for now.
+VERSO = "verso"
+TSTORE_TTL = 1800.0  # seconds a MISSING region store stays missing in a loader's cache (the pod publishes
+                     # continuously, so a negative result must expire; a found store is cached for good)
+
 
 def teacher_region_path(lo2, channel="recto", root=None):
     """Where the region teacher service writes the store of the region at rung-2 origin `lo2`."""
     z, y, x = (int(v) for v in lo2)
     return f"{root or TEACHER_REGIONS}/{channel}/region_{z}_{y}_{x}.zarr"
+
+
+# Where the 5090 pod PUBLISHES the verso region stores. A store is two objects -- `zarr.json` and the one
+# 1024^3 shard `c/0/0/0` -- and it appears only once the pod has finished it (`done` in the attrs), so a
+# 404 means "not published yet", never "no verso here" (see `stream.Planner.fetch_verso`).
+VERSO_REGIONS_URL = ("https://dl.ash2txt.org/community-uploads/forrest/volcomp/PHercParis4/"
+                     "representations/predictions/teacher_regions/verso-2.4um")
+REGION_FILES = ("zarr.json", "c/0/0/0")
+
+
+def verso_region_url(lo2, base=None):
+    """The published URL of the verso region store at rung-2 origin `lo2` (no trailing slash)."""
+    z, y, x = (int(v) for v in lo2)
+    return f"{str(base or VERSO_REGIONS_URL).rstrip('/')}/region_{z}_{y}_{x}.zarr"
 
 
 def read_teacher(a, k, lo, p):
@@ -873,7 +898,8 @@ class Patches(torch.utils.data.IterableDataset):
     def __init__(self, patch=128, ct=CT, stores=TRAIN, exclude=VAL, seed=0, air_keep=0.1, fg_min=0.05,
                  fg_keep=0.25, sym=True, aug=None, dense_pow=0.0, dense_ref=0.2, ctx=(), stores_file=None,
                  recheck=200, rungs=None, rung_boost=None, channels=None, require_targets=False, stream=None,
-                 region=0, windows_per_region=64, region_fails=0, teacher_regions=None, cascade="off"):
+                 region=0, windows_per_region=64, region_fails=0, teacher_regions=None, cascade="off",
+                 verso=False, verso_regions=None):
         """dense_pow > 0 biases sampling towards sheet-dense patches: a patch whose target mean m is below
         dense_ref is kept with probability (m / dense_ref) ** dense_pow (crushed windings are where students fail).
         stores_file: instead of `stores`, a text file with one comma-joined group per line that is re-read
@@ -919,6 +945,11 @@ class Patches(torch.utils.data.IterableDataset):
         # the region teacher stores (see `read_teacher`): soft probability instead of the exported mask,
         # for any rung-2/3 window that lies inside one finished region store
         self.teacher_regions = None if teacher_regions in (None, "") else str(teacher_regions)
+        # the VERSO output channel (section 23): an extra output channel whose only source is the verso
+        # region stores under `verso_regions` (default: the same root as the recto ones). Everywhere no
+        # finished verso store covers, the channel's WEIGHT is 0 and the sample trains recto alone.
+        self.verso = bool(verso)
+        self.verso_regions = (None if verso_regions in (None, "") else str(verso_regions)) or self.teacher_regions
         self._tstore = {}
         # CASCADE (docs/unified_design.md section 22): the rung-(k+1) prediction as an extra input channel.
         # "off" (nothing changes), "mask" (the rung-(k+1) target block), "self" (the model's own coarse
@@ -937,6 +968,7 @@ class Patches(torch.utils.data.IterableDataset):
             ex = [exclude]  # a single (origin, size) box, not two excludes
         self.exclude = [e for e in ex if e is not None and (isinstance(e, tuple) or len(e))]
         self.dense_pow, self.dense_ref, self.ctx = dense_pow, dense_ref, tuple(ctx)  # coarse context levels
+        self.nrecto = None  # set by _open_rungs: the output channels that are NOT the verso one
         self.sym = sym  # the 48 cube symmetries; the GPU augs are in aug.py
         self.aug = aug or {}  # the worker-side raw-uint8 stage: window / volcomp / blank
         self.air_keep, self.fg_min, self.fg_keep = air_keep, fg_min, fg_keep  # low-foreground patches are mostly skipped
@@ -967,6 +999,11 @@ class Patches(torch.utils.data.IterableDataset):
         self.srcs = source_groups([",".join(ps) for ps in self.paths])
         if self.channels is None:
             self.channels = list(dict.fromkeys(c for s in self.srcs for c in s["targets"]))
+        if self.verso and VERSO not in self.channels:  # no source pyramid provides it: the stores do
+            self.channels = list(self.channels) + [VERSO]
+        # the verso channel is always LAST and never decides whether a window is worth training on: the
+        # foreground / density rejection rules stay exactly what a recto-only run's were
+        self.nrecto = len(self.channels) - (1 if self.channels and self.channels[-1] == VERSO else 0)
         allowed = None if self.rungs is True else set(self.rungs)
         for s in self.srcs:
             s["probs"] = rung_probs(s, self.patch, allowed, self.rung_boost)
@@ -1069,10 +1106,11 @@ class Patches(torch.utils.data.IterableDataset):
             ct = read_rung(cpyr, k, lo, p, dtype=np.uint8)
             if (ct == 0).mean() > 0.9 and rng.random() > self.air_keep:
                 return None, None
-            tea = self._teacher_store(s, k, lo)
-            tg, w = self._rung_target(s, k, lo, ct, teacher=tea)
-            sel = w > 0
-            m = float(np.sum(tg, where=sel, dtype=np.int64)) / 255.0 / max(int(sel.sum()), 1)
+            tea, ver = self._teacher_store(s, k, lo), self._verso_store(s, k, lo)
+            tg, w = self._rung_target(s, k, lo, ct, teacher=tea, verso=ver)
+            nr = self.nrecto or len(self.channels)
+            sel = w[:nr] > 0          # the verso channel is ignored here: a cout=2 run draws the same
+            m = float(np.sum(tg[:nr], where=sel, dtype=np.int64)) / 255.0 / max(int(sel.sum()), 1)  # windows
             if m < self.fg_min and rng.random() > self.fg_keep:
                 return None, None
             if self.dense_pow > 0 and m < self.dense_ref and rng.random() > (m / self.dense_ref) ** self.dense_pow:
@@ -1087,6 +1125,8 @@ class Patches(torch.utils.data.IterableDataset):
         desc = {"s": int(i), "k": k, "lo": [int(v) for v in lo], "y": sym, "b": int(blank), "r": prm}
         if not blank and tea:  # the replaying worker reads the same teacher store, not the mask pyramid
             desc["t"] = tea
+        if not blank and ver:
+            desc["v"] = ver
         if hook is not None and (self.ctx or self.cascade != "off"):
             hook.ctx(s, k, lo)
         if not build:
@@ -1107,7 +1147,9 @@ class Patches(torch.utils.data.IterableDataset):
             w = np.zeros_like(tg)
         else:
             ct = read_rung(s["ct_pyr"], k, lo, p, dtype=np.uint8)
-            tg, w = self._rung_target(s, k, lo, ct, teacher=d.get("t"))
+            # the verso store may have been published AFTER the planner wrote this entry: look again
+            tg, w = self._rung_target(s, k, lo, ct, teacher=d.get("t"),
+                                      verso=d.get("v") or self._verso_store(s, k, lo))
             ct = raw_apply(ct, d.get("r") or {})
         cx = context(s["ct"], lo, ct.shape, self.ctx, rung=k) if self.ctx else ()
         ex = self._cascade_extras(s, k, lo, ct.shape, blank=blank)
@@ -1146,44 +1188,68 @@ class Patches(torch.utils.data.IterableDataset):
             out["lo1"] = c0 // 2 - p // 2
         return out
 
-    def _teacher_store(self, s, k, lo):
-        """The finished region teacher store that covers this whole window, or None. Only rungs 2 and 3
+    def _region_store(self, s, k, lo, channel, root):
+        """The finished region store of `channel` that covers this whole window, or None. Only rungs 2 and 3
         (the store's own grid is rung 2 and rung 3 is its 2x pool), only a window inside ONE region, and
         only for the FIRST source: the regions are named by rung-2 origin, which is one scroll's grid."""
-        if not self.teacher_regions or int(k) not in (2, 3) or s is not self.srcs[0]:
+        if not root or int(k) not in (2, 3) or s is not self.srcs[0]:
             return None
         d = int(k) - 2
         lo2, hi2 = np.asarray(lo, np.int64) << d, ((np.asarray(lo, np.int64) + self.patch) << d) - 1
         a, b = lo2 // REGION, hi2 // REGION
         if not np.array_equal(a, b) or (lo2 < 0).any():
             return None                                    # the window straddles two region stores
-        p = teacher_region_path(a * REGION, self.channels[0], self.teacher_regions)
+        p = teacher_region_path(a * REGION, channel, root)
         return p if self._teacher_arr(p) is not None else None
 
-    def _teacher_arr(self, path):
-        """The opened store, or None when it does not exist or the service has not finished it."""
-        a = self._tstore.get(path)
-        if a is None:
-            try:
-                a = open_zarr(path)
-                a = a if a.attrs.get("done") else False
-            except Exception:  # noqa: BLE001  (not written yet)
-                a = False
-            self._tstore[path] = a
-        return a or None
+    def _teacher_store(self, s, k, lo):
+        """The RECTO region teacher store covering this window (see `_region_store`)."""
+        return self._region_store(s, k, lo, self.channels[0], self.teacher_regions)
 
-    def _rung_target(self, s, k, lo, ct, teacher=None):
+    def _verso_store(self, s, k, lo):
+        """The VERSO region store covering this window. The pod publishes these continuously, so a store
+        that was missing when a window was drawn may exist later; `_teacher_arr` expires a miss."""
+        if not self.verso:
+            return None
+        return self._region_store(s, k, lo, VERSO, self.verso_regions)
+
+    def _teacher_arr(self, path):
+        """The opened store, or None when it does not exist or the service has not finished it. A HIT is
+        cached for the life of the loader; a MISS expires after `TSTORE_TTL` seconds, because the region
+        services publish while the run trains (a verso store appearing mid-run must be picked up)."""
+        import time as _t
+        a = self._tstore.get(path)
+        if a is None or (a[0] is False and _t.time() - a[1] > TSTORE_TTL):
+            try:
+                z = open_zarr(path)
+                z = z if z.attrs.get("done") else False
+            except Exception:  # noqa: BLE001  (not written yet)
+                z = False
+            a = self._tstore[path] = (z, _t.time())
+        return a[0] or None
+
+    def _rung_target(self, s, k, lo, ct, teacher=None, verso=None):
         """(target, weight) at rung k as uint8 (255 = 1.0): one channel per output channel, 0 (weight 0) for
         a channel this source does not provide; weight 1 inside the target's box and where CT > 0, times its
         source weight. `teacher`: a region teacher store whose soft probability replaces the exported mask
-        for the first channel (the window is inside it; rung 3 is its 2x mean pool)."""
+        for the first channel (the window is inside it; rung 3 is its 2x mean pool). `verso`: the VERSO
+        region store, the only source of the verso channel -- without one that channel keeps weight 0
+        everywhere, which is a perfectly good recto-only sample."""
         p = self.patch
         tg = np.zeros((len(self.channels),) + tuple(p), np.uint8)
         w = np.zeros_like(tg)
         inside_ct = ct > 0
         ta = self._teacher_arr(teacher) if teacher else None
+        va = self._teacher_arr(verso) if verso else None
         for c, chan in enumerate(self.channels):
-            if ta is not None and chan == (ta.attrs.get("channel") or self.channels[0]):
+            if chan == VERSO:
+                if va is not None:
+                    v, ins = read_teacher(va, k, lo, p)
+                    np.copyto(tg[c], v, where=inside_ct)
+                    w[c] = np.where(ins & inside_ct, np.uint8(255), np.uint8(0))
+                continue  # no store here: weight 0, i.e. the verso channel is ignored on this sample
+            if ta is not None and chan == (ta.attrs.get("channel") or
+                                           (list(ta.attrs.get("channels") or []) or [None])[0] or self.channels[0]):
                 v, ins = read_teacher(ta, k, lo, p)
                 np.copyto(tg[c], v, where=inside_ct)
                 w[c] = np.where(ins & inside_ct, np.uint8(255), np.uint8(0))
@@ -1214,6 +1280,8 @@ class Patches(torch.utils.data.IterableDataset):
             "(the planner fetches the coarse target block and the tenth context cube)"
         self.paths, self.stores_file = [g.split(",") for g in m["stores"]], None
         self.teacher_regions = self.teacher_regions or m.get("teacher_regions")
+        self.verso = self.verso or bool(m.get("verso"))
+        self.verso_regions = self.verso_regions or m.get("verso_regions") or self.teacher_regions
         if self.channels is None:
             self.channels = list(m["channels"])
         assert list(self.channels) == list(m["channels"]), f"--stream was planned for channels {m['channels']}"
@@ -1438,15 +1506,24 @@ def val_box(store=VAL):
 VAL_RUNGS = (2, 3, 4, 6)  # the rungs the held-out box is scored at
 
 
-def val_grid_rungs(patch, stores, box2, rungs=VAL_RUNGS, limit=8, ctx=(), channels=None, cascade="off"):
+def val_grid_rungs(patch, stores, box2, rungs=VAL_RUNGS, limit=8, ctx=(), channels=None, cascade="off",
+                   verso=False, verso_regions=None):
     """Per-rung validation: the held-out box (given at rung 2) read at each rung from the same pyramids
     as training. Returns the same compact uint8 items the rung loader yields (`rung_item`), so 8 patches x
-    3 rungs at 256^3 cost ~1.6 GB of host memory instead of the ~22 GB of 14-channel float32 they used to."""
+    3 rungs at 256^3 cost ~1.6 GB of host memory instead of the ~22 GB of 14-channel float32 they used to.
+
+    `verso`: add the verso output channel. Its target comes from a published verso region store covering the
+    val box (`verso_regions`) when there is one, and otherwise carries weight 0 -- so the grid still has two
+    channels, `val_png` still shows both, and the verso metrics are simply empty until a store lands on the
+    box. The RECTO channel is never taken from a region store here: the validation target stays the exported
+    mask pyramid, so a run's recto numbers are comparable across the whole ladder."""
     srcs = source_groups(stores)
     if channels is None:
         channels = list(dict.fromkeys(c for s in srcs for c in s["targets"]))
+        if verso and VERSO not in channels:
+            channels = channels + [VERSO]
     ds = Patches(patch=patch, stores=stores, exclude=[], rungs=True, ctx=ctx, channels=channels, sym=False,
-                 cascade=cascade)
+                 cascade=cascade, verso=verso, verso_regions=verso_regions)
     ds._open_rungs()
     p3, out = shape3(patch), []
     o2, s2 = val_box(box2)
@@ -1463,7 +1540,7 @@ def val_grid_rungs(patch, stores, box2, rungs=VAL_RUNGS, limit=8, ctx=(), channe
             for c in corners:
                 lo = org + np.array(c, np.int64)
                 ct = read_rung(s["ct_pyr"], k, lo, p3, dtype=np.uint8)
-                tg, w = ds._rung_target(s, k, lo, ct)
+                tg, w = ds._rung_target(s, k, lo, ct, verso=ds._verso_store(s, k, lo))
                 cx = context(s["ct"], lo, ct.shape, ctx, rung=k) if ctx else ()
                 ex = ds._cascade_extras(s, k, lo, ct.shape)
                 out.append(rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, s["axis"], **ex))

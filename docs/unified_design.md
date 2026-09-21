@@ -859,3 +859,135 @@ optional `nimg` and `train` passes the cube count when cascade is on: the intens
 CT and context cubes only, and the cascade channel and the scale plane are left alone. Spatial augs still
 act on every channel (the cascade channel is a spatial field and must ride the same grid). A run with
 `--cascade off` is bit-for-bit what it was.
+
+## 23. The verso output channel (implemented 2026-09-21)
+
+ONE model, two outputs. The final 1x1x1 head grows from `cout=1` to `cout=2` -- channel 0 recto, channel 1
+verso -- and the deep-supervision heads follow (they are `cout`-wide too). There is NO second head, no
+second branch and no second decoder: the whole net up to the last convolution is shared, and the verso
+output costs `w0` extra parameters per head (32 weights + 1 bias on the 30m6) and nothing measurable per
+step. `--verso` on `train` is what switches it on; `--cout 2` is an optional assertion that the output
+channel list came out the length you expected.
+
+### Where the verso target comes from
+
+The verso target has no pyramid. Unlike recto -- which has published masks, exported target pyramids and
+region teacher stores -- verso exists only as REGION STORES, written by the 5090 pod as it works through the
+same region list:
+
+    <root>/verso/region_<z>_<y>_<x>.zarr        z, y, x = the region origin in RUNG-2 voxels
+
+1024^3 uint8 (probability * 255), zarr v3 sharded (one data file, `c/0/0/0`), volcomp q8, written with
+`predict.out_array(..., channels=["verso"])`, attrs `origin_zyx` / `voxel_um` / `rung` / `volume` /
+`umbilicus` and `done: true` when the pod has finished it -- the same contract as the recto teacher region
+stores of section 17, under a sibling directory. `--verso-regions` is that root; it defaults to
+`--teacher-regions`, so one directory holds `recto/` and `verso/`.
+
+The loader reads it exactly as it reads a recto teacher store (`data.read_teacher`): rung 2 is the store's
+own grid, rung 3 is its 2x mean pool, and a window must lie inside ONE finished store (a window straddling
+two regions falls back, as for recto).
+
+### The weights
+
+The target tensor has two channels and so does the weight tensor -- the per-channel ignore of section 3,
+which the losses already understand. Per channel:
+
+| | recto (channel 0) | verso (channel 1) |
+|---|---|---|
+| rung 2 | recto teacher region store if one covers the window, else the published mask pyramid | the verso region store's probability; weight = the store's `inside` mask AND CT > 0 |
+| rung 3 | same, the store's 2x pool | the store's 2x pool, same weight |
+| rungs >= 4 | the mask pyramid | **weight 0 everywhere** -- there is no verso source above rung 3 yet |
+| no store / straddling / blank patch | unchanged | weight 0 |
+
+So a sample with zero verso weight everywhere is a perfectly good recto sample, and most samples are exactly
+that. Recto weights are not touched by any of this.
+
+The foreground and density rejection rules (`fg_min`, `dense_pow`, "every voxel masked") look at the RECTO
+channels only, so a `--verso` run draws the same windows a `--cout 1` run would from the same seed -- which
+is what lets one stream queue feed either.
+
+### The losses with a dead channel
+
+`train.losses_tw` had to change in one place. The BCE is a single weighted mean over the whole tensor, so a
+channel that is weight 0 throughout a batch contributes nothing to the numerator AND nothing to the
+denominator: it neither adds to the loss nor rescales the recto term, and an all-zero weight tensor (the
+blank-patch aug) gives 0, not a NaN. The soft dice is per channel and used to be `.mean()` over them; a
+weight-0 channel scores a constant 0 there and would have HALVED the recto dice on every sample without a
+verso store. It is now the mean over the channels the batch says anything about:
+
+    live = (wv.sum(dims) > 0)
+    dice = (per_channel * live).sum() / live.sum().clamp_min(1)
+
+With one channel, or with every channel live, that is the old value exactly; with nothing live it is 0. The
+gradient into the verso row of the head is exactly zero on such a batch (the weight multiplies both `p` and
+`tgt` in the dice and the BCE term). `deep_losses` pools the weights alongside the targets as before, so an
+ignored channel stays ignored at every supervision level. Measured `overlap` (mean excess
+relu(p_recto + p_verso - 1)) is now reported for any even `cout`, so the recto/verso pair gets it too, and
+`eval.jsonl` carries `dice_recto` / `dice_verso` -- a channel scored only on the patches that weigh it, so
+`dice_verso` is simply absent until a verso store covers the validation box.
+
+### The planner fetches the verso stores
+
+The pod publishes continuously, so the verso stores appear region by region WHILE the run trains. Two paths:
+
+- **local** (`--teacher-regions DIR` on `train`): `<DIR>/verso/` is read the same way `<DIR>/recto/` already
+  was. A store that was missing is re-probed after `data.TSTORE_TTL` (30 min) -- a miss must not be cached
+  for the life of the run.
+- **streamed** (`stream-plan --verso --verso-regions-url URL`): when the planner plans a region it makes that
+  region's verso store local first. One GET of `zarr.json` (a few hundred bytes) decides: 404 = not published
+  yet, `done` false = still being written (the file is removed again, so no loader ever opens a half store),
+  otherwise the single shard `c/0/0/0` is pulled too and the store is complete under
+  `<--verso-regions>/verso/`. The result is cached per region -- a hit for good, a miss for
+  `stream.VERSO_TTL` (30 min) -- so the cost per window is a dict lookup, and the download goes through the
+  existing keep-alive `aiohttp` session and the same `--jobs` semaphore as everything else, with two attempts
+  and no `.absent` marker (an absent verso store has to be allowed to become present). The published root is
+
+      https://dl.ash2txt.org/community-uploads/forrest/volcomp/PHercParis4/representations/predictions/teacher_regions/verso-2.4um/
+
+  (`data.VERSO_REGIONS_URL`). Verso stores are NOT charged to the rolling chunk buffer and are not evicted:
+  every window of a region reads the one store, and `<DIR>/verso` therefore grows with the walk (~30-60 MiB
+  per region at volcomp q8). `plan.jsonl` reports `verso_stores` and `verso_MiB`.
+
+The queue descriptor gains `"v"`, the store the planner saw, exactly as `"t"` carries the recto one; a
+replaying worker that finds no `"v"` looks once itself, so a store published between planning and replay is
+still used. `meta.json` carries `verso`, `verso_regions` and `verso_url`, and the queue's channel list now
+ends in `verso`, so a `--verso` queue can only be replayed by a `--verso` run and vice versa.
+
+### The warm start
+
+`train.warm_start` already did this: head j takes source head j mod n, for the main head and every
+deep-supervision head. A `cout 1 -> 2` warm start therefore copies the recto filter and bias into the verso
+channel, so at step 0 the verso output says exactly what the recto output says -- a sane starting point (the
+verso face is the same sheet) that the verso loss then pulls off it. The recto channel is untouched: the
+head is a 1x1x1 convolution, so channel 0 is the same dot product either way and the outputs agree to one
+float32 ulp (measured 1.2e-7 relative; a 2-output convolution accumulates in a different order).
+
+This composes with the cascade 14 -> 15 input warm start of section 22 -- the stem and the head are adapted
+independently -- so the A100 restart does both in one `--init-from`: 15 input channels with the cascade slot
+zeroed, 2 output channels with verso copied from recto, and the recto prediction at step 0 is the old run's
+to a ulp.
+
+### Resume and inference
+
+`verso` and `cout` are NOT in the resume `grow` tuple: they change the head, so they must match a resumed
+checkpoint (`cout` was already checked, being in `args`). `verso_regions` and `verso_regions_url` ARE in it,
+like `teacher_regions`: where the stores come from may change between restarts without changing the model.
+A `cout=1` run resumes exactly as before -- `verso` and friends are only written into `args` when the flag is
+on, so an existing checkpoint's args are byte-for-byte what they were.
+
+`predict.probs(head=...)` and `evalsurf --head` take a channel NAME as well as an index: `--head recto` = 0,
+`--head verso` = 1, resolved against the checkpoint's own `args["channels"]`. `--head verso` on a cout=1
+checkpoint is an error that names the alternative: `--radial-sign -1`, the old flip trick (a recto model
+shown a mirrored world, `verso.py`), which is unchanged and still the only way to get a verso band out of a
+single-output checkpoint. `predict` writes the channel name into the store's `channels` attr, so the verso
+stores the pod publishes and the ones a student writes are self-describing.
+
+`evalsurf --head verso` runs, but there is NO published verso surface to score against. It scores at the
+RECTO surface points, so `offset_mean` becomes the sheet thickness rather than a bias and recall/precision
+are not comparable with a recto run; the command prints that note. Scoring against the recto surfaces
+shifted by a guessed thickness would only measure the guess, so it is deliberately not done. Until verso
+surfaces exist, `--head verso` on evalsurf is a smoke test plus a thickness readout.
+
+`val_png` needs no change: it already tiles every target channel and every output channel, so a cout=2 grid
+shows CT, recto target, verso target, recto prediction, verso prediction (a verso target with no store is
+black).

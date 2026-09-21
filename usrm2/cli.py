@@ -54,6 +54,17 @@ def main(argv=None):
     t.add_argument("--teacher-regions", default=None, help="prefer a region's teacher probability store "
                    "(usrm2.data.teacher_region_path under this root) over the exported mask as the rung-2/3 "
                    "target; rung 3 is its 2x mean pool")
+    t.add_argument("--verso", action="store_true", help="add the VERSO OUTPUT CHANNEL (docs/unified_design.md "
+                   "section 23): ONE head with cout 2, channel 0 recto and channel 1 verso (the deep heads "
+                   "follow). Its target is the verso region stores under --verso-regions (default: "
+                   "--teacher-regions); every voxel no finished verso store covers has weight 0 in that "
+                   "channel, so a sample with no verso is still a valid recto sample")
+    t.add_argument("--verso-regions", default=None, help="root of the verso region stores "
+                   "(<root>/verso/region_<z>_<y>_<x>.zarr); default: --teacher-regions")
+    t.add_argument("--verso-regions-url", default=None, help="where `stream-plan` fetches verso region "
+                   "stores from (recorded in the args; the planner is what downloads them)")
+    t.add_argument("--cout", type=int, default=None, help="assert the number of output channels (1 recto, "
+                   "2 recto+verso): the head width is derived from the target channels, this just checks it")
     t.add_argument("--cascade", default="off", choices=["off", "mask", "self", "mix"], help="cascade input channel (docs/unified_design.md section 22): the rung-(k+1) prediction over the same field of view, upsampled 2x. off = 14 channels as before; mask = the rung-(k+1) target block (+ noise); self = the model's own coarse prediction (one extra forward per sample); mix = self with probability --cascade-self-p, else mask")
     t.add_argument("--cascade-self-p", type=float, default=0.5, help="--cascade mix: probability a sample uses the self source")
     t.add_argument("--cascade-drop", type=float, default=0.1, help="probability a sample's cascade channel is zeroed (a missing coarse prediction stays in distribution)")
@@ -93,6 +104,14 @@ def main(argv=None):
     sp.add_argument("--epochs", type=int, default=1, help="walk the region list this many times (a fresh "
                     "permutation each time)")
     sp.add_argument("--teacher-regions", default=None, help="see `train --teacher-regions`")
+    sp.add_argument("--verso", action="store_true", help="plan for the verso output channel (must match the "
+                    "training run's --verso: it changes the queue's channel list)")
+    sp.add_argument("--verso-regions", default=None, help="see `train --verso-regions`")
+    sp.add_argument("--verso-regions-url", default=None, metavar="URL",
+                    help="fetch verso region stores from this published root as the pod writes them, e.g. "
+                    f"{__import__('usrm2.data', fromlist=['data']).VERSO_REGIONS_URL} . The planner checks a "
+                    "region once when it plans it (a GET of zarr.json; a 404 = not published yet, retried "
+                    "after 30 min) and downloads zarr.json + c/0/0/0 into <--verso-regions>/verso/")
     sp.add_argument("--region-fails", type=int, default=0, help="consecutive rejected draws that abandon a "
                     "region (0 = 8 x --windows-per-region)")
     sp.add_argument("--cascade", default="off", choices=["off", "mask", "self", "mix"], help="must match the "
@@ -131,7 +150,8 @@ def main(argv=None):
                    "--origin/--size are then rung-k voxels (default: the level the volume names, rung 2)")
     p.add_argument("--plain", action="store_true", help="plain zarr (1,Z,Y,X) instead of volcomp")
     p.add_argument("--tta", type=int, default=0, help="average over this many axis flips (8 = all)")
-    p.add_argument("--head", default="0", help="head index of a multi-teacher student, or mean / prod / max")
+    p.add_argument("--head", default="0", help="which output channel to write: an index, a channel NAME of "
+                   "the checkpoint (recto / verso -- see `train --verso`), all, or mean / prod / max")
     p.add_argument("--radial-sign", type=float, default=1.0, help="-1 negates the radial vector (the student then predicts the verso face)")
     p.add_argument("--lut-to", nargs="*", default=(), metavar="REF", help="also average with the input histogram-matched to REF volumes")
     p.add_argument("--cascade", default="auto", choices=["auto", "on", "off"], help="top-down cascade inference: "
@@ -158,7 +178,9 @@ def main(argv=None):
     s.add_argument("--png", default=None)
     s.add_argument("--window", type=int, default=128)
     s.add_argument("--tta", type=int, default=0)
-    s.add_argument("--head", default="0", help="head index of a multi-teacher student, or mean / prod / max")
+    s.add_argument("--head", default="0", help="which output channel to score: an index, a channel NAME "
+                   "(recto / verso), or mean / prod / max. NOTE: there is no published verso surface, so "
+                   "`--head verso` measures the verso band at the RECTO points (see usrm2/evalsurf.py)")
     s.add_argument("--lut-to", nargs="*", default=(), metavar="REF")
     s.add_argument("--halo", type=int, default=16)
     s.add_argument("--cascade", default="auto", choices=["auto", "on", "off"], help="see `predict --cascade`")
@@ -267,7 +289,9 @@ def main(argv=None):
                 **({"rungs": parse_rungs(a.rungs), "rung_boost": parse_boost(a.rung_boost),
                     "val_rungs": [int(q) for q in a.val_rungs.split(",")], "require_targets": a.require_targets,
                     "region": a.region, "windows_per_region": a.windows_per_region,
-                    "teacher_regions": a.teacher_regions} if a.rungs else {}),
+                    "teacher_regions": a.teacher_regions, "verso": a.verso,
+                    "verso_regions": a.verso_regions, "verso_regions_url": a.verso_regions_url,
+                    "cout": a.cout} if a.rungs else {}),
                 **{k: v for k, v in dict(stores=a.stores, stores_file=a.stores_file, val=a.val).items() if v})
     elif a.cmd == "umbilicus":
         from usrm2 import umbilicus as U
@@ -288,7 +312,8 @@ def main(argv=None):
                val_rungs=[int(q) for q in a.val_rungs.split(",")], val_patches=a.val_patches,
                region=a.region, windows_per_region=a.windows_per_region, walk=a.walk,
                active_regions=a.active_regions, epochs=a.epochs, region_fails=a.region_fails,
-               teacher_regions=a.teacher_regions, visits_max=a.visits_max, cascade=a.cascade)
+               teacher_regions=a.teacher_regions, visits_max=a.visits_max, cascade=a.cascade,
+               verso=a.verso, verso_regions=a.verso_regions, verso_url=a.verso_regions_url)
     elif a.cmd == "ablate":
         from usrm2 import ablate
         ablate.sweep(a.out_dir, a.presets.split(","), size=a.size, steps=a.steps, patch=a.patch,
@@ -316,7 +341,7 @@ def main(argv=None):
         luts = [teacher.lut_to(a.volume or data.CT, r) for r in a.lut_to]
         E.run(b[:3], b[3:], ckpt=a.ckpt, store=a.store, teacher=a.teacher, tifxyz=a.tifxyz or E.TIFXYZ,
               volume=a.volume, window=a.window, halo=a.halo, device=a.device, png_path=a.png, tta=a.tta, luts=luts,
-              head=a.head if a.head in P.HEADS else int(a.head),
+              head=a.head,  # resolved against the checkpoint's own channel list in predict.probs
               cascade=parse_cascade(a.cascade), cascade_depth=a.cascade_depth)
     elif a.cmd == "refine":
         from usrm2 import refine
@@ -373,7 +398,7 @@ def main(argv=None):
         from usrm2 import teacher
         vol = a.volume or data.CT
         P.predict(a.ckpt, vol, *a.origin, *a.size, a.out, window=a.window, halo=a.halo, volcomp=not a.plain, rung=a.rung,
-                  tta=a.tta, luts=[teacher.lut_to(vol, r) for r in a.lut_to], head=a.head if a.head in P.HEADS or a.head == "all" else int(a.head),
+                  tta=a.tta, luts=[teacher.lut_to(vol, r) for r in a.lut_to], head=a.head,
                   radial_sign=a.radial_sign, cascade=parse_cascade(a.cascade), cascade_depth=a.cascade_depth)
 
 

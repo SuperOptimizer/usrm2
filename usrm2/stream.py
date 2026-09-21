@@ -37,6 +37,7 @@ from usrm2 import data, umbilicus as U
 
 META, QUEUE, STATE, PROGRESS, CONSUMED = "meta.json", "queue.jsonl", "state.json", "progress", "consumed"
 REGIONS, WALK, EPOCH_DONE = "regions.jsonl", "walk.json", "epoch_done"
+VERSO_TTL = 1800.0  # seconds an UNPUBLISHED verso region store stays unpublished in the planner's memory
 
 
 # ------------------------------------------------------------------ which chunks a read touches
@@ -173,6 +174,46 @@ class Fetcher:
                         self.failed += 1
                         return "fail", 0
                     await asyncio.sleep(2 * (attempt + 1))
+
+
+    async def fetch_url(self, url, path, retries=2):
+        """GET an explicit URL into `path`. Unlike `get` this leaves NO `.absent` marker on a 404: it is
+        used for objects that do not exist YET (the verso region stores, published continuously while the
+        run trains), where "absent" has to be allowed to expire. Returns have / new / absent / fail."""
+        if os.path.exists(path):
+            self.have += 1
+            return "have"
+        lk = self.lock.setdefault(path, asyncio.Lock())
+        async with lk:
+            try:
+                if os.path.exists(path):
+                    self.have += 1
+                    return "have"
+                async with self.sem:            # the same keep-alive session and the same job budget as
+                    for attempt in range(max(int(retries), 1)):   # everything else: no burst of its own
+                        try:
+                            async with self.session.get(url) as r:
+                                if r.status == 404:
+                                    return "absent"
+                                r.raise_for_status()
+                                buf = await r.read()
+                            os.makedirs(os.path.dirname(path), exist_ok=True)
+                            with open(path + ".part", "wb") as fh:
+                                fh.write(buf)
+                            os.replace(path + ".part", path)
+                            self.bytes += len(buf)
+                            self.fetched += 1
+                            self.requests += 1
+                            return "new"
+                        except Exception as e:  # noqa: BLE001
+                            if attempt == max(int(retries), 1) - 1:
+                                print(f"stream-plan: FAILED {url}: {e!r}", flush=True)
+                                self.failed += 1
+                                return "fail"
+                            await asyncio.sleep(2 * (attempt + 1))
+            finally:
+                if not lk.locked():
+                    self.lock.pop(path, None)
 
 
 async def fetch_group_meta(f, base):
@@ -335,7 +376,8 @@ class Planner:
                  ahead=400, cache_gb=20.0, ctx=(), aug="geo", dense_pow=0.0, require_targets=False,
                  val=None, jobs=48, report=30.0, limit=0, val_rungs=data.VAL_RUNGS, val_patches=32,
                  region=0, windows_per_region=64, walk=None, active_regions=4, epochs=1, region_fails=0,
-                 teacher_regions=None, visits_max=64, cascade="off"):
+                 teacher_regions=None, visits_max=64, cascade="off", verso=False, verso_regions=None,
+                verso_url=None):
         from usrm2 import aug as A
         self.dir = str(queue)
         self.stores_file, self.seed, self.W, self.ahead = str(stores_file), int(seed), int(workers), int(ahead)
@@ -347,7 +389,18 @@ class Planner:
                        require_targets=bool(require_targets), seed=int(seed),
                        region=int(region or 0), windows_per_region=int(windows_per_region),
                        region_fails=int(region_fails or 0), teacher_regions=teacher_regions,
-                       cascade=str(cascade or "off"))
+                       cascade=str(cascade or "off"), verso=bool(verso),
+                       verso_regions=str(verso_regions) if verso_regions else teacher_regions)
+        # THE VERSO OUTPUT (docs/unified_design.md section 23). The verso target has no pyramid: it is
+        # published, region by region, as the pod finishes it. With `--verso-regions-url` the planner
+        # fetches a region's store the first time it plans that region -- two objects, `zarr.json` and the
+        # single shard `c/0/0/0` -- into `<verso_regions>/verso/`, where the training workers read it from
+        # like any local region store. A 404 is "not published yet" and is remembered for VERSO_TTL only.
+        self.verso, self.verso_url = bool(verso), (str(verso_url) if verso_url else None)
+        assert not (self.verso and self.verso_url) or self.kw["verso_regions"], \
+            "--verso-regions-url needs --teacher-regions (or --verso-regions): a directory to download into"
+        self.verso_probe = {}          # local store path -> (state, when); "no" expires, "yes" does not
+        self.verso_bytes = self.verso_have = 0
         self.cascade = str(cascade or "off")
         self.walk_mode = None if not walk else str(walk)
         assert self.walk_mode in (None, "once", "mix"), f"--walk {walk}: 'once' or 'mix'"
@@ -372,6 +425,7 @@ class Planner:
         self.pending = [[] for _ in range(self.W)]
         self.states = [None] * self.W
         self.lines, self.dirty, self.full = [], False, False
+        self.verso_lock = {}          # one probe/download per region, however many windows want it
 
     # ---- bookkeeping -------------------------------------------------------
 
@@ -452,10 +506,63 @@ class Planner:
 
     async def fetch_data(self, hook, s, k, lo):
         """The CT cube and the targets of a candidate window. False = reject (`--require-targets` and the
-        origin serves no target chunk at all for this window: nothing was exported there)."""
+        origin serves no target chunk at all for this window: nothing was exported there).
+
+        Under `--verso-regions-url` this is also where the window's VERSO region store is made local, before
+        the sampler asks `data.Patches._verso_store` whether there is one: one probe per region (cached), so
+        the cost per window is a dict lookup."""
+        await self.fetch_verso(s, k, lo)
         res = await asyncio.gather(self._need(hook, s["ct_pyr"], k, lo),
                                    *[self._need(hook, t["pyr"], k, lo) for t in s["targets"].values()])
         return bool(any(res[1:])) if self.require_targets and s["targets"] else True
+
+    async def fetch_verso(self, s, k, lo):
+        """Make the verso region store covering this window local, if it is published. One HEAD-equivalent
+        (a GET of `zarr.json`, a few hundred bytes) decides: 404 = the pod has not got there yet, remembered
+        for `VERSO_TTL` seconds so a long run picks the region up later; `done` false = still being written,
+        the same; otherwise the shard is pulled too and the store is complete on disk. Nothing here is
+        charged to the rolling chunk buffer -- a region store is read by every window of the region and is
+        not evicted (see the docs: `<DIR>/verso` grows with the walk)."""
+        if not (self.verso and self.verso_url) or int(k) not in (2, 3) or s is not self.ds.srcs[0]:
+            return
+        d = int(k) - 2
+        lo2 = np.asarray(lo, np.int64) << d
+        hi2 = ((np.asarray(lo, np.int64) + self.patch) << d) - 1
+        a, b = lo2 // data.REGION, hi2 // data.REGION
+        if not np.array_equal(a, b) or (lo2 < 0).any():
+            return                                      # the window straddles two regions: no store anyway
+        org = a * data.REGION
+        path = data.teacher_region_path(org, data.VERSO, self.kw["verso_regions"])
+        st, when = self.verso_probe.get(path, (None, 0.0))
+        if st == "yes" or (st == "no" and time.time() - when < VERSO_TTL):
+            return
+        lk = self.verso_lock.setdefault(path, asyncio.Lock())
+        async with lk:
+            st, when = self.verso_probe.get(path, (None, 0.0))
+            if st == "yes" or (st == "no" and time.time() - when < VERSO_TTL):
+                return
+            url = data.verso_region_url(org, self.verso_url)
+            b0 = self.f.bytes
+            got = await self.f.fetch_url(f"{url}/zarr.json", f"{path}/zarr.json")
+            ok = got in ("have", "new")
+            if ok:
+                try:
+                    j = json.load(open(f"{path}/zarr.json"))
+                    at = j.get("attributes", j) if isinstance(j, dict) else {}
+                    ok = bool(at.get("done"))
+                except Exception:  # noqa: BLE001  (half-written or not JSON)
+                    ok = False
+                if not ok:
+                    os.remove(f"{path}/zarr.json")      # not finished: do not leave a store a loader opens
+            if ok:
+                for q in data.REGION_FILES[1:]:
+                    ok = ok and await self.f.fetch_url(f"{url}/{q}", f"{path}/{q}") in ("have", "new")
+            self.verso_probe[path] = ("yes" if ok else "no", time.time())
+            if ok:
+                self.verso_bytes += self.f.bytes - b0
+                self.verso_have += 1
+                print(f"stream-plan: verso region {org.tolist()} -> {path} "
+                      f"({(self.f.bytes - b0) / 2 ** 20:.1f} MiB, {self.verso_have} so far)", flush=True)
 
     async def fetch_ctx(self, hook, s, k, lo):
         """The nine context cubes, fetched only once the window has been accepted -- plus, under
@@ -529,6 +636,7 @@ class Planner:
                 "region": self.kw["region"], "windows_per_region": self.kw["windows_per_region"],
                 "walk": self.walk_mode, "active_regions": self.K, "epochs": self.epochs,
                 "teacher_regions": self.kw["teacher_regions"],
+                "verso": self.verso, "verso_regions": self.kw["verso_regions"], "verso_url": self.verso_url,
                 "regions": len(self.walk.regions) if self.walk else 0,
                 "val": _val_meta(self.val),
                 "dirs": self.dirs, "whole": sorted(self.whole)}
@@ -856,7 +964,9 @@ class Planner:
         if self.walk:
             rec.update(regions=self.regions_done, regions_left=len(self.walk.regions) - self.walk.i,
                        regions_total=len(self.walk.regions), epoch=self.walk.epoch, active=self.K,
-                       region_MiB=round(self.f.bytes / max(self.regions_done, 1) / 2 ** 20, 1))
+                       region_MiB=round(self.f.bytes / max(self.regions_done, 1) / 2 ** 20, 1),
+                       **({"verso_stores": self.verso_have,
+                           "verso_MiB": round(self.verso_bytes / 2 ** 20, 1)} if self.verso else {}))
             if self.regions_done >= self.K and self.K * self.f.bytes / self.regions_done > 0.5 * self.cache_max:
                 print(f"stream-plan: WARNING --cache-gb {self.cache_max / 2 ** 30:.0f} is small for "
                       f"--active-regions {self.K} ({rec['region_MiB']} MiB fetched per region)", flush=True)

@@ -47,9 +47,25 @@ input is a z-scored CT patch, output is one recto-probability logit per voxel.
   top-down and recursive (`--cascade-depth`, default 3 rungs, 1/8 of the work per level). A 14-channel
   checkpoint warm-starts into it exactly (the cascade weights start at zero).
 
+- `--verso` adds the VERSO OUTPUT CHANNEL (`docs/unified_design.md` section 23): ONE head, `cout 2` --
+  channel 0 recto, channel 1 verso -- and the deep heads follow. The verso target has no pyramid; it comes
+  from region stores `<--verso-regions>/verso/region_<z>_<y>_<x>.zarr` (1024^3 uint8 probability, rung 2, its
+  2x pool at rung 3), and every voxel no finished store covers gets WEIGHT 0 in that channel, so a sample
+  without verso is still a valid recto sample and rungs >= 4 are verso-free for now. `stream-plan --verso
+  --verso-regions-url URL` fetches the stores from the published tree as the pod writes them. A `cout 1`
+  checkpoint warm-starts into it by copying the recto filter into the verso channel (the recto output is
+  unchanged to a float32 ulp), and composes with the cascade 14 -> 15 warm start in one restart.
+  `predict`/`evalsurf --head recto|verso` picks the channel; `--radial-sign -1` (the old flip trick) still
+  works for `cout 1` checkpoints. There is no published verso surface, so `evalsurf --head verso` only runs
+  and reads out the band offset -- it is not a score.
+
     usrm2 train RUN --rungs 2-11 --ctx 1 2 3 4 5 6 7 8 9 --patch 256 --stores-file stores.txt \
         --rung-boost 2=2 --val-rungs 2,3,4,6
     usrm2 train RUN --rungs 2-11 --ctx 1..9 --cascade mix --init-from OLD/ckpt.pt   # 14 -> 15 channels
+    usrm2 train RUN --rungs 2-11 --ctx 1..9 --cascade mix --verso --cout 2 \
+        --teacher-regions ~/teacher_regions --init-from OLD/ckpt.pt   # 14 -> 15 in, 1 -> 2 out
+    usrm2 stream-plan stores.txt --queue Q --verso --teacher-regions ~/teacher_regions \
+        --verso-regions-url https://dl.ash2txt.org/community-uploads/forrest/volcomp/PHercParis4/representations/predictions/teacher_regions/verso-2.4um
     usrm2 rung-mix stores.txt --patch 256      # the sampling mix and the local CT coverage per rung
     usrm2 predict RUN/ckpt.pt out.zarr --rung 4 --origin ... --size ...   # origin/size in rung-4 voxels
 

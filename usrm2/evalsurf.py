@@ -2,6 +2,14 @@
 
 The meshes lie ON the recto face (usrm/docs/labels.md), so the probability band should peak at
 offset 0 along the surface normal; everything here is measured at the published surface points.
+
+`--head verso` (the unified model's second output channel, docs/unified_design.md section 23) runs and
+prints the same numbers, but THEY DO NOT MEAN WHAT THEY MEAN FOR RECTO: there is no published verso
+surface to score against. The verso band sits on the other face of the sheet, so measured at the recto
+points it shows up as a large positive `offset_mean` (roughly the sheet thickness) and a low `recall@2`,
+and scoring it against the recto surfaces SHIFTED by a guessed thickness would only measure the guess.
+Until verso surfaces are published, treat a verso run of evalsurf as a smoke test plus a thickness
+readout (`offset_mean` / `offset_std` over the points where a band was found at all), not as a score.
 """
 import glob
 import json
@@ -169,6 +177,10 @@ def run(origin=VAL_BOX[0], size=VAL_BOX[1], ckpt=None, store=None, teacher=None,
     keep = ct[tuple(np.clip(np.rint(pts - o).astype(int), 0, np.array(s) - 1).T)] > 0  # points in masked CT can't be predicted
     pts, nrm = pts[keep], nrm[keep]
     print(json.dumps({"box": [*o, *s], "surfaces": counts, "masked_points_dropped": int((~keep).sum())}))
+    if str(head) == "verso" or (isinstance(head, int) and head == 1):
+        print(json.dumps({"note": "head verso is scored at the RECTO surface points: there is no published "
+                                  "verso surface. offset_mean is then the sheet thickness, not a bias; "
+                                  "recall/precision are not comparable with a recto run."}))
     if ckpt:
         prob, st = P.probs(ckpt, volume or data.CT, *o, *s, window=window, halo=halo, device=device, tta=tta, luts=luts, head=head,
                            cascade=cascade, cascade_depth=cascade_depth)

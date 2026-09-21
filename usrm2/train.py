@@ -49,7 +49,15 @@ def deep_losses(logits, tgt, ridge_w=0.0, wtgt=(), w=None):
 
 def losses_tw(logit, tgt, wv, ridge_w=0.0):
     """`losses` on an already-converted (target, weight) pair. The weight scales the BCE and masks the soft
-    dice (a voxel with weight 0 contributes to neither, so it carries no gradient)."""
+    dice (a voxel with weight 0 contributes to neither, so it carries no gradient).
+
+    The BCE is one weighted mean over the whole tensor, so a channel that is weight 0 throughout the batch
+    adds nothing to the numerator AND nothing to the denominator: it neither contributes nor rescales the
+    others, and an all-zero weight tensor (the blank-patch aug) gives 0, not a NaN. The soft dice is per
+    channel and is averaged over the channels that HAVE weight somewhere in the batch -- an ignored channel
+    would otherwise score a constant 0 and halve the loss of the channel that is being trained. That is what
+    lets the verso output (docs/unified_design.md section 23) sit in the same head as the recto one: on a
+    sample with no verso store the verso channel simply is not there."""
     if ridge_w > 0 or wv is not None:
         w = wv if ridge_w == 0 else (1 + ridge_w * (tgt >= 0.9).float())  # ridge_w 0: 1 * wv is wv
         if ridge_w > 0 and wv is not None:
@@ -60,8 +68,11 @@ def losses_tw(logit, tgt, wv, ridge_w=0.0):
     p, d = torch.sigmoid(logit), (0, 2, 3, 4)
     if wv is not None:
         p, tgt = p * wv, tgt * wv
-    dice = (1 - (2 * (p * tgt).sum(d) + 1) / (p.sum(d) + tgt.sum(d) + 1)).mean()  # per head
-    return bce, dice
+    per = 1 - (2 * (p * tgt).sum(d) + 1) / (p.sum(d) + tgt.sum(d) + 1)  # per head
+    if wv is None:
+        return bce, per.mean()
+    live = (wv.sum(d) > 0).to(per.dtype)          # the channels this batch says anything about
+    return bce, (per * live).sum() / live.sum().clamp_min(1.0)
 
 
 def losses(logit, tgt, ridge_w=0.0, wtgt=(), w=None):
@@ -95,16 +106,21 @@ def autocast(dev):
 
 
 @torch.no_grad()
-def evaluate(net, grid, dev, wtgt=(), norad=False, cascade=None):
+def evaluate(net, grid, dev, wtgt=(), norad=False, cascade=None, channels=None):
     """bce / dice / mae over the val patches. A grid entry is (x, tgt) -- the old convention, optionally with
     `wtgt` weight channels -- or a compact rung sample (data.rung_item), whose input is built on the device
     by `prep.prepare`; its weights then scale every metric and each rung is also scored on its own
-    (`dice_r2`, `dice_r3`, ...), `dice` being the mean over the rungs present. With verso heads (>= 4 heads:
-    recto..., verso...) also `overlap`, the mean excess relu(p_recto + p_verso - 1) per lineage pair,
-    measured only (no loss term)."""
+    (`dice_r2`, `dice_r3`, ...), `dice` being the mean over the rungs present. With an even number of output
+    channels (the unified model's recto/verso pair, or the older recto.../verso... heads) also `overlap`,
+    the mean excess relu(p_recto + p_verso - 1) per lineage pair, measured only (no loss term).
+
+    `channels`: the output channel names, which give the per-channel dice a name (`dice_recto`,
+    `dice_verso`); without them the channels are numbered. A channel is only scored on the patches whose
+    WEIGHT says anything about it, so the verso channel is silently absent until a verso store covers the
+    val box."""
     net.eval()
     m = torch.zeros(4)
-    per = {}
+    per, pch = {}, {}
     for item in grid:
         if isinstance(item, dict):
             ct, tg, ww = prep.prepare(prep.batch1(item), dev, norad=norad, cascade=cascade)
@@ -123,9 +139,14 @@ def evaluate(net, grid, dev, wtgt=(), norad=False, cascade=None):
         p = torch.sigmoid(logit)
         h, t = (p >= 0.5).float(), (tg >= 0.5).float()
         C = p.shape[1]
-        ov = (p[:, :C // 2] + p[:, C // 2:] - 1).clamp_min(0).mean().item() if C >= 4 and C % 2 == 0 else 0.0
+        ov = (p[:, :C // 2] + p[:, C // 2:] - 1).clamp_min(0).mean().item() if C >= 2 and C % 2 == 0 else 0.0
         n = ww.sum().clamp_min(1e-6)
         dice = (2 * (h * t * ww).sum() / ((h * ww).sum() + (t * ww).sum() + 1)).item()
+        for c in range(C if C > 1 else 0):  # per output channel, over the voxels it weighs
+            wc = ww[:, c]
+            if float(wc.sum()) > 0:
+                pch.setdefault(c, []).append(float(2 * (h[:, c] * t[:, c] * wc).sum() /
+                                                  ((h[:, c] * wc).sum() + (t[:, c] * wc).sum() + 1)))
         m += torch.tensor([((F.binary_cross_entropy_with_logits(logit, tg, reduction="none") * ww).sum() / n).item(),
                            dice, (((p - tg).abs() * ww).sum() / n).item(), ov])
         if rung is not None:
@@ -137,7 +158,9 @@ def evaluate(net, grid, dev, wtgt=(), norad=False, cascade=None):
         for k in sorted(per):
             out[f"dice_r{k}"] = float(np.mean(per[k]))
         out["dice"] = float(np.mean([out[f"dice_r{k}"] for k in sorted(per)]))  # every rung counts the same
-    if grid and grid_cout(grid[0]) >= 4:
+    for c in sorted(pch):
+        out[f"dice_{(list(channels)[c] if channels and c < len(channels) else f'c{c}')}"] = float(np.mean(pch[c]))
+    if grid and grid_cout(grid[0]) >= 2 and grid_cout(grid[0]) % 2 == 0:
         out["overlap"] = m[3].item()
     return out
 
@@ -152,8 +175,10 @@ def grid_cout(item):
 
 
 def val_png(path, net, grid, dev, norad=False, cascade=None):
-    """Middle z-slice of the first 4 val patches: CT (gray), each teacher target and each student head as a red
-    opacity overlay (no threshold), tiled patches x [CT, targets..., heads...]."""
+    """Middle z-slice of the first 4 val patches: CT (gray), each teacher target and each student OUTPUT
+    CHANNEL as a red opacity overlay (no threshold), tiled patches x [CT, targets..., channels...]. With
+    `--verso` (cout 2) that is CT, recto target, verso target, recto prediction, verso prediction; a verso
+    target the val box has no store for is simply black."""
     from PIL import Image
     rows = []
     with torch.no_grad():
@@ -217,7 +242,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
           ema_decay=0.999, lr_floor=0.0, ridge_w=0.0, dense_pow=0.0, norm="patch", ctx=(), init_from=None, wtgt=(),
           compile=False, ckpt_act=0, add_skip=0, deep=0, rungs=None, rung_boost=None, val_rungs=data.VAL_RUNGS,
           require_targets=False, stream=None, cascade="off", cascade_self_p=0.5, cascade_drop=0.1,
-          cascade_noise=True, **kw):
+          cascade_noise=True, verso=False, verso_regions=None, verso_regions_url=None, cout=None, **kw):
     """accum: gradient accumulation (micro-batches per optimizer step), for big models on small cards.
     lr_floor: the cosine decays to lr_floor * lr instead of 0. norm: "patch" (per-patch z-score) or "global"
     (fixed scan mean/std, stored in the checkpoint). dense_pow / ridge_w: see data.Patches / losses.
@@ -236,6 +261,16 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     over the same field of view, upsampled 2x. `cascade_self_p` is P in "mix", `cascade_drop` the per-sample
     probability the channel is zeroed (so a missing coarse prediction is in distribution), `cascade_noise`
     the roughening of the mask-derived channel. "off" (the default) leaves every existing run untouched.
+    verso: add the VERSO OUTPUT CHANNEL (docs/unified_design.md section 23). The final 1x1x1 head grows
+    from cout 1 to cout 2 -- channel 0 recto, channel 1 verso, ONE head, and the deep-supervision heads
+    follow -- and the loader gains a second target channel whose only source is the verso region stores
+    under `verso_regions` (default: `--teacher-regions`). Where no finished verso store covers a voxel its
+    weight is 0, so the sample trains recto alone; at rungs >= 4 the whole channel is weight 0 for now.
+    `verso_regions_url` is only for `stream-plan` (the planner fetches the stores as they are published);
+    it is recorded in the args so a resume can tell how the run was fed. `cout`, when given, is an
+    assertion: the number of output channels is derived from the target channels (+ verso), and `--cout 2`
+    just says out loud that you expect two.
+
     stream: a queue directory filled by `usrm2 stream-plan` (usrm2/stream.py). The loader then replays that
     queue out of a rolling local buffer instead of sampling, and every 20 steps `train.jsonl` carries
     `stream_wait_ms` (how long the workers waited for the planner, 0 once the buffer is ahead) and
@@ -264,23 +299,43 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     if cascade != "off":
         args.update(cascade=cascade, cascade_self_p=float(cascade_self_p), cascade_drop=float(cascade_drop),
                     cascade_noise=bool(cascade_noise))
+    verso = bool(verso)
+    assert not verso or rungs is not None, "--verso needs the rung ladder (--rungs)"
+    verso_regions = str(verso_regions) if verso_regions else (kw.get("teacher_regions") or None)
+    if verso:  # only recorded when on, so an existing run's args -- and its resume check -- are untouched
+        args.update(verso=True, verso_regions=str(verso_regions) if verso_regions else None,
+                    verso_regions_url=str(verso_regions_url) if verso_regions_url else None)
+        assert verso_regions, "--verso needs --teacher-regions (or --verso-regions): the verso targets are " \
+                              "region stores, there is no verso pyramid"
+        if verso_regions_url and not stream:  # only the planner downloads; train reads the directory
+            main and print(f"--verso-regions-url {verso_regions_url} is recorded but NOT fetched by train: "
+                           f"`usrm2 stream-plan --verso --verso-regions-url ...` downloads into "
+                           f"{verso_regions}; this run only reads what is there", flush=True)
     if norm == "global":
         args["norm_stats"] = data.global_norm(kw.get("ct", data.CT))
         main and print("global normalization", args["norm_stats"], flush=True)
-    dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    cout_arg, dev = cout, torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     if rungs is not None:
         lines = data.Patches(patch=patch, stores=kw.get("stores", data.TRAIN), stores_file=kw.get("stores_file"),
                              rungs=rungs).paths
         lines = [",".join(q) for q in lines]
         args["rungs"], args["rung_boost"], args["val_rungs"] = rungs if rungs is True else list(rungs), dict(rung_boost or {}), list(val_rungs)
         args["scale_plane"] = True
+        chans = list(dict.fromkeys(c for s in data.source_groups(lines) for c in s["targets"]))
+        if verso and data.VERSO not in chans:  # channel 1 of the same head, not a second branch
+            chans.append(data.VERSO)
+        args["channels"] = chans
         grid = data.val_grid_rungs(patch, lines, kw.get("val", data.VAL), rungs=val_rungs, limit=val_patches,
-                                   ctx=ctx, cascade=cascade)
-        args["channels"] = list(dict.fromkeys(c for s in data.source_groups(lines) for c in s["targets"]))
+                                   ctx=ctx, cascade=cascade, channels=chans, verso=verso,
+                                   verso_regions=verso_regions)
     else:
         grid = data.val_grid(patch=patch, ct=kw.get("ct", data.CT), store=kw.get("val", data.VAL), limit=val_patches, ctx=ctx)
     assert grid, f"validation store {kw.get('val', data.VAL)} is smaller than the patch ({patch})"
-    cin, cout = grid_cin_cout(grid[0])  # CT + context cubes (+ scale plane) + radial vector; one head per store
+    # CT + context cubes (+ scale plane) + radial vector; one output channel per target channel (+ verso)
+    cin, cout = grid_cin_cout(grid[0])
+    assert cout_arg is None or int(cout_arg) == cout, \
+        f"--cout {cout_arg} but the output channels are {args.get('channels')} (cout {cout}): " \
+        "--verso is what adds the verso output channel"
     args["cin"], args["cout"] = cin, cout
     net = M.build(size, cout=cout, cin=cin, ckpt_act=ckpt_act, add_skip=add_skip, deep=deep).to(dev)
     args["ckpt_act"], args["add_skip"], args["deep"] = ckpt_act, add_skip, deep
@@ -303,9 +358,13 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     ck = out / "ckpt.pt"
     if resume and ck.exists():
         st = torch.load(ck, map_location=dev)
+        # `verso` and `cout` are NOT here: they change the head, so they must match. `verso_regions` /
+        # `verso_regions_url` are, like `teacher_regions`: WHERE the verso stores come from may change
+        # between restarts (a different mirror, a planner that fetches them) without changing the model.
         grow = ("steps", "stores", "stores_file", "val", "val_rungs", "val_patches", "compile", "workers",
                 "require_targets", "rung_boost", "eval_every", "continued_from", "ckpt_act",
-                "stream", "teacher_regions", "region", "windows_per_region")
+                "stream", "teacher_regions", "region", "windows_per_region",
+                "verso_regions", "verso_regions_url")
         # a continued run may train longer, on more data, with other bookkeeping -- and from another queue
         diff = {k: (st["args"][k], args.get(k)) for k in st["args"] if k not in grow and k != "aug_cfg" and st["args"][k] != args.get(k)}
         assert not diff, f"resume with different arguments (saved, now): {diff}"
@@ -340,6 +399,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
                      # region mode / the region teacher stores reach the DATASET, not just the args record
                      **(dict(rungs=rungs, rung_boost=rung_boost, channels=args.get("channels"),
                              require_targets=require_targets, cascade=cascade,
+                             verso=verso, verso_regions=verso_regions,
                              **{q: kw[q] for q in ("region", "windows_per_region", "region_fails",
                                                    "teacher_regions") if kw.get(q)}) if rungs is not None else {}),
                      **(dict(stream=stream) if stream else {}))
@@ -418,7 +478,8 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
             t0 = time.time()
         if (step % eval_every == 0 or step == steps) and main:
             evnet.load_state_dict(ema)
-            log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev, wtgt, norad=no_radial, cascade=casval)})
+            log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev, wtgt, norad=no_radial, cascade=casval,
+                                            channels=args.get("channels"))})
             try:
                 val_png(out / f"val_{step:06d}.png", evnet, grid, dev, norad=no_radial, cascade=casval)
             except Exception as e:  # a missing PIL must not stop training
@@ -432,7 +493,8 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
                                    if os.path.exists(os.path.join(str(stream), "epoch_done")) else {})})
             if main:
                 evnet.load_state_dict(ema)
-                log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev, wtgt, norad=no_radial, cascade=casval)})
+                log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev, wtgt, norad=no_radial, cascade=casval,
+                                            channels=args.get("channels"))})
     save()
     if world > 1:
         dist.barrier()
