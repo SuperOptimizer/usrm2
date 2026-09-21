@@ -112,18 +112,28 @@ def zscore_t(c):
     return (x - x.mean()) / (x.std() + 1e-3)
 
 
+def shard_shape(shape, chunk=128, cap=1024):
+    """Shard shape for a store: one shard per `cap`^3 box, a multiple of the chunk and covering the array
+    (so a store smaller than `cap` on an axis is a single shard, i.e. ONE data file on disk)."""
+    return tuple(min(cap, -(-int(s) // chunk) * chunk) for s in shape)
+
+
 def out_array(path, shape, origin, volcomp=True, volume=None, umbilicus=None, rung=2):
     import zarr
     try:
         from volcomp_zarr import VolcompCodec
     except Exception:
         VolcompCodec = None
-    kw = dict(shape=shape, chunks=(128, 128, 128), dtype="uint8", fill_value=0, overwrite=True)
+    # ONE data file per ~1024^3 of store: a zarr v3 shard holds the 128^3 inner chunks. 512 chunk files per
+    # store cost ~590 sftp operations to publish to the mirror; a shard costs one put. Every store usrm2
+    # writes is sharded this way, and its writers fill a shard region in one write (see teacher.run).
+    sh = shard_shape(shape)
+    kw = dict(shape=shape, chunks=(128, 128, 128), shards=sh, dtype="uint8", fill_value=0, overwrite=True)
     if volcomp and VolcompCodec is not None:  # volcomp requires exactly 128^3 chunks, hence 3D
         assert all(s % 128 == 0 for s in shape), "volcomp output needs box sizes that are multiples of 128"
         z = zarr.create_array(path, serializer=VolcompCodec(q=8), **kw)
     else:
-        kw["shape"], kw["chunks"] = (1,) + tuple(shape), (1, 128, 128, 128)
+        kw["shape"], kw["chunks"], kw["shards"] = (1,) + tuple(shape), (1, 128, 128, 128), (1,) + sh
         z = zarr.create_array(path, **kw)
     z.attrs.update({"channels": ["recto"], "voxel_um": data.rung_um(rung), "rung": int(rung),
                     "origin_zyx": [int(v) for v in origin], "scale": 1.0,
@@ -145,39 +155,6 @@ def write(path, prob, origin, volcomp=True, volume=None, rung=2):
     a = out_array(path, prob.shape, origin, volcomp=volcomp, volume=volume, rung=rung)
     p = u8(prob)
     a[:] = p[None] if a.ndim == 4 else p
-
-
-def write_ome(path, prob_u8, origin, levels=3, full_shape=None, meta=None):
-    """Zarr v2 OME group, a positional drop-in for the vc3d tracer: level 0 has the FULL volume
-    shape but only the box's chunks are written (sparse, fill 0). Values are probability * 255,
-    no threshold. The origin is rounded down to the 256 chunk grid and the box zero-padded."""
-    import json
-
-    import zarr
-    from numcodecs import Blosc
-    o = np.asarray(origin, np.int64)
-    pad = o % 256
-    o, prob_u8 = o - pad, np.pad(prob_u8, [(int(p), 0) for p in pad]) if pad.any() else prob_u8
-    assert not (o % 256).any()
-    full = tuple(int(v) for v in (full_shape or data.open_zarr(data.CT).shape[-3:]))
-    g, a = zarr.open_group(path, mode="w", zarr_format=2), prob_u8
-    for l in range(levels):
-        z = g.create_array(str(l), shape=tuple(-(-s >> l) for s in full), chunks=(256, 256, 256),
-                           dtype="uint8", fill_value=0, compressors=Blosc(cname="zstd", clevel=1, shuffle=1),
-                           chunk_key_encoding={"name": "v2", "separator": "/"})
-        c = o >> l
-        z[c[0]:c[0] + a.shape[0], c[1]:c[1] + a.shape[1], c[2]:c[2] + a.shape[2]] = a
-        a = a[::2, ::2, ::2]  # nearest 2x downsample, box only
-    g.attrs.update({
-        "multiscales": [{"version": "0.4", "name": "recto",
-                         "axes": [{"name": n, "type": "space", "unit": "micrometer"} for n in "zyx"],
-                         "datasets": [{"path": str(l), "coordinateTransformations":
-                                       [{"type": "scale", "scale": [float(1 << l)] * 3}]} for l in range(levels)]}],
-        "channels": ["recto"], "voxel_um": 2.4, "origin_zyx": [int(v) for v in o], "scale": 1.0})
-    json.dump({**(meta or {}), "threshold": None, "origin_zyx": [int(v) for v in o],
-               "shape_zyx": [int(v) for v in prob_u8.shape], "levels": levels, "voxel_um": 2.4},
-              open(f"{path}/metadata.json", "w"), indent=1)
-    return path
 
 
 def flips_vec(fn, n=8):
@@ -246,11 +223,7 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
     return sum(slide(fn, roi, window, halo, dev, pr) for pr in preps) / len(preps), st
 
 
-def predict(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=None, volcomp=True, ome=False, tta=0, luts=(), head=0, radial_sign=1.0, rung=None):
-    prob, st = probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=window, halo=halo, device=device, tta=tta, luts=luts, head=head, radial_sign=radial_sign, rung=rung)
-    if ome:
-        write_ome(out, u8(prob), (z0, y0, x0), full_shape=data.open_zarr(volume).shape[-3:],
-                  meta={"checkpoint": str(ckpt), "step": int(st.get("step", 0)), "volume": volume})
-    else:
-        write(out, prob, (z0, y0, x0), volcomp=volcomp, volume=volume, rung=2 if rung is None else int(rung))
+def predict(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=None, volcomp=True, tta=0, luts=(), head=0, radial_sign=1.0, rung=None):
+    prob, _ = probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=window, halo=halo, device=device, tta=tta, luts=luts, head=head, radial_sign=radial_sign, rung=rung)
+    write(out, prob, (z0, y0, x0), volcomp=volcomp, volume=volume, rung=2 if rung is None else int(rung))
     return out

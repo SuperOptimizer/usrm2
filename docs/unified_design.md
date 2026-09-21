@@ -597,6 +597,33 @@ falls back to the exported mask pyramid: no store, not `done` yet, a window stra
 source, or any other rung. The queue entry records the store path (`t`), so the replaying worker reads what
 the planner decided rather than racing the service.
 
+### 18.1b One file per store: every array we write is zarr v3 sharded (2026-09-21)
+
+A 1024^3 region store used to be 512 chunk files (`c/z/y/x`, 128^3 each) plus their directories: 514 files.
+Publishing one to the dl.ash2txt.org sftp mirror cost ~590 sftp operations, and with thousands of regions
+that hammers the server -- it, not the bandwidth, was the bottleneck (the median store is only ~10 MB).
+
+So `predict.out_array` now creates a zarr v3 SHARDED array: one shard per 1024^3 box (`predict.shard_shape`
+= min(1024, shape rounded up to the 128 chunk), so a store smaller than 1024 on an axis is still a single
+shard), 128^3 inner chunks, the same `VolcompCodec(q=8)` serializer and the same default zstd compressor.
+A finished region is then 2 files, `zarr.json` + `c/0/0/0`, and publishing it is 7 sftp operations, with a
+whole batch of stores per sftp session. The rule is general: **every array usrm2 writes is zarr v3 sharded
+this way** -- the region/box teacher stores, the m7 and verso stores, `predict`'s output, and the offline
+pyramid levels of `cloud/make_levels.py` (whose resume check is now per shard file, and which builds one
+whole shard at a time). The old zarr v2 OME "tracer drop-in" export was deleted rather than exempted.
+
+Nothing else changes: the inner chunk encoding is byte-for-byte what it was, so readers are unaffected
+(`data.open_zarr` / `data.read_teacher` / `data.chunk_index` already went through zarr and its `shards`
+attribute) and `cloud/repack_regions.py` converts the stores already on disk LOSSLESSLY by moving the raw
+chunk bytes into a shard file plus its uint64 (offset, nbytes) index and crc32c checksum -- no decode, no
+re-encode. Measured on the desk: filling a 1024^3 store in 256^3 blocks takes 41.6 s sharded vs 41.3 s
+unsharded (the shard is small enough that even a full rewrite per block is free, and the teacher writes a
+region in ONE call anyway); 200 random 128^3 reads cost 1.93 s vs 1.76 s. Converting the 3185 finished
+desk stores took 16 s at `--jobs 8`; the decoded arrays are identical to the originals.
+
+The ~505 stores already published in the old layout stay as they are -- deleting them would be another
+260k sftp operations, and zarr reads either layout.
+
 ### 18.2 `--walk mix`: the coarse rungs must not be used up in the first percent (measured)
 
 A weighted shuffle front-loads the heavy items, and that is a problem for a rung with FEW regions and a

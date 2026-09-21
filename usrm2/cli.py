@@ -124,7 +124,6 @@ def main(argv=None):
     p.add_argument("--rung", type=int, default=None, help="predict at rung k of the volume's pyramid (0.6 * 2^k um); "
                    "--origin/--size are then rung-k voxels (default: the level the volume names, rung 2)")
     p.add_argument("--plain", action="store_true", help="plain zarr (1,Z,Y,X) instead of volcomp")
-    p.add_argument("--ome", action="store_true", help="zarr v2 OME group at full volume shape (tracer drop-in)")
     p.add_argument("--tta", type=int, default=0, help="average over this many axis flips (8 = all)")
     p.add_argument("--head", default="0", help="head index of a multi-teacher student, or mean / prod / max")
     p.add_argument("--radial-sign", type=float, default=1.0, help="-1 negates the radial vector (the student then predicts the verso face)")
@@ -352,7 +351,7 @@ def main(argv=None):
     else:
         from usrm2 import teacher
         vol = a.volume or data.CT
-        P.predict(a.ckpt, vol, *a.origin, *a.size, a.out, window=a.window, halo=a.halo, volcomp=not a.plain, ome=a.ome, rung=a.rung,
+        P.predict(a.ckpt, vol, *a.origin, *a.size, a.out, window=a.window, halo=a.halo, volcomp=not a.plain, rung=a.rung,
                   tta=a.tta, luts=[teacher.lut_to(vol, r) for r in a.lut_to], head=a.head if a.head in P.HEADS or a.head == "all" else int(a.head),
                   radial_sign=a.radial_sign)
 
