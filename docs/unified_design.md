@@ -671,3 +671,11 @@ Measured for the 8-scroll file (patch 256): `--walk mix` turns the 36329 regions
 16 Mvox over and over. The boosts were written for a sampler that resamples for ever; under a walk they are
 capped by what exists, and `mix` gives the coarse rungs as much of their share as the data can carry
 (~60x their region count at `--visits-max 64`) without repeating a window.
+
+## 19. Bootstrap run result (A100 `u1_30m6_p4`, finished 2026-09-21 ~04:00 CDT)
+
+30m6 at 256^3, batch 2, 60k steps, upstream masks only (Paris 4 recto 2x-mode + m7), geo augmentation, warm start
+r3 raw: val dice r2/r3/r4 = 0.740 / 0.740 / 0.682 (0.59/0.51/0.33 at step 500; 0.73/0.72/0.67 at 30k). Throughput
+32 Mvox/s until ~33k, then ~25 (loader-bound on the boxed mirror). Checkpoint backed up to the desk at
+/vesuvius/usrm2/runs/u1_30m6_p4_final.pt. Next: `u2_30m6_stream` = streaming region walk (--walk mix), full
+augmentation, teacher region stores preferred at rungs 2/3, warm start from this checkpoint, 200k steps.
