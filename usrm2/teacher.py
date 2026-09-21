@@ -48,7 +48,9 @@ def run(out, z0, y0, x0, Z, Y, X, volume=data.CT, window=256, halo=32, tile=2048
     """tta: number of flips to average (0/1 = none, 8 = all). luts: extra intensity LUTs (uint8->float) whose
     predictions are averaged with the plain one (intensity TTA, e.g. lut_to(volume, other_scroll))."""
     """Tiles over y/x so RAM stays bounded. Each tile is read with a `margin` (>= half a window: the teacher
-    is poor within ~32 voxels of a window edge, and the crop boundary must be covered by an interior window)."""
+    is poor within ~32 voxels of a window edge, and the crop boundary must be covered by an interior window).
+    The margin is clipped to the box, so it only ever buys context from inside it: one tile covering the whole
+    box (tile >= Y, X) computes the same windows as a tiling with margin >= window/2, without the overlap."""
     dev = torch.device(device or "cuda")
     import os
     torch.backends.cudnn.benchmark = os.environ.get("USRM2_CUDNN_BENCH", "1") == "1"  # one window shape all run long; off = no workspace spikes

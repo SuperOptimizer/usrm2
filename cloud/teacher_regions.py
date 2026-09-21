@@ -3,7 +3,12 @@
 in a seed-0 shuffled order, writing one probability store per region for the streaming trainer to use as a soft
 target (the planner prefers a region's teacher store over the mask when it exists). A region = one shard of the
 exported mask level; its origin is the shard index * 1024. Resumable: a region with a `done` store is skipped.
-    CUDA_VISIBLE_DEVICES=1 python cloud/teacher_regions.py [--shard I K] [--out DIR] [--tile 512] [--limit N]
+    CUDA_VISIBLE_DEVICES=1 python cloud/teacher_regions.py [--shard I K] [--out DIR] [--limit N]
+
+One region = one teacher.run call over the whole 1024^3 box (--tile 1024): the tile margin is clipped to the box,
+so a single tile computes exactly the same windows as the 2x2 tiling did, with none of the overlap - 1.4x fewer
+windows. --backend trt (usrm2/trt.py, fp16 engine for this GPU) is another 2x on the desk; on virtualized cloud
+GPUs the untimed engine is slower, so pass --backend torch there.
 """
 import argparse, os, sys, time
 import numpy as np
@@ -38,7 +43,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="/vesuvius/usrm2/teacher_regions/recto")
     ap.add_argument("--shard", nargs=2, type=int, default=(0, 1))
-    ap.add_argument("--tile", type=int, default=512)
+    ap.add_argument("--tile", type=int, default=1024)
+    ap.add_argument("--margin", type=int, default=128)
+    ap.add_argument("--window", type=int, default=256)
+    ap.add_argument("--halo", type=int, default=32)
+    ap.add_argument("--backend", default="trt")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
@@ -56,7 +65,8 @@ def main():
         Z, Y, X = (int(min(R, s - o)) for s, o in zip(ct.shape[-3:], (z, y, x)))
         t0 = time.time()
         try:
-            teacher.run(out, z, y, x, Z, Y, X, window=256, halo=32, tile=a.tile, margin=128, gpu_acc=True)
+            teacher.run(out, z, y, x, Z, Y, X, window=a.window, halo=a.halo, tile=a.tile, margin=a.margin,
+                        gpu_acc=True, backend=a.backend)
             import zarr
             arr = zarr.open(out, mode="r+"); arr.attrs["done"] = True; arr.attrs["region"] = R
         except Exception as e:
