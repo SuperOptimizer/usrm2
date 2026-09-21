@@ -714,3 +714,36 @@ continuity 0.656, merge_frac 0.44, offset<=3 0.36 -- far above the desk 5m (0.75
 (0.729/0.584/0.42). Streaming run `u2_30m6_stream` at ~7.5k steps (full aug, teacher soft targets at rungs 2/3):
 0.748 / 0.623 / 0.48 / 0.29 -- below u1 early on; to be re-measured at 20k and 40k (if it stays below, the
 teacher soft targets or the full aug are the suspects: the published mask th0.45 is crisper than the teacher's band).
+
+## 21. Next input channels (direction set 2026-09-21)
+
+Candidate channels are worth adding only when they carry information the network cannot compute from its own
+receptive field; local filters (sharpen, Laplacian, Sobel, sheetness, structure-tensor normals) fail that test
+since the first 3x3x3 layers learn them. The user picked these to pursue, in order:
+
+1. **Cascade**: the model's own prediction at rung k+1, upsampled, as an input channel at rung k (coarse-to-fine;
+   also an iterative-refinement mode when fed its own output). Cross-rung consistency for free, one cheap coarse
+   pass per region at inference.
+2. **Normalised radius from the umbilicus**: the radial vector gives direction, not how far out the voxel sits
+   (core vs mid-wraps vs the outer wrap by the case, which sets sheet spacing, curvature and damage).
+3. **Scan-level conditioning planes** from the upstream `metadata.json` next to every open-data volume
+   (`<bucket>/<scroll>/volumes/<vol>.zarr/metadata.json`; example kept at
+   `docs/example_metadata_paris4_2.4um_78keV.json` without the motor/attenuator dumps). Fields that vary between
+   scans and plausibly change what papyrus looks like:
+   - `scan.tomo.acquisition.energy` (keV; 74 / 78 / 137 across Paris 4 alone), `detector.samplePixelSize`
+     (the true voxel pitch; the scale plane already carries the rung), `detector.scintillator`,
+     `sampleDetectorDistance` (phase contrast strength: 220 mm vs 11 m), `expo_time`, `tomo_N`,
+     `half_acquisition`;
+   - `scan.tomo.processing.preprocessing.phase.delta_beta` and `unsharp_coeff/sigma` (Paganin filtering, i.e.
+     how blurred/edge-enhanced the sheets are; 1000/4.0/1.2 on the 2.4 um 78 keV scan, 500/4.0/2.5 on the
+     1.1 um mosaic);
+   - `scan.tomo.processing.32bitsData.histogram.*` percentiles and `zarr_export.window_u16_min/max` and
+     `target_window_f32_*` (the linear map from reconstructed attenuation to the stored uint8, so the absolute
+     intensity that the per-window z-score throws away can be restored as a plane);
+   - `mosaic.*` (the 1.1 um Paris 4 volume is a 19-tile fused mosaic; per-tile acquisition blocks).
+   Encoded as constant planes (log-scaled where the range is wide), zero-filled for the warm start like the scale
+   plane was. Our own scan-level papyrus mean/std (data.global_norm) belong in the same set.
+4. Distance to the scroll's outer boundary / case: undecided.
+5. Existing segmentation meshes as a sparse known-surface channel: later (refinement / interactive mode only).
+
+Angular position about the axis and absolute z stay out: they break the symmetry augmentations and carry little.
