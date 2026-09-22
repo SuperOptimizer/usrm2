@@ -715,6 +715,10 @@ continuity 0.656, merge_frac 0.44, offset<=3 0.36 -- far above the desk 5m (0.75
 0.748 / 0.623 / 0.48 / 0.29 -- below u1 early on; to be re-measured at 20k and 40k (if it stays below, the
 teacher soft targets or the full aug are the suspects: the published mask th0.45 is crisper than the teacher's band).
 
+All four of u1's numbers here were re-measured on 2026-09-21 by the Evaluation v2 suite and reproduce
+exactly; section 25.6 adds the noise ceiling, the bootstrap CIs and ERL beside them, and those are the
+numbers later experiments should be compared against.
+
 ## 21. Next input channels (direction set 2026-09-21)
 
 Candidate channels are worth adding only when they carry information the network cannot compute from its own
@@ -1200,7 +1204,59 @@ saturation call from fewer than ~10-15 checkpoints, and never from an unsmoothed
 Conversely, a metric at its 25.1 ceiling is done regardless of what the fit says: more steps cannot beat
 the label.
 
-### 25.6 How a Phase-A0 number is quoted
+### 25.6 The measured Phase-A0 baseline (val box, 2026-09-21)
+
+Box `34432 15104 18432 + 256 1024 1024`, 11 published surfaces, 23724 mesh points, **2.14 m of meshed
+surface length** (`path_um`), 2.4 um voxels, thr 0.5, `--window 128 --halo 16`, 200 seeded bootstrap
+draws over the 11 surfaces. Ceiling = the published recto mask pyramid (`…-recto-2um-ps256-L0-th0.45`,
+level 2.4). Model = `/vesuvius/usrm2/runs/u1_30m6_p4_final.pt` @ 60000, head 0. Full dumps at
+`/vesuvius/usrm2/eval/a0_ceiling_published_valbox.json` and `a0_u1_30m6_p4_final_valbox.json`.
+
+| metric | u1 @60k | ceiling | 95% CI (u1) |
+|---|---|---|---|
+| `recall@2` | 0.738 | 0.829 | [0.626, 0.787] |
+| `recall@4` | **0.806** | 0.878 | [0.709, 0.848] |
+| `recall@8` | 0.883 | 0.920 | [0.814, 0.918] |
+| `offset_le3` | **0.363** | 0.326 | [0.291, 0.387] |
+| `offset_mean` | -1.23 | -3.15 | [-2.08, -0.25] |
+| `offset_std` | 7.12 | 6.43 | [6.55, 8.27] |
+| `offset_hd95` | 16.0 | 15.0 | [14.8, 16.0] |
+| `precision6` | 0.183 | 0.221 | (box-level, no CI) |
+| `merge_frac` | **0.440** | 0.397 | [0.408, 0.501] |
+| `merge_runs` | 1.503 | 1.456 | [1.464, 1.559] |
+| `continuity` | **0.656** | 0.729 | [0.589, 0.680] |
+| `hit_frac` | 0.806 | 0.878 | [0.709, 0.848] |
+| `mean_run` | 13.6 | 20.9 | [9.6, 16.0] |
+| `erl_um` | **237** | 406 | [137, 282] |
+| `erl_break_um` | 718 | 1010 | [463, 836] |
+| `erl_merge_um` | 303 | 502 | [204, 349] |
+| `lost_break_frac` | 0.189 | 0.120 | [0.147, 0.288] |
+| `lost_merge_frac` | 0.350 | 0.353 | [0.315, 0.369] |
+| `betti0_err` | 236 (b0 257) | 92 (b0 113) | ref b0 21 |
+| `betti1_err` | 1905 (b1 1424) | 2332 (b1 997) | ref b1 3329 (see 25.3) |
+
+The four numbers section 20 quotes reproduce exactly (`recall@4 0.806, continuity 0.656, merge_frac
+0.44, offset<=3 0.36`), which is the check that nothing old moved.
+
+What is new information:
+
+1. **The ceiling is not 1.0 anywhere, and on one metric u1 is already past it.** `offset_le3` 0.363 vs
+   0.326 and `offset_mean` -1.23 vs -3.15: the published mask's band sits ~3 voxels off the mesh on the
+   inside, and u1 localises the face BETTER than the labels it was trained on. Sub-voxel localisation is
+   therefore not a place to spend effort against this label source -- only a distance head (O3b) measured
+   against the meshes can move it further.
+2. **Merges are the dominant loss of traceable length, for the teacher as much as for the model.**
+   `lost_merge_frac` 0.350 (u1) vs 0.353 (ceiling), essentially identical, against `lost_break_frac`
+   0.189 vs 0.120. A third of the meshed surface is unusable because a second sheet's band lies on the
+   same normal ray, and **the labels have that failure too** -- which is exactly why L3/O12-style
+   label-free terms, not more teacher data, are the Phase-A ask.
+3. **ERL puts a number on it: 237 um of traceable surface per break or merge, against a 406 um ceiling
+   and 2.14 m of surface.** The CI is wide ([137, 282]) because 11 surfaces is few; an experiment must
+   move ERL outside that band to count.
+4. **Every headline metric's CI is 4-10 points wide.** A 2-point change between checkpoints on this box
+   is not evidence, which is the claim Phase A0 existed to settle.
+
+### 25.7 How a Phase-A0 number is quoted
 
 > `recall@4 0.806 (ceiling 0.9xx) [0.7xx, 0.8xx]`
 
