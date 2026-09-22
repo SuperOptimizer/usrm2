@@ -113,19 +113,22 @@ def metrics(p_u8, origin, pts, nrm, thr=0.5, far=40, win=16, precision=True):
     return m
 
 
-def continuity(p_u8, origin, size, tifxyz=TIFXYZ, ax=None, thr=0.5, r=4, min_pts=200):
+def continuity(p_u8, origin, size, tifxyz=TIFXYZ, ax=None, thr=0.5, r=4, min_pts=200, surfaces=None):
     """Along-sheet continuity of the band: for every published surface crossing the box, a grid cell is HIT when
     the probability along its normal reaches thr within +-r voxels; continuity = fraction of hit cells whose 8
     grid neighbours are all hit (a broken or fragmented band scores low even at high recall). Also the mean run
-    length of hits along grid rows. Point-weighted over the surfaces."""
+    length of hits along grid rows. Point-weighted over the surfaces.
+
+    `surfaces`: an already-read `surface_list()`, to skip re-reading every tifxyz grid off disk. It is the
+    same set this function would select itself, so the numbers are unchanged."""
     from usrm2 import refine as R
     o, s = np.asarray(origin, np.float32), np.asarray(size, np.float32)
     V, ax = np.asarray(p_u8, np.float32) / 255.0, ax if ax is not None else data.axis()
     tot, cont, runs, n_hit = 0, 0.0, [], 0
-    for d in R.surfaces_in(tifxyz, o, s, min_pts):
-        g = read_surface(d)
-        n = R.normals(g, ax)
-        k = np.isfinite(g).all(-1) & ((g >= o) & (g < o + s)).all(-1) & np.isfinite(n).all(-1)
+    for g, n, k in ([(g, n, k) for _, g, k, n in surfaces] if surfaces is not None else
+                    ((lambda gg: (gg, R.normals(gg, ax), None))(read_surface(d)) for d in R.surfaces_in(tifxyz, o, s, min_pts))):
+        if k is None:
+            k = np.isfinite(g).all(-1) & ((g >= o) & (g < o + s)).all(-1) & np.isfinite(n).all(-1)
         if k.sum() < min_pts:
             continue
         S = R.profile(V, g[k] - o, n[k], r)
@@ -458,7 +461,7 @@ def evaluate_all(p_u8, origin, size, pts, nrm, surfaces, tifxyz=TIFXYZ, ax=None,
     """The whole v2 suite on one probability box: the pooled legacy numbers (unchanged), ERL, Betti-0/1,
     per-surface rows and bootstrap CIs."""
     m = metrics(p_u8, origin, pts, nrm, thr=thr, far=far)
-    c = continuity(p_u8, origin, size, tifxyz, ax=ax, thr=thr, r=r)
+    c = continuity(p_u8, origin, size, tifxyz, ax=ax, thr=thr, r=r, surfaces=surfaces)
     rows = surface_rows(p_u8, origin, size, tifxyz, ax=ax, ct=ct, thr=thr, r=r, far=far, um=um, surfaces=surfaces)
     pooled = pool(rows)
     out = {**m, **c, **{k: v for k, v in pooled.items() if k not in m and k not in c}}

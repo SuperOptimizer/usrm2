@@ -99,7 +99,7 @@ def betti_error(pred, ref, margin=8, band=6, chunk=CHUNK):
     # implementation; the efficient one is C++/CUDA and is not a dependency we carry today.
 
 
-def rasterize(grids, shape, origin, step=0.4):
+def rasterize(grids, shape, origin, step=0.7):
     """Bool volume of the published surfaces: every mesh quad whose four corners are finite is sampled on a
     regular (u x u) lattice dense enough that consecutive samples are `step` voxels apart, and the samples
     are rounded into the box. The tifxyz grid is many voxels coarse, so the quads MUST be filled in or the
@@ -112,15 +112,22 @@ def rasterize(grids, shape, origin, step=0.4):
         if not q.any():
             continue
         C = np.stack([g[:-1, :-1][q], g[1:, :-1][q], g[:-1, 1:][q], g[1:, 1:][q]]).astype(np.float32)  # (4,M,3)
-        d = max(float(np.abs(C[1] - C[0]).max()), float(np.abs(C[2] - C[0]).max()), 1e-3)
-        u = int(min(max(2, np.ceil(d / step) + 1), 256))
-        t = np.linspace(0, 1, u, dtype=np.float32)
-        wa, wb = t[:, None, None, None], t[None, :, None, None]  # (u,1,1,1) x (1,u,1,1)
         sh = np.asarray(shape)
-        for j in range(0, C.shape[1], max(1, 2_000_000 // (u * u))):  # keep the sample block bounded
-            c = C[:, j:j + max(1, 2_000_000 // (u * u))]
-            p = ((1 - wa) * (1 - wb) * c[0] + wa * (1 - wb) * c[1] + (1 - wa) * wb * c[2] + wa * wb * c[3])
-            i = np.rint(p.reshape(-1, 3) - o).astype(np.int64)
-            i = i[((i >= 0) & (i < sh)).all(1)]
-            out[i[:, 0], i[:, 1], i[:, 2]] = True
+        # The sampling density is PER QUAD, bucketed to powers of two: one hole in the grid can leave a
+        # single quad hundreds of voxels wide, and a global density taken from it would cost 10^4 times
+        # more samples on every ordinary 20-voxel quad.
+        d = np.maximum(np.abs(C[1] - C[0]).max(-1), np.abs(C[2] - C[0]).max(-1))
+        ub = np.clip(1 << np.ceil(np.log2(np.maximum(np.ceil(d / step) + 1, 2))).astype(int), 2, 512)
+        for u in np.unique(ub):
+            Cu = C[:, ub == u]
+            u = int(u)
+            t = np.linspace(0, 1, u, dtype=np.float32)
+            wa, wb = t[:, None, None, None], t[None, :, None, None]  # (u,1,1,1) x (1,u,1,1)
+            blk = max(1, 4_000_000 // (u * u))
+            for j in range(0, Cu.shape[1], blk):  # keep the sample block bounded
+                c = Cu[:, j:j + blk]
+                p = ((1 - wa) * (1 - wb) * c[0] + wa * (1 - wb) * c[1] + (1 - wa) * wb * c[2] + wa * wb * c[3])
+                i = np.rint(p.reshape(-1, 3) - o).astype(np.int64)
+                i = i[((i >= 0) & (i < sh)).all(1)]
+                out[i[:, 0], i[:, 1], i[:, 2]] = True
     return out
