@@ -36,6 +36,7 @@ import numpy as np
 from usrm2 import data, umbilicus as U
 
 META, QUEUE, STATE, PROGRESS, CONSUMED = "meta.json", "queue.jsonl", "state.json", "progress", "consumed"
+CONSUMED_STALE = 3600.0   # seconds a tagged trainer may go quiet before its eviction bound is ignored
 REGIONS, WALK, EPOCH_DONE = "regions.jsonl", "walk.json", "epoch_done"
 VERSO_TTL = 1800.0  # seconds an UNPUBLISHED verso region store stays unpublished in the planner's memory
 
@@ -377,7 +378,7 @@ class Planner:
                  val=None, jobs=48, report=30.0, limit=0, val_rungs=data.VAL_RUNGS, val_patches=32,
                  region=0, windows_per_region=64, walk=None, active_regions=4, epochs=1, region_fails=0,
                  teacher_regions=None, visits_max=64, cascade="off", verso=False, verso_regions=None,
-                verso_url=None, planes=(), scan_meta=None):
+                verso_url=None, planes=(), scan_meta=None, label_free=False):
         from usrm2 import aug as A
         self.dir = str(queue)
         self.stores_file, self.seed, self.W, self.ahead = str(stores_file), int(seed), int(workers), int(ahead)
@@ -391,7 +392,14 @@ class Planner:
                        region_fails=int(region_fails or 0), teacher_regions=teacher_regions,
                        cascade=str(cascade or "off"), verso=bool(verso),
                        verso_regions=str(verso_regions) if verso_regions else teacher_regions,
-                       planes=data.parse_planes(planes), scan_meta=scan_meta)
+                       planes=data.parse_planes(planes), scan_meta=scan_meta,
+                       label_free=bool(label_free))
+        # LABEL-FREE planning (section 30): windows are drawn anywhere the CT is not air, so the walk's
+        # regions and the occupancy check come off the CT pyramid instead of the first target group, and
+        # `--require-targets` is meaningless (nothing is required). A source line may be a bare CT base.
+        self.label_free = bool(label_free)
+        assert not (self.label_free and require_targets), \
+            "--label-free and --require-targets contradict each other: there is no target to require"
         # The METADATA / RADIUS planes (section 29) change the STEM, so a queue planned with one plane
         # set may only be replayed by a run that builds the same one; meta.json records it and
         # `data.Patches._open_stream` asserts it, exactly as it does for --ctx and --cascade.
@@ -594,6 +602,7 @@ class Planner:
         """What the region list was built for: a different one means a different list."""
         return json.dumps({"stores": lines, "patch": [int(v) for v in self.patch],
                            "region": self.kw["region"], "seed": self.seed, "epochs": self.epochs,
+                           "label_free": self.label_free,
                            "rungs": self.kw["rungs"] if self.kw["rungs"] is True else sorted(self.kw["rungs"]),
                            "boost": {str(k): v for k, v in self.kw["rung_boost"].items()},
                            "walk": self.walk_mode, "visits_max": self.visits_max,
@@ -615,7 +624,7 @@ class Planner:
             return
         t0 = time.time()
         for s in self.ds.srcs:  # the occupancy check reads one coarse level of each target: pull it first
-            for t in s["targets"].values():
+            for t in list(s["targets"].values()) + [s["bounds"]]:
                 arr = t["pyr"][data.occupancy_rung(t["pyr"])]
                 await self._fetch(arr, all_keys(arr), record=None)
         regions = data.region_list(self.ds.srcs, patch=self.patch, region=self.kw["region"],
@@ -637,6 +646,7 @@ class Planner:
                 "rungs": self.kw["rungs"] if self.kw["rungs"] is True else sorted(self.kw["rungs"]),
                 "rung_boost": {str(k): v for k, v in self.kw["rung_boost"].items()},
                 "aug": self.cfg, "dense_pow": self.kw["dense_pow"], "cascade": self.cascade,
+                "label_free": self.label_free,
                 "planes": list(self.planes),
                 "require_targets": self.require_targets, "channels": self.ds.channels,
                 "region": self.kw["region"], "windows_per_region": self.kw["windows_per_region"],
@@ -653,12 +663,31 @@ class Planner:
         os.replace(tmp, os.path.join(self.dir, META))
 
     def consumed(self):
-        """The queue index the trainer has certainly consumed (its own report, minus the loader's prefetch)."""
+        """The queue index every trainer on this queue has certainly consumed (its own report, minus the
+        loader's prefetch) -- the MINIMUM over them, because that is what the eviction bound has to be.
+
+        One trainer writes `<queue>/consumed`, exactly as before. A SHARED queue (the size ladder, section
+        30: several rungs replaying one plan so they see the same windows in the same order) gives each
+        trainer a tag and each tag its own `consumed.<tag>`, and the planner may only evict a chunk the
+        SLOWEST of them has passed. A tag file nobody has touched for `CONSUMED_STALE` seconds is ignored,
+        so a finished or dead rung cannot pin the buffer forever."""
+        lo = None
         try:
-            j = json.load(open(os.path.join(self.dir, CONSUMED)))
-            return int(j["i"]) - int(j.get("margin", 0))
-        except Exception:  # noqa: BLE001
+            names = [q for q in os.listdir(self.dir)
+                     if (q == CONSUMED or q.startswith(CONSUMED + ".")) and not q.endswith(".tmp")]
+        except OSError:
             return -1
+        for nm in names:
+            f = os.path.join(self.dir, nm)
+            try:
+                if nm != CONSUMED and time.time() - os.path.getmtime(f) > CONSUMED_STALE:
+                    continue
+                j = json.load(open(f))
+                v = int(j["i"]) - int(j.get("margin", 0))
+            except Exception:  # noqa: BLE001
+                continue
+            lo = v if lo is None else min(lo, v)
+        return -1 if lo is None else lo
 
     def emit(self, desc, keys):
         if self.dirty:  # a level the consumer's meta.json does not know yet: republish the directory table

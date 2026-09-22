@@ -400,7 +400,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
           loss_eikonal=0.0, loss_normals=0.0, sdist_delta=2.0, sdist_band=8.0,
           pair="off", pair_band=1.5, pair_tau=0.5,
           loss_ect=0.0, ect_dirs=8, ect_res=16, ect_margin=8, ect_block=32, ect_n=4, ect_rung=2,
-          planes=(), **kw):
+          planes=(), stream_tag=None, **kw):
     """accum: gradient accumulation (micro-batches per optimizer step), for big models on small cards.
     lr_floor: the cosine decays to lr_floor * lr instead of 0. norm: "patch" (per-patch z-score) or "global"
     (fixed scan mean/std, stored in the checkpoint). dense_pow / ridge_w: see data.Patches / losses.
@@ -493,6 +493,11 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
                 no_radial=no_radial, accum=accum, ema_decay=ema_decay, lr_floor=lr_floor, ridge_w=ridge_w, wtgt=list(wtgt),
                 dense_pow=dense_pow, norm=norm, ctx=list(ctx), world=world,
                 stream=str(stream) if stream else None,
+                # A SHARED stream queue (section 30): with a tag this run's replay cursor and eviction
+                # bound are `<queue>/progress.<tag>/` and `<queue>/consumed.<tag>`, so several runs (the
+                # size ladder's rungs) replay ONE plan -- the same windows in the same order -- without
+                # consuming each other's entries. Absent it, the paths are exactly what they always were.
+                **({"stream_tag": str(stream_tag)} if stream_tag else {}),
                 **({"scan_meta": str(scan_meta)} if scan_meta else {}), **kw)
     cascade = str(cascade or "off")
     assert cascade in data.CASCADE_MODES, f"--cascade {cascade}: one of {data.CASCADE_MODES}"
@@ -696,7 +701,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         # between restarts (a different mirror, a planner that fetches them) without changing the model.
         grow = ("steps", "stores", "stores_file", "val", "val_rungs", "val_patches", "compile", "workers",
                 "require_targets", "rung_boost", "eval_every", "continued_from", "ckpt_act",
-                "stream", "teacher_regions", "region", "windows_per_region",
+                "stream", "stream_tag", "teacher_regions", "region", "windows_per_region",
                 "verso_regions", "verso_regions_url",
                 # WSD's whole point is that the budget is NOT committed at run start: the plateau may be
                 # extended and the cooldown moved on a resume, because neither is part of the weights.
@@ -745,7 +750,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
                              fuse=fuse, source_w=source_w, planes=planes, scan_meta=scan_meta,
                              **{q: kw[q] for q in ("region", "windows_per_region", "region_fails",
                                                    "teacher_regions") if kw.get(q)}) if rungs is not None else {}),
-                     **(dict(stream=stream) if stream else {}))
+                     **(dict(stream=stream, stream_tag=stream_tag) if stream else {}))
     model = torch.nn.parallel.DistributedDataParallel(net, device_ids=[dev.index]) if world > 1 else net
     if compile:
         model = torch.compile(model)
@@ -888,10 +893,11 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
                                 **({"stream_wait_ms": round(wait_ms), "stream_idx": stream_idx} if stream else {})})
             rung_n, wait_ms = {}, 0.0
             if stream and main and stream_idx >= 0:  # the planner's eviction bound
-                tmp = os.path.join(str(stream), "consumed.tmp")
+                tmp = os.path.join(str(stream), f"consumed{'.' + stream_tag if stream_tag else ''}.tmp")
                 with open(tmp, "w") as f:
                     json.dump({"i": stream_idx, "margin": margin}, f)
-                os.replace(tmp, os.path.join(str(stream), "consumed"))
+                os.replace(tmp, os.path.join(str(stream),
+                                             f"consumed{'.' + stream_tag if stream_tag else ''}"))
             t0 = time.time()
         if (step % eval_every == 0 or step == steps) and main:
             evnet.load_state_dict(ema)

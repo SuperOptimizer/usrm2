@@ -174,7 +174,7 @@ def autocast(dev):
 
 # ------------------------------------------------------------------------------- rungs and sources
 
-def available_rungs(lines, want, quiet=False):
+def available_rungs(lines, want, quiet=False, label_free=False):
     """(usable lines, usable rungs): the requested rungs intersected with what the sources actually have.
 
     A source's usable rungs start at its NATIVE rung (`data.usable_rungs`), so rungs 0 and 1 (0.6 and 1.2 um)
@@ -184,7 +184,7 @@ def available_rungs(lines, want, quiet=False):
     allowed = None if want is True else {int(k) for k in want}
     keep, have = [], set()
     for line in lines:
-        s = data.source_groups([line])[0]
+        s = data.source_groups([line], label_free=label_free)[0]
         ks = data.usable_rungs(s, allowed)
         if ks:
             keep.append(line)
@@ -220,7 +220,7 @@ def pretrain(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, worke
              ema_decay=0.999, lr_floor=0.0, norm="patch", ctx=(), compile=False, ckpt_act=0, add_skip=0,
              deep=0, rungs=(0, 1, 2, 3, 4), mask_block=32, mask_lo=0.5, mask_hi=0.75, sheet_p=0.5,
              sheet_pct=0.7, mask_ctx=True, loss="l1", cascade_slot=True, rung_aux=0.0, rung_aux_p=0.5,
-             fg_min=0.0, air_keep=0.1, **kw):
+             fg_min=0.0, air_keep=0.1, label_free=False, stream=None, stream_tag=None, **kw):
     """Masked-cube pretraining of the trunk `train` uses. Writes `<out_dir>/ckpt.pt` with `args`, `ema` and
     `model`, loadable by `usrm2 train --init <out_dir>/ckpt.pt`.
 
@@ -255,14 +255,20 @@ def pretrain(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, worke
     lines = [",".join(q) if isinstance(q, (list, tuple)) else str(q) for q in lines]
     assert lines, "pretrain needs --stores or --stores-file (CT pyramids; the target group is only used to " \
                   "bound the sampling box, no labels are read)"
-    lines, ks = available_rungs(lines, True if rungs is True else set(rungs))
+    # LABEL-FREE sampling (section 30): the window is drawn anywhere the CT is not air rather than inside
+    # the first target group's box, and a line may be a bare `ct_base` with no target group at all. That
+    # is the sampling R10 actually wants -- the pretraining corpus is the mirrored CT, not the labelled
+    # part of it -- and it is what `--label-free` switches on. Off, everything is as it was.
+    lines, ks = available_rungs(lines, True if rungs is True else set(rungs), label_free=label_free)
 
     args = dict(size=size, steps=steps, patch=patch, batch=batch, lr=lr, aug=aug, aug_cfg=cfg,
                 no_radial=no_radial, accum=accum, ema_decay=ema_decay, lr_floor=lr_floor, norm=norm,
                 ctx=list(ctx), rungs=list(ks), scale_plane=True, pretrain=True,
                 mask_block=mask_block, mask_lo=mask_lo, mask_hi=mask_hi, sheet_p=sheet_p,
                 sheet_pct=sheet_pct, mask_ctx=bool(mask_ctx), loss=loss,
-                cascade_slot=bool(cascade_slot), rung_aux=float(rung_aux), **kw)
+                cascade_slot=bool(cascade_slot), rung_aux=float(rung_aux),
+                **({"label_free": True} if label_free else {}),
+                **({"stream": str(stream)} if stream else {}), **kw)
     if norm == "global":
         args["norm_stats"] = data.global_norm(lines[0].split(",")[0])
 
@@ -305,11 +311,14 @@ def pretrain(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, worke
         for _ in range(step):
             sched.step()
 
-    grid = data.val_grid_rungs(patch, lines, kw.get("val", data.VAL), rungs=ks, limit=val_patches, ctx=ctx)
+    grid = data.val_grid_rungs(patch, lines, kw.get("val", data.VAL), rungs=ks, limit=val_patches, ctx=ctx,
+                               label_free=bool(label_free))
     evnet = M.build(size, verbose=False, cout=1, cin=cin, add_skip=add_skip, deep=deep).to(dev)
     dl = data.loader(patch, batch, workers, stores=lines, exclude=kw.get("val", data.VAL),
                      seed=step + 7919, sym=cfg.get("sym", True), aug=cfg, ctx=ctx, rungs=set(ks),
-                     air_keep=air_keep, fg_min=fg_min, fg_keep=1.0, require_targets=False)
+                     air_keep=air_keep, fg_min=fg_min, fg_keep=1.0, require_targets=False,
+                     label_free=bool(label_free),
+                     **(dict(stream=stream, stream_tag=stream_tag) if stream else {}))
     model = torch.compile(net) if compile else net
     if compile:
         args["compile"] = True

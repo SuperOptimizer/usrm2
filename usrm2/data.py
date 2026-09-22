@@ -782,13 +782,22 @@ def target_box(t, k):
     return (o >> d, np.maximum(-(-s >> d), 1)) if d >= 0 else (o << -d, s << -d)
 
 
-def source_groups(lines):
+def source_groups(lines, label_free=False):
     """Parse and open `ct_base,target_group[,target_group...]` lines. Each source:
-    {ct, ct_pyr, targets: {channel: {pyr, weight, box, native}}, native, umbilicus, voxels}."""
+    {ct, ct_pyr, targets: {channel: {pyr, weight, box, native}}, bounds, native, umbilicus, voxels}.
+
+    `bounds` is the pseudo-target that fixes WHERE a source may be sampled and how heavily: the FIRST
+    target group when there is one, so nothing about an ordinary run changes. With `label_free` a line may
+    also be a bare `ct_base` with no target group at all -- for masked-cube pretraining, where no label is
+    read and the whole non-air CT is fair game (docs/unified_design.md section 30) -- and `bounds` is then
+    the CT pyramid itself, whole.
+    """
     out = []
     for line in lines:
         parts = [q.strip() for q in str(line).split(",") if q.strip()]
-        assert len(parts) >= 2, f"{line!r}: a rung source is 'ct_base,target_group[,target_group...]'"
+        assert len(parts) >= 2 or label_free, \
+            f"{line!r}: a rung source is 'ct_base,target_group[,target_group...]' " \
+            "(a bare CT pyramid is only a source in the label-free path)"
         src = {"ct": parts[0], "ct_pyr": rungs(parts[0]), "line": ",".join(parts), "targets": {}}
         umb = None
         for g in parts[1:]:
@@ -800,7 +809,19 @@ def source_groups(lines):
                                   "weight": float(at.get("weight", 1.0)),
                                   "box": (bx[0], bx[1]) if bx else None}
             umb = umb or at.get("umbilicus")
-        src["native"] = min(t["native"] for t in src["targets"].values())
+        # the pseudo-target that bounds the sampling: the first target group, or -- label-free -- the CT
+        # pyramid itself, whole. Under `label_free` EVERY source is bounded by its CT, even one that
+        # carries target groups, because that is what the flag means: sample where there is CT, not where
+        # there is a label. The target groups are still opened and still read, so a label-free queue can
+        # be replayed by a labelled run and vice versa.
+        src["bounds"] = ({"path": parts[0], "pyr": src["ct_pyr"], "native": min(src["ct_pyr"]),
+                          "weight": 0.0, "box": None, "label_free": True}
+                         if (label_free or not src["targets"]) else next(iter(src["targets"].values())))
+        src["label_free"] = bool(label_free or not src["targets"])
+        # the native rung follows the BOUNDS, so a label-free source is usable wherever its CT is, not
+        # only from the coarsest target group's rung up
+        src["native"] = (int(src["bounds"]["native"]) if src["label_free"]
+                         else min(t["native"] for t in src["targets"].values()))
         # a multi-scroll stores file must never fall back to another scroll's axis: the source's own
         # scroll directory comes first, and the configured default only serves a path without a scroll
         sc = scroll_of(parts[0])
@@ -809,7 +830,7 @@ def source_groups(lines):
                             or (own if own and os.path.exists(own) else UMBILICUS))
         # a source's draw weight is its PHYSICAL volume (um^3), not its voxel count: a 9.6 um-native scroll would
         # otherwise weigh 64x less than a 2.4 um one of the same size
-        src["voxels"] = float(np.prod(target_box(next(iter(src["targets"].values())), src["native"])[1]))
+        src["voxels"] = float(np.prod(target_box(src["bounds"], src["native"])[1]))
         src["volume_um3"] = src["voxels"] * rung_um(src["native"]) ** 3
         out.append(src)
     return out
@@ -827,7 +848,7 @@ def rung_probs(src, patch, allowed=None, boost=None):
     per = float(np.prod(shape3(patch)))
     ks = usable_rungs(src, allowed)
     assert ks, f"{src['line']}: no usable rung (native {src['native']}) among {sorted(allowed or [])}"
-    t = next(iter(src["targets"].values()))
+    t = src["bounds"]
     w = np.array([max(float(np.prod(target_box(t, k)[1])) / per, 1.0) ** 0.5 *
                   float((boost or {}).get(k, 1.0)) for k in ks])
     return dict(zip(ks, w / w.sum()))
@@ -876,7 +897,7 @@ def region_tiles(s, k, region, patch):
     """The shard-aligned tiles covering a source's target box at rung k: (per-axis origins, tile size).
     The tile size is `region` rounded DOWN to a multiple of the shard grid (and never below one shard, nor
     above the box), so every tile origin is a shard boundary."""
-    p, t = shape3(patch), next(iter(s["targets"].values()))
+    p, t = shape3(patch), s["bounds"]
     blo, bs = target_box(t, k)
     g = shard_grid(s["ct_pyr"], k)
     R = np.maximum((shape3(region) // g) * g, g)
@@ -906,7 +927,7 @@ def region_list(srcs, patch=256, region=1024, allowed=None, boost=None, exclude=
     sw /= sw.sum()
     out = []
     for i, (s, ws) in enumerate(zip(srcs, sw)):
-        ko, occ = occupancy(next(iter(s["targets"].values()))["pyr"], cap=cap)
+        ko, occ = occupancy(s["bounds"]["pyr"], cap=cap)
         for k, pk in rung_probs(s, patch, allowed, boost).items():
             ax, R = region_tiles(s, k, region, patch)
             keep = tiles_occupied(occ, ko, k, ax)
@@ -1088,7 +1109,8 @@ class Patches(torch.utils.data.IterableDataset):
                  fg_keep=0.25, sym=True, aug=None, dense_pow=0.0, dense_ref=0.2, ctx=(), stores_file=None,
                  recheck=200, rungs=None, rung_boost=None, channels=None, require_targets=False, stream=None,
                  region=0, windows_per_region=64, region_fails=0, teacher_regions=None, cascade="off",
-                 verso=False, verso_regions=None, fuse="off", source_w=None, planes=(), scan_meta=None):
+                 verso=False, verso_regions=None, fuse="off", source_w=None, planes=(), scan_meta=None,
+                 label_free=False, stream_tag=None):
         """dense_pow > 0 biases sampling towards sheet-dense patches: a patch whose target mean m is below
         dense_ref is kept with probability (m / dense_ref) ** dense_pow (crushed windings are where students fail).
         stores_file: instead of `stores`, a text file with one comma-joined group per line that is re-read
@@ -1161,6 +1183,19 @@ class Patches(torch.utils.data.IterableDataset):
         self.norm, self.umbilicus = NORM, UMBILICUS  # module state the (spawned) workers must inherit explicitly
         self.stores_file, self.recheck, self.file_mtime = stores_file, recheck, None
         self.require_targets = require_targets  # only draw windows whose target chunks are on disk (a partial pull)
+        # LABEL-FREE sampling (docs/unified_design.md section 30): a window is drawn anywhere the CT is
+        # not air, instead of only inside a target group's box, and no foreground / density rejection is
+        # applied -- what masked-cube pretraining (section 28, experiment 11) wants, where there is no
+        # label to reject on and the whole mirrored scroll is training data. A source line may then also
+        # be a bare `ct_base` with no target group. Targets that ARE on the line are still read, so the
+        # per-channel weights of such a sample are what a labelled run would see; they simply do not
+        # decide whether the window is kept.
+        self.label_free = bool(label_free)
+        # A SHARED stream queue (the size ladder, section 30): two trainers replaying one queue must not
+        # share the per-worker replay cursor or the planner's eviction bound. With a tag they become
+        # `<queue>/progress.<tag>/w<g>` and `<queue>/consumed.<tag>`; without one they are exactly the
+        # paths every run so far used.
+        self.stream_tag = None if stream_tag in (None, "") else str(stream_tag)
         if stores_file:
             stores = self.read_groups()
         self.patch, self.ct_path, self.paths, self.seed = shape3(patch), ct, [str(s).split(",") for s in stores], seed
@@ -1197,7 +1232,7 @@ class Patches(torch.utils.data.IterableDataset):
         if self.stores_file:
             self.paths = [g.split(",") for g in self.read_groups()]
             assert self.paths, f"{self.stores_file} lists no store groups"
-        self.srcs = source_groups([",".join(ps) for ps in self.paths])
+        self.srcs = source_groups([",".join(ps) for ps in self.paths], label_free=self.label_free)
         if self.channels is None:
             self.channels = list(dict.fromkeys(c for s in self.srcs for c in s["targets"]))
         if self.verso and VERSO not in self.channels:  # no source pyramid provides it: the stores do
@@ -1247,7 +1282,7 @@ class Patches(torch.utils.data.IterableDataset):
         s = self.srcs[i]
         ks, pk = list(s["probs"]), np.array(list(s["probs"].values()))
         k = int(rng.choice(ks, p=pk))
-        blo, bs = target_box(next(iter(s["targets"].values())), k)
+        blo, bs = target_box(s["bounds"], k)
         size = np.minimum(shape3(self.region), np.maximum(bs, self.patch))
         hi = np.maximum(blo + bs - size, blo)
         lo = rng.integers(np.minimum(blo, hi), hi + 1)
@@ -1280,7 +1315,7 @@ class Patches(torch.utils.data.IterableDataset):
             s = self.srcs[i]
             ks, pk = list(s["probs"]), np.array(list(s["probs"].values()))
             k = int(rng.choice(ks, p=pk))
-            t0 = next(iter(s["targets"].values()))
+            t0 = s["bounds"]
             blo, bs = target_box(t0, k)
             lo_min, lo_max = np.minimum(blo, blo + bs - p), np.maximum(blo, blo + bs - p)
             lo = rng.integers(lo_min, lo_max + 1)
@@ -1315,15 +1350,16 @@ class Patches(torch.utils.data.IterableDataset):
                 return None, None
             tea, ver = self._teacher_store(s, k, lo), self._verso_store(s, k, lo)
             tg, w = self._rung_target(s, k, lo, ct, teacher=tea, verso=ver)
-            nr = self.nrecto or len(self.channels)
-            sel = w[:nr] > 0          # the verso channel is ignored here: a cout=2 run draws the same
-            m = float(np.sum(tg[:nr], where=sel, dtype=np.int64)) / 255.0 / max(int(sel.sum()), 1)  # windows
-            if m < self.fg_min and rng.random() > self.fg_keep:
-                return None, None
-            if self.dense_pow > 0 and m < self.dense_ref and rng.random() > (m / self.dense_ref) ** self.dense_pow:
-                return None, None
-            if not sel.any():  # every voxel masked or outside the target box: no gradient, so no sample.
-                return None, None  # (after the draws above, so the rng stream is the one it always was)
+            if not self.label_free:
+                nr = self.nrecto or len(self.channels)
+                sel = w[:nr] > 0      # the verso channel is ignored here: a cout=2 run draws the same
+                m = float(np.sum(tg[:nr], where=sel, dtype=np.int64)) / 255.0 / max(int(sel.sum()), 1)  # windows
+                if m < self.fg_min and rng.random() > self.fg_keep:
+                    return None, None
+                if self.dense_pow > 0 and m < self.dense_ref and rng.random() > (m / self.dense_ref) ** self.dense_pow:
+                    return None, None
+                if not sel.any():  # every voxel masked or outside the target box: no gradient, so no sample.
+                    return None, None  # (after the draws above, so the rng stream is the one it always was)
             prm = raw_params(rng, self.aug)
             ct = raw_apply(ct, prm)
         sym = int(draw_sym(rng, tuple(p))) if self.sym else 0  # applied on the GPU (usrm2.prep), not here
@@ -1426,6 +1462,8 @@ class Patches(torch.utils.data.IterableDataset):
 
     def _teacher_store(self, s, k, lo):
         """The RECTO region teacher store covering this window (see `_region_store`)."""
+        if not self.channels:   # a label-free source has no output channel to take a teacher for
+            return None
         return self._region_store(s, k, lo, self.channels[0], self.teacher_regions)
 
     def _verso_store(self, s, k, lo):
@@ -1539,6 +1577,9 @@ class Patches(torch.utils.data.IterableDataset):
             f"--stream was planned with --cascade {m.get('cascade', 'off')}, not {self.cascade} " \
             "(the planner fetches the coarse target block and the tenth context cube)"
         self.paths, self.stores_file = [g.split(",") for g in m["stores"]], None
+        # a label-free plan says so, and the replaying dataset takes it: the window list is already
+        # fixed by the queue, but the source bounds must be built the same way (section 30)
+        self.label_free = self.label_free or bool(m.get("label_free"))
         self.teacher_regions = self.teacher_regions or m.get("teacher_regions")
         self.verso = self.verso or bool(m.get("verso"))
         self.verso_regions = self.verso_regions or m.get("verso_regions") or self.teacher_regions
@@ -1567,8 +1608,9 @@ class Patches(torch.utils.data.IterableDataset):
         assert GW == int(self.smeta["workers"]), \
             f"--stream was planned for {self.smeta['workers']} streams, not {world} ranks x {W} workers"
         self._dirs = list(self.smeta["dirs"])
-        os.makedirs(os.path.join(self.stream, S.PROGRESS), exist_ok=True)
-        prog = os.path.join(self.stream, S.PROGRESS, f"w{g}")
+        pdir = os.path.join(self.stream, S.PROGRESS + ("." + self.stream_tag if self.stream_tag else ""))
+        os.makedirs(pdir, exist_ok=True)
+        prog = os.path.join(pdir, f"w{g}")
         start = -1
         if os.path.exists(prog):
             try:
@@ -1725,7 +1767,7 @@ def rung_mix(lines, patch=256, allowed=None, boost=None):
     per, rows = float(np.prod(shape3(patch))), []
     for s, ws in zip(srcs, sw):
         for k, p in rung_probs(s, patch, allowed, boost).items():
-            t = next(iter(s["targets"].values()))
+            t = s["bounds"]
             shp = target_box(t, k)[1]
             csrc = max(r for r in s["ct_pyr"] if r <= k)
             rows.append({"source": s["line"], "rung": k, "um": rung_um(k), "shape": tuple(int(v) for v in shp),
@@ -1767,7 +1809,7 @@ VAL_RUNGS = (2, 3, 4, 6)  # the rungs the held-out box is scored at
 
 
 def val_grid_rungs(patch, stores, box2, rungs=VAL_RUNGS, limit=8, ctx=(), channels=None, cascade="off",
-                   verso=False, verso_regions=None, planes=(), scan_meta=None):
+                   verso=False, verso_regions=None, planes=(), scan_meta=None, label_free=False):
     """Per-rung validation: the held-out box (given at rung 2) read at each rung from the same pyramids
     as training. Returns the same compact uint8 items the rung loader yields (`rung_item`), so 8 patches x
     3 rungs at 256^3 cost ~1.6 GB of host memory instead of the ~22 GB of 14-channel float32 they used to.
@@ -1777,14 +1819,14 @@ def val_grid_rungs(patch, stores, box2, rungs=VAL_RUNGS, limit=8, ctx=(), channe
     channels, `val_png` still shows both, and the verso metrics are simply empty until a store lands on the
     box. The RECTO channel is never taken from a region store here: the validation target stays the exported
     mask pyramid, so a run's recto numbers are comparable across the whole ladder."""
-    srcs = source_groups(stores)
+    srcs = source_groups(stores, label_free=label_free)
     if channels is None:
         channels = list(dict.fromkeys(c for s in srcs for c in s["targets"]))
         if verso and VERSO not in channels:
             channels = channels + [VERSO]
     ds = Patches(patch=patch, stores=stores, exclude=[], rungs=True, ctx=ctx, channels=channels, sym=False,
                  cascade=cascade, verso=verso, verso_regions=verso_regions, planes=planes,
-                 scan_meta=scan_meta)
+                 scan_meta=scan_meta, label_free=label_free)
     ds._open_rungs()
     p3, out = shape3(patch), []
     o2, s2 = val_box(box2)
