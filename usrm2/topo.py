@@ -81,11 +81,21 @@ def betti_error(pred, ref, margin=8, band=6, dilate=2.0, chunk=CHUNK):
     that many voxels of the reference sheet: the published meshes cover only SOME of the sheets crossing
     the box, so an unrestricted count would charge the model for every correctly predicted sheet that has
     no mesh. The band must stay below half the sheet pitch (15-35 voxels here) or two sheets' bands fuse.
+
+    `dilate` thickens the reference to that many voxels either side. A mesh rasterizes to a ONE-voxel
+    staircase, and a 26-connected staircase traps a background voxel in every corner: measured raw, the
+    val-box reference has b2 = 48679 cavities and b1 = 19786 loops that are pure rasterization artefacts
+    (dilate 1 -> 11897 / 7422, 2 -> 4765 / 3351, 3 -> 1706 / 1612). A predicted band at thr 0.5 is 3-5
+    voxels thick and traps none of them, so the two must be put on the same footing first.
     """
     assert pred.shape == ref.shape, (pred.shape, ref.shape)
+    from scipy import ndimage as ndi
     s = tuple(slice(margin, -margin if margin else None) for _ in range(3))
     p, r = np.ascontiguousarray(pred[s], bool), np.ascontiguousarray(ref[s], bool)
-    b = band_of(r, band)
+    d = ndi.distance_transform_edt(~r) if r.any() and (band > 0 or dilate > 0) else None
+    b = np.ones_like(r) if d is None or band <= 0 else (d <= float(band))
+    if d is not None and dilate > 0:
+        r = d <= float(dilate)
     p, r = p & b, r & b
     p0, p1, p2, pc = betti(p, chunk)
     r0, r1, r2, rc = betti(r, chunk)
