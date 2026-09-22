@@ -1043,6 +1043,155 @@ re-opened handle, so the retry costs one open, not one per read). `tests/test_ve
 A100 failure exactly -- open a store, strip it underneath, watch the raw read raise -- and checks the
 recovery, and that a non-decode error is still raised rather than retried.
 
+## 25. Evaluation v2 (Phase A0, implemented 2026-09-21)
+
+Phase A0 / experiment 1 of `docs/research/synthesis_v2_with_literature.md`, from
+`docs/research/lit_evaluation_metrics.md`. The complaint it answers: section 20 quotes `recall@4 0.806,
+continuity 0.656, merge_frac 0.44, offset<=3 0.36` as one number per box per checkpoint, with **no
+confidence interval, no ceiling and no global topology check**, while the labels are a machine teacher
+whose own Dice ceiling is ~0.90-0.93. Two adjacent checkpoints differing by 0.02 was an unfalsifiable
+claim. Everything here is CPU-only and costs no GPU-hours.
+
+**Nothing old changed.** `metrics()` and `continuity()` in `usrm2/evalsurf.py` compute `recall@{2,4,8}`,
+`offset_mean/std/le3/frac`, `precision6`, `pos_frac`, `merge_runs/merge_frac`, `continuity`, `hit_frac`
+and `mean_run` exactly as before, and `evalsurf` still prints them on one json line with the same keys, so
+every number in sections 19-20 stays comparable. `--window 128 --halo 16` are still the defaults and
+`--head` / `--cascade` pass through untouched. The only edit to an old function is
+`metrics(..., precision=False)`, which *omits* `precision6`/`pos_frac` (their KD-tree is over the whole
+box and is not a per-surface quantity); with the default `precision=True` the output is bit-for-bit what
+it was.
+
+### 25.1 The noise ceiling (`--ceiling [STORE]`)
+
+A model scored against a noisy reference cannot, in expectation, beat what that reference's own noise
+permits (Metrics Reloaded, Maier-Hein et al. 2024). So: run the **identical** suite with a label source in
+the model's place and print every number as `value (ceiling)`.
+
+- Default source: the published recto mask pyramid,
+  `.../representations/predictions/surfaces/…-surface-recto-2um-ps256-L0-th0.45.zarr/2.4`
+  (`USRM2_CEILING_STORE`). `--ceiling PATH` names another; bare `--ceiling` uses `--teacher` when given.
+- Cached per `(box, store, tifxyz, umbilicus)` as
+  `<dir of USRM2_VAL>/evalsurf_ceiling_<z>_<y>_<x>_<hash>.json` (`USRM2_CEILING_CACHE`), so every later
+  run prints the ceiling for free. `--no-ceiling-cache` recomputes.
+- The published mask is a *threshold* of one lineage, so it is not the only ceiling worth having: the
+  literature's own caveat is that one teacher's ceiling is itself noisy, and the second one
+  (recto lineage vs `m7`, `--ceiling /vesuvius/usrm2/teacher/eval_m7…`) is still to be measured.
+
+How to read it: a metric at or above its ceiling is **saturated on this label source** and can only be
+pushed further by better labels or by the mesh-measured metrics; a metric far below its ceiling is where
+model work still pays.
+
+### 25.2 Expected run length, in micrometres (`erl_*`)
+
+Januszewski et al. 2018 (flood-filling networks) score a reconstruction by how far a neurite can be traced
+before a split or a merge. The papyrus analogue is exact, and the walk graph already exists: the tifxyz
+**UV grid** of each published surface.
+
+- A grid vertex is **good** when the probability reaches `thr` within +-`r`(=4) voxels along its normal
+  (no break) **and** the ray crosses `thr` exactly once over +-`far`(=40) voxels (no merge -- the same
+  `merge_runs` test `metrics()` has always used).
+- An edge between two neighbouring in-box vertices is traversable when both endpoints are good; its
+  length is the Euclidean distance between the two mesh points **times the voxel size in um** (2.4 um for
+  the Paris 4 2.4 um volume; read from the volume name). Both grid axes are walked.
+- `erl_um = sum(L_i^2) / sum(L_total)` over maximal traversable runs: the expected length of the run
+  containing a point drawn uniformly **by length**, so a 2 mm break costs far more than a 2-voxel one.
+  `path_um` is the denominator, the total meshed surface length inside the box.
+- `erl_break_um` and `erl_merge_um` repeat the walk with only one of the two stopping conditions, which
+  separates "the band is torn" from "the band has fused into a neighbour".
+- `lost_break_frac` / `lost_merge_frac` split the surface length between the two failures directly: every
+  vertex gets half of each incident edge, and its share is charged to breaks when it has no band, to
+  merges when it has a band but the ray crosses twice.
+
+`mean_run` (section 20) is kept and still means grid *cells* along grid *rows* only; `erl_um` is its
+physical-units, both-axes, merge-aware replacement. Quote `erl_um`; keep `mean_run` for continuity with
+old runs.
+
+### 25.3 Betti-0 / Betti-1 error (`usrm2/topo.py`)
+
+`merge_frac` and `continuity` are local proxies: neither can see a hole spanning more than a couple of
+grid cells, nor a handle that is not a normal-ray double crossing. The global check is the Betti number
+error (Hu et al. 2019), computed on the **cubical complex** in which every foreground voxel is a closed
+unit cube (26-connected foreground, 6-connected background):
+
+```
+b0  = connected components of the thresholded band            (scipy.ndimage.label, 3x3x3)
+b2  = components of the complement, one zero layer padded on, minus the unbounded one
+chi = V - E + F - C over the cells of the cubical complex     (exact, counted, chunked along z)
+b1  = b0 + b2 - chi
+```
+
+The **approximation** to document: `b1` is *derived* from the Euler characteristic rather than counted.
+The count itself is right (a cubical subcomplex of R^3 is torsion-free, by Alexander duality), but unlike
+persistence it says nothing about *where* a loop is, and one spurious handle cancels one missing loop.
+**TODO**: Betti *matching* error (Stucki et al., ICML 2023; arXiv:2407.04683) -- spatially matched,
+differentiable, and the honest version of this metric. It needs a 3D persistent-homology implementation;
+the efficient one is C++/CUDA and is not a dependency we carry, so it is deliberately left undone rather
+than half-built.
+
+Two masks make the number mean something:
+
+- **Interior margin** (`--betti-margin`, default 8 voxels, >= the halo): a sheet the box merely cuts
+  through would otherwise read as a component the model invented and a loop it opened. Every box face is
+  cropped by the margin before anything is counted.
+- **Band around the mesh** (`--betti-band`, default 6 voxels): the published meshes cover only *some* of
+  the sheets crossing the box, so an unrestricted count charges the model for every correctly predicted
+  sheet that happens to have no mesh. Both volumes are restricted to voxels within that distance of the
+  reference. The band must stay below half the sheet pitch (15-35 voxels here) or two sheets' bands fuse
+  and a merge stops being visible; a bridge longer than the band is likewise invisible. This is the
+  metric's main blind spot and is why `merge_frac`/`lost_merge_frac` are kept alongside it.
+
+The reference is the mesh itself: `topo.rasterize` fills every quad whose four corners are finite on a
+lattice dense enough (0.4 voxel) that the rasterized sheet is 26-connected -- the tifxyz grid is many
+voxels coarse, and rasterizing the bare grid points would give a cloud of specks with a meaningless `b0`.
+
+### 25.4 Bootstrap confidence intervals and `--json`
+
+Points inside one surface are far too correlated to resample individually, so the bootstrap resamples
+**surfaces** with replacement (200 draws, seeded by `--seed`; `--bootstrap 0` turns it off) and repools.
+Pooling is exact, not approximate: point-weighted means for the rate metrics, the pooled-variance formula
+for `offset_std`, length-weighted recombination for ERL, and quantiles over the concatenated per-point
+offsets for the new `offset_hd95` / `offset_p99` (HD95, section 2 of the metrics survey). `precision6`
+and `pos_frac` are box-level, not per-surface, and therefore have no CI.
+
+`evalsurf` now prints, after the legacy json line, a table of `metric  value (ceiling)  [lo, hi]` -- the
+form every number should be quoted in from here on. `--json OUT` dumps the whole thing: the box, the
+voxel size, per-surface rows, the pooled metrics, the CIs, the Betti block, and the ceiling's own copy of
+all of it. The ceiling json line is printed **before** the main source's, so `grep '"recall@4"' | tail -1`
+in the existing `~/eval_u2.sh` / `~/eval_u3.sh` still picks the model, not the ceiling.
+
+### 25.5 Declaring a plateau (`usrm2 evalsurf-curve`)
+
+```
+usrm2 evalsurf-curve RUN_DIR [--metric dice] [--unbounded] [--json OUT]
+```
+
+Reads `RUN_DIR/eval.jsonl` (val dice per step) when it exists, otherwise a directory of
+`evalsurf --json` dumps (each carries its `step`), and fits both
+
+```
+power     y = c - a * step^-alpha          (Hestness et al. 2017)
+logistic  y = c / (1 + exp(-k*(log10 step - m)))
+```
+
+keeping the lower-RMSE one -- a power law does not saturate below 1, so for a [0,1] metric the logistic is
+usually the honest fit. It prints the fitted **asymptote** `c`, the **step at which 95% of the gain still
+outstanding at the last measured step** has been collected, and the **current slope per 10k steps**.
+
+**The decision rule.** Call a metric plateaued when its fitted gain over the next 10k steps is smaller
+than the bootstrap CI width from 25.4 -- signal below noise -- and not on a step budget. Do not trust a
+saturation call from fewer than ~10-15 checkpoints, and never from an unsmoothed two-point comparison.
+Conversely, a metric at its 25.1 ceiling is done regardless of what the fit says: more steps cannot beat
+the label.
+
+### 25.6 How a Phase-A0 number is quoted
+
+> `recall@4 0.806 (ceiling 0.9xx) [0.7xx, 0.8xx]`
+
+value, ceiling, 95% CI over surfaces. An experiment in the section-5 table of the synthesis moves a metric
+only if it moves **outside that CI**; a change inside it is not evidence. Per-surface rows are in the json
+and should be looked at before believing a pooled mean -- one badly broken patch hides inside many good
+ones (the survey's first pitfall).
+
 ## 27. Physics augmentation v2 (`full2`, implemented 2026-09-21)
 
 Phase D / experiment 10 of `docs/research/synthesis_v2_with_literature.md` (R9), from
@@ -1168,3 +1317,102 @@ threads, B=2, 14 channels, 128^3, median of 10): see the commit message / README
 pair and the shuffle adds only the (op, slot) pairs actually used, so `full2` is a small constant factor
 over `full` and negligible next to the GPU step it overlaps with.
 
+## 28. Masked-cube pretraining (`usrm2 pretrain`, implemented 2026-09-21)
+
+`usrm2/pretrain.py`, `tests/test_pretrain.py`, `cloud/pretrain_a6000.sh`. The R10 item of
+`docs/research/synthesis_v2_with_literature.md` and its experiment 11; the evidence is in
+`docs/research/lit_pretraining_foundation.md` (Wald/Isensee CVPR 2025: a CNN-native MAE stage on a
+ResEnc U-Net, +3 Dice average over 8 downstream sets, the gain concentrated at low label counts; VAMAE:
+structure-aware masking is what moves the topology metrics specifically). This is the replacement for
+tsm's dead DINO/feature-distillation line (L11): the same instinct, done the way the literature says works
+-- pretrain OUR OWN CNN on OUR OWN CT, do not import a clinical-CT foundation checkpoint and do not swap to
+a ViT to make somebody's recipe drop in.
+
+### The objective
+
+A pretraining sample is the ORDINARY rung sample of section 2, built by the ordinary loader and
+`prep.prepare`: CT cube at rung k, 9 context cubes at rungs k+1..k+9, the cascade slot, the scale plane,
+the radial vector. Then
+
+- **mask** the CT channel: `mask_block`^3 blocks (32 by default), a ratio drawn per sample from
+  [`--mask-lo`, `--mask-hi`] = [0.5, 0.75], masked voxels set to 0 (the mean of the z-scored cube, the same
+  "no information" value a dropped cascade channel carries);
+- with probability `--sheet-p` (0.5) the blocks are drawn **structure-aware** instead of uniformly: a block
+  is sampled with probability proportional to its foreground fraction, foreground being CT above the
+  `--sheet-pct` (0.7) quantile of that cube. That is the cheap sheet proxy. Sheet-heavy blocks are then what
+  vanishes, so the model has to reconstruct sheet TEXTURE and cannot score well by interpolating air;
+- **target** = the z-scored CT cube before masking (after the augmentations, so the target is what the model
+  would have seen);
+- **loss** = L1 (`--loss l2` for squared) over the MASKED voxels only. An unmasked voxel is a copy, not a
+  prediction, and scoring it would let the model win by learning the identity.
+
+No target pyramid is read. `Patches` runs with `require_targets=False` and `--fg-min 0` (take any non-air
+window: pretraining wants texture, not labels).
+
+**The context cubes are masked too, and this matters.** Context cube j sits at rung k+j over the same
+centre with the same voxel count, so its central 2^-j box is a 2^j-times coarser copy of the CT cube --
+left alone it is a free low-frequency answer key and the "reconstruction" is an upsample. The voxel mask is
+therefore max-pooled by 2^j and pasted into channel j's central footprint (`mask_ctx_`), for every j whose
+footprint is still at least one voxel. `--no-mask-ctx` turns it off for an ablation.
+
+### Which rungs
+
+`--rungs 0-4` by default: the fine half of the ladder, where the texture the fine-tuning run has to model
+lives and where R10 predicts the gain. **Rungs 0 and 1 (0.6 and 1.2 um) exist only where a fine scan does**:
+a source's usable rungs start at its NATIVE rung (`data.usable_rungs`), and every 2.4 um mirror is native at
+rung 2. `pretrain.available_rungs` intersects the request with what is actually on disk, drops a source that
+has none of the requested rungs (instead of letting `data.rung_probs` assert), and prints what it dropped --
+so `--rungs 0-4` on the Paris 4 corpus trains at 2-4 and says so.
+
+### The warm start: same trunk, renamed head
+
+The point of the stage is that `usrm2 train --init <run>/ckpt.pt` is EXACT. `pretrain` calls
+`model.build(size, cin=..., ckpt_act=..., add_skip=..., deep=...)` -- the very same builder, so `enc.*`,
+`down.*`, `dec.*` and `proj.*` have the state-dict keys `train` expects, byte for byte. Only the 1x1 output
+head is repurposed as the reconstruction head, and in the checkpoint it is stored as `recon_head.*`
+(`recon_deep_heads.*` under `--deep`). `train`'s `load_state_dict(..., strict=False)` then reports it as an
+UNEXPECTED key and drops it: the trunk is pretrained, the segmentation head starts random.
+`tests/test_pretrain.py` asserts exactly this -- missing keys are `{head.weight, head.bias}` and nothing
+else, unexpected keys are the `recon_head` pair, every trunk tensor equals the checkpoint's, and the warm
+started net's output is finite.
+
+`cin` must line up. By default the stem is the 15-channel one of a `--cascade` run, with the cascade slot
+held at ZERO -- which is exactly the in-distribution "no coarse prediction" value that `--cascade-drop`
+teaches. For a 14-channel fine-tuning run pretrain with `--no-cascade-slot`: `train.warm_start` can widen a
+stem, never narrow one. The checkpoint sets `args["scale_plane"] = True`, which is what makes `warm_start`'s
+`src_scale` path line the scale plane up rather than sliding it into the cascade slot.
+
+The checkpoint is train's shape -- `{"model", "ema", "opt", "step", "args"}` -- with the same EMA, bf16
+autocast, `--compile`, activation checkpointing, atomic save and `--resume` argument check. The few small
+pieces (`ema_update`, `autocast`) are COPIED from train.py rather than imported, so this stage does not
+break when train's internals move.
+
+### The optional rung head (VoCo flavour)
+
+`--rung-aux W` (off by default) adds a linear head on the mean-pooled bottleneck predicting the rung index,
+cross entropy, weight W. It is the one part of VoCo (CVPR 2024) that transfers: VoCo's own pretext task is
+"where is this crop in the body", which needs a fixed macro-anatomy a scroll does not have, but "how coarse
+is this cube" is the same idea on the axis we actually have. The catch, and the reason it is off: **the
+scale plane hands the model the answer**. So when it is on, a fraction `--rung-aux-p` (0.5) of the steps
+zero the scale plane and score the aux loss; the rest are plain reconstruction with the plane intact. The
+head lives outside the model state dict (`ckpt["rung_head"]`), so it can never reach a warm start.
+
+### The ablation protocol (experiment 11)
+
+Budget ~16 GPU-h: pretrain ~20k steps (~7 GPU-h) + two fine-tuning arms x 10k steps (~9 GPU-h).
+
+1. **Audit the corpus first.** Count DISTINCT SCANS in the stores file, not voxels. The R10 evidence comes
+   from ~39k volumes; two scrolls is a different regime and the number belongs in the write-up.
+2. `bash cloud/pretrain_a6000.sh pre1` -- planner-free, it samples the local CT mirror directly (there is no
+   target to wait for, so there is nothing for `stream-plan` to do).
+3. Two fine-tuning arms, IDENTICAL but for one flag and at MATCHED steps:
+   - from scratch: `usrm2 train ~/runs/ft_scratch ... --steps 10000`
+   - pretrained: the same command `+ --init-from ~/runs/pre1/ckpt.pt`
+   Same `--size`, `--patch`, `--ctx`, `--aug`, `--deep`, `--add-skip`, `--ckpt-act`, seed and val boxes.
+4. **Metric: `usrm2 evalsurf` continuity / ERL on the held-out box**, plus val dice per rung. Dice alone is
+   the wrong headline here -- the claimed mechanism (structure-aware masking, thin structures) is topological,
+   so ERL is what has to move.
+5. **Decision rule** (from synthesis_v2): adopt only if the gain survives at the label counts we actually
+   have. A gain that only appears at an artificially reduced label count is a note, not an adoption.
+6. Worth a third arm if the first two are close: `--no-mask-ctx`, which tells you how much of any gain was
+   real reconstruction and how much was the context channels leaking a coarse answer.
