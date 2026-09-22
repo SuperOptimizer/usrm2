@@ -1312,10 +1312,22 @@ remaining wiring, and belongs to the `cli.py`/`train.py` owner.
 
 ### 27.5 Presets and cost
 
-`full2` = `full` + `paganin` + `shuffle`; ablations: `geo+paganin`, `geo+shuffle`. Measured on CPU (8
-threads, B=2, 14 channels, 128^3, median of 10): see the commit message / README -- the jitter is one FFT
-pair and the shuffle adds only the (op, slot) pairs actually used, so `full2` is a small constant factor
-over `full` and negligible next to the GPU step it overlaps with.
+`full2` = `full` + `paganin` + `shuffle`; ablations: `geo+paganin`, `geo+shuffle`. Cost, CPU, 8 threads,
+B=2, 14 channels, 64^3, 24 interleaved reps (the aug suite is drawn per sample, so single runs are noisy;
+this interleaves the cases and averages):
+
+| preset | mean per batch | vs `full` |
+|---|---|---|
+| `full` | 1836 ms | 1.00 |
+| `full` + `shuffle` | 1869 ms | 1.02 |
+| `full` + `paganin` | 2062 ms | 1.12 |
+| `full2` | 2485 ms | **1.35** |
+
+Per call on the same (2, 10, 64^3) cube: `paganin` 41 ms, against `pool` 73 ms, `blur` 191 ms and
+`spectral_noise` 265 ms -- the jitter is one rfftn/irfftn pair and is among the CHEAPEST ops in the suite.
+The shuffle costs ~2%: it only adds the (op, slot) pairs actually used. The 1.35x is therefore mostly the
+extra `torch.where` batch copies that any added op pays, and it is a CPU figure -- on the GPU, where the
+augmentation overlaps the step, an FFT of this size is noise.
 
 ## 28. Masked-cube pretraining (`usrm2 pretrain`, implemented 2026-09-21)
 
