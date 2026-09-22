@@ -1209,6 +1209,274 @@ only if it moves **outside that CI**; a change inside it is not evidence. Per-su
 and should be looked at before believing a pooled mean -- one badly broken patch hides inside many good
 ones (the survey's first pitfall).
 
+## 26. Phase A losses and training recipe (implemented 2026-09-21)
+
+`docs/research/synthesis_v2_with_literature.md` section 4 (Phase A) and its experiments 2, 3, 4, 8 and 9,
+built behind flags that all default to OFF. A run whose flags are absent is **byte-identical** to one built
+before this section existed: each flag is recorded in the checkpoint `args` only when it is on, so an
+existing run's resume check is untouched, and `tests/test_phase_a.py` asserts that passing every flag at
+its off value gives the same weights, the same args and the same schedule as not passing it at all.
+
+Code: `usrm2/losses.py` (the four losses), `usrm2/train.py` (the recipe, `warm_start`, the step),
+`usrm2/calib.py` (temperature), `usrm2/glc.py` (source weights), `usrm2/data.py` (teacher fusion).
+
+### 26.1 The four label-free losses
+
+All four are computed from tensors the step already holds -- **no extra forward, no extra store, no extra
+loader channel** -- and all four run at level 0 only (the deep-supervision heads keep `bce + dice`). On the
+card they are computed in bf16: the skeleton and the affinity targets are 0/1 fields the size of the
+target, and at 256^3 in fp32 they alone would be ~1.6 GB of temporaries.
+
+**L3 soft exclusivity, `--loss-excl W`.**
+
+    excl = mean over {v : w_r(v) w_v(v) > 0} of  relu(p_recto(v) + p_verso(v) - 1)
+
+weighted by `w_r * w_v`. The mask is the plan's L3 definition: only where a verso store actually covers
+the voxel is there anything to say about the pair, so a sample with no verso store contributes nothing
+rather than pushing the untrained verso channel to 0. It needs `--verso` (train warns and stays inactive
+otherwise). Note the survey's discipline: once exclusivity is a LOSS, `eval.jsonl`'s `overlap` metric is
+no longer independent evidence, so keep a rung that carries no exclusivity weight if `overlap` is to stay
+a measurement.
+
+**L4 cascade self-consistency, `--loss-selfcons W`.**
+
+    selfcons = mean |avgpool2(p_recto) - avgpool2(CASCADE)|   over the SELF-source samples
+
+The CASCADE input channel (section 22) already holds the rung-(k+1) prediction over the same field of
+view, upsampled 2x, so the term reuses it and costs one forward of nothing. Pooling the upsample back by 2
+recovers the coarse field up to the trilinear kernel's residual smoothing (per axis 0.75/0.125/0.125
+instead of a delta) -- that is the price of the reuse. The coarse side is detached. `prep.Cascade` now
+records `last_self`, the per-sample mask of which samples took the `self` source, and only those are
+scored: the `mask` source is the coarse TARGET, so a consistency term against it would be a second,
+blurrier copy of the supervised loss, and a dropped channel is all zeros. One-way stop-grad, as the survey
+recommends starting (collapse risk); bidirectional is a later question.
+
+**`--cascade-self-p-anneal START END`** anneals `--cascade-self-p` linearly over the run (scheduled
+sampling, Bengio 2015 / OneSeg). The fixed 0.5 is textbook exposure bias; 0.1 -> 0.7 is the suggested
+range. The one-level truncation of the self feedback (the coarse pass's own cascade channel is always
+zero) is a property to keep deliberately: unconstrained multi-step self-feedback diverges without damping.
+
+**L8 skeleton recall, `--loss-skel W --skel-iters N`.** Skeleton Recall Loss (Kirchhoff/Isensee, ECCV
+2024), with the hard skeleton built here rather than offline:
+
+    fg   = target >= 0.5
+    d    = fg + sum_{j=1..N} erode^j(fg)          (Chebyshev distance to background, capped at N)
+    skel = fg AND (d == max of d over the 3x3x3 neighbourhood)
+    loss = 1 - (sum p * skel * w) / (sum skel * w),  averaged over the channels with any skeleton weight
+
+`erode` is a 3x3x3 min filter with the OUTSIDE treated as background (explicit zero padding, not
+`max_pool3d`'s -inf), which is why the ridge falls away within N voxels of a face the band runs off -- a
+patch-edge voxel is simply not asked about, which is the conservative direction. `N + 1` pooling ops in
+total, and the result is a medial SURFACE, not a centreline, which is what a sheet wants.
+
+Two properties matter. It is a **recall of a fixed point set derived from the TARGET**, so it cannot be
+gamed by making the band wider (`tests/test_phase_a.py` checks a 3-voxel and a 9-voxel prediction score
+identically), and it costs no differentiable skeletonisation. It is a **GAPS term only**: a merge bridge
+is itself thin and connected and scores well under it. Abort the arm if `merge_frac` rises.
+
+**O12 long-range affinity, `--affinity OFFSETS --loss-affinity W`.** `--affinity 16,32` adds
+`3 x len(offsets)` output channels to the same 1x1x1 head, named `aff16_z, aff16_y, aff16_x, aff32_z, ...`
+and appended after the target channels. Channel `(d, a)` asks, **at the midpoint**, whether the voxel
+`d/2` back and the voxel `d/2` forward along axis `a` are on the same sheet:
+
+    target_(d,a)(v) = min over t in [-d/2, +d/2] of fg(v + t e_a)     (a centred 1D erosion of length d+1)
+    weight_(d,a)(v) = w(v - (d/2) e_a) * w(v + (d/2) e_a) * fg(v - (d/2) e_a) * fg(v + (d/2) e_a)
+    loss            = weighted BCE
+
+Four decisions worth stating:
+
+- **Midpoint-centred, even offsets.** The pair is unordered and symmetric about the voxel, so a FLIP maps
+  the channel to itself and a PERMUTATION only permutes the three axis channels. That is why the channel
+  set survives the 48-symmetry augmentation for free.
+- **Axis offsets, not the per-voxel radial vector.** An axis offset is one 1D pooling op; a radial offset
+  would need a gather per voxel per offset and a resampling rule under the spatial augs. The three axes
+  bracket the radial direction to within the angle to the nearest axis, and the exact 48-symmetry
+  augmentation already shows the model every orientation of the same geometry.
+- **Same-sheet = the straight segment is entirely foreground.** This is connected-component labelling
+  restricted to straight paths inside the patch. It is CONSERVATIVE: a pair on one strongly curved sheet
+  can read as "different", never the other way round, so the NEGATIVES -- "these two are the next wrap
+  apart", the merge signal -- are clean, which is the direction that matters. A real per-sample
+  connected-component labelling is a CPU pass of seconds per 256^3 sample, and precomputed in the loader
+  it would not survive `aug.spatial`'s rotations; this form is three pooling ops on the AUGMENTED target.
+- **Scored only where both ends are foreground** (`--affinity-all` turns that off). The same/different
+  question is only meaningful for a pair of band voxels; without the restriction the channel is >95 %
+  trivial "one end is air" zeros.
+
+Offsets are in voxels **at the sample's own rung**, and the sheet pitch in voxels halves per rung: the
+measured 15-35 voxels is at rung 2, so ~8-18 at rung 3 and ~4-9 at rung 4. `--affinity 8,16,32` is
+therefore the set that brackets the pitch across rungs 2-4; a single offset only brackets one rung.
+
+Inference and evaluation **never read these channels**: `train.evaluate` and `train.val_png` cut the head
+to `cout_t`, `predict.probs` cuts it before any `--head` selection or reduction, and `args["cout_t"]`
+records where the cut is. `warm_start` gains `ncopy`: rows below it follow the old `copy mod n` rule
+(recto, verso), rows at and above it are zero-initialised in both weight and bias, so the affinity
+channels start at p = 0.5 and -- the head being 1x1x1 -- the recto and verso outputs are unchanged.
+
+### 26.2 The training recipe
+
+**`--sched wsd --stable-until S --cooldown C`.** Linear warmup, a FLAT plateau to step `S`, then the same
+cosine cooling over `C` steps (defaults: `C = 0.1 * steps`, `S = steps - C`, the literature's 10 %).
+`cosine` is untouched to the last float op. `sched`, `stable_until` and `cooldown` are in the resume
+`grow` tuple, which is the entire point: the step budget need not be committed at run start, and a resume
+may push the plateau out and move the cooldown. `--steps` was already in `grow`. Treat 10 % as a starting
+guess and check 5/10/20 % cheaply.
+
+**`--ema auto` / `--ema-k K`**: `ema_decay = 1 - K / steps`, clamped to [0.9, 0.9999]. The averaging window
+is `steps / K`, so `K = 50` is 2 % of the run -- the middle of the literature's 1-3 % -- and `K = 10` is
+10 %. A fixed 0.999 is a 1000-step window: 1.7 % of a 60k run and 0.5 % of a 200k one. When `--ema auto`
+is on, `ema_decay` joins the `grow` tuple, since extending `steps` on a resume must be allowed to move it.
+Caveat from the same survey: an EMA val curve going flat is not proof of convergence -- use raw-weight
+dice for a cooldown trigger.
+
+**`--rewarm N`**: on a warm start (`--init-from`) the LR warms up over `N` steps instead of `--warmup`.
+Resuming at a decayed tail generalises worse than starting fresh (Ash & Adams); 1-5 % of the new budget is
+the recommended window.
+
+**`--new-param-lr-mult M`**: a second AdamW param group, at `M x` LR through the stable phase and `1 x`
+during the cooldown, holding the tensors a warm start GREW -- the stem convolution when `cin` grew and the
+heads when `cout` grew. Param groups are per TENSOR, not per row, so the warm-started rows inside those
+tensors are boosted too; that is the standard practical form of the recipe and it is cheap here (the head
+is a 1x1x1 convolution and the stem is one 3x3x3 convolution out of ~200 tensors). With `M = 1` there is
+one group and the optimizer state is exactly as before.
+
+### 26.3 Teacher fusion and per-source weights
+
+Today a region teacher store simply REPLACES the exported mask wherever it covers the window, and the two
+lineages' bands differ systematically (32 % vs 23 % coverage of a mid-scroll cube), so which one wins is
+arbitrary per voxel. `--fuse agreement` instead, per voxel both cover (`data.fuse_agreement`):
+
+    c(p)  = 1 - H2(p)/ln 2                    (1 where a source commits, 0 at p = 0.5)
+    a_x   = w_x * (c(p_x) + 0.05)
+    p     = (a_s p_s + a_m p_m) / (a_s + a_m)
+    w_mul = 1 - |p_s - p_m|
+
+a confidence-weighted mean whose loss weight is the sources' AGREEMENT: a disagreed voxel is down-weighted
+smoothly instead of being decided by lineage order (UA-MT's "gate by agreement, not by one threshold").
+`--source-w store=1 mask=1 verso=1` scales each source's loss weight; the default is flat, exactly as
+before.
+
+`usrm2 glc-weights NAME=STORE ...` measures those weights (GLC, Hendrycks 2018, downgraded to one pass of
+counts as `lit_noisy_labels_self_training.md` recommends -- no meta-gradient, no bilevel optimisation).
+Per source over the val box: `fnr` = share of published mesh points with no band within +-r along the
+normal, `fpr` = share of its positive voxels farther than r from every mesh point, `J = 1 - fnr - fpr`,
+and the suggested weight is `J` normalised so the best source weighs 1. It prints a ready `--source-w`
+line. Two caveats it cannot fix: `fpr` is a proxy (the published surfaces do not cover every sheet in the
+box) and is only comparable ACROSS sources over the same box; and the verified boxes are where labelling
+was easy, so the rates do not transfer to the hard regions -- treat a fitted weight as a prior. Where both
+teachers agree AND are wrong, only the meshes can see it, which is exactly what this measures.
+
+### 26.4 Per-rung temperature calibration
+
+`usrm2 calibrate CKPT` fits one scalar `T` per rung on the run's own held-out grid, minimising the same
+weighted BCE the training loss uses, by golden-section search on `log T` in [0.2, 5]. `p = sigmoid(logit /
+T)`. It writes `args["temps"] = {"2": 1.13, ...}` into the checkpoint and moves no weight, so a calibrated
+and an uncalibrated checkpoint produce the same logits.
+
+A rung is fitted only when its target is a genuine binary band: `binary_frac`, the share of the weighted
+target mass strictly inside (0.02, 0.98), must be at most 0.5. Above the native rung the target is a
+pooled FRACTION and a temperature there is fitting a scale to a different quantity -- `--all-rungs`
+overrides, `--dry-run` prints without writing. Dice-trained networks are measurably overconfident
+(Mehrtash, arXiv:1911.13273), and every uncertainty-gated mechanism downstream needs the sigmoid to be a
+probability first.
+
+`predict.probs` applies the temperature of the rung it is predicting at, including at each level of the
+top-down cascade recursion, unless `--no-calib`. `calib.temp_for(args, rung)` is the one call `evalsurf`
+needs.
+
+### 26.5 Measured step cost
+
+Measured on the desk laptop's RTX 5080 (16 GB, shared with two other processes), `5m` at 128^3 batch 1,
+15 input channels, cout 2, `--deep 2`, `--ckpt-act 0`, bf16 autocast. The figure is the WHOLE training step
+(forward, deep losses, aux losses, backward, AdamW), i.e. the percentage a run actually pays, not the loss
+kernel in isolation. Two independent passes; the spread between them is the noise floor of this card.
+
+| arm | ms / step (pass 1, pass 2) | vs baseline | peak MiB |
+|---|---|---|---|
+| baseline (`bce + dice`) | 429.0, 438.3 | -- | 6019 |
+| `+ --loss-excl` (L3) | 439.6, 445.5 | +2.5 %, +1.6 % | 6019 |
+| `+ --loss-selfcons` (L4) | 445.5, 433.0 | +3.8 %, -1.2 % | 6019 |
+| `+ --loss-skel --skel-iters 4` (L8) | 432.6, 445.6 | +0.8 %, +1.7 % | 6019 |
+| `+ --loss-skel --skel-iters 2` | 433.7, 444.5 | +1.1 %, +1.4 % | 6019 |
+| `+ --loss-excl --loss-selfcons` | 435.9, 448.4 | +1.6 %, +2.3 % | 6019 |
+| `+ --affinity 16,32 --loss-affinity` (O12, 6 channels) | 480.1, 460.6 | +11.9 %, +5.1 % | 6022 |
+| all four together | 450.9, 462.6 | +5.1 %, +5.5 % | 6022 |
+
+Read it as: **L3, L4 and L8 are each inside the +-2 % noise of this card -- free, as the survey predicted**;
+the affinity head costs **+5-12 %** for two offsets (six extra head channels plus six BCE maps), which is
+the only term worth a second thought; and all four together land at **+5 %**. Peak memory is unchanged to
+3 MiB at this size.
+
+At the production configuration (256^3, batch 2) the extra memory is arithmetic rather than measured: the
+affinity target and weight are `2 x 3 x len(offsets) x 256^3` in bf16, so 0.4 GB for two offsets and 0.6 GB
+for three, and the skeleton adds about three full-size bf16 temporaries per target channel, ~0.2 GB. Budget
+**~0.6-0.8 GB on top of the current peak** with `--affinity 8,16,32` and `--loss-skel` both on. That is why
+the A6000 recommendation below turns on `--ckpt-act 1`.
+
+### 26.6 The recommended `u4` flag set
+
+`u3_30m6_cv` (cascade `mix` + verso, cout 2) is the warm-start source. Phase A splits cleanly in two,
+because only the affinity head changes a weight shape:
+
+**u4a -- the free arm (experiment 2 + 4 + 9), a plain RESUME of `u3`, no warm start, no head change.**
+This is the cheapest thing that can move `merge_frac` and `continuity`, and it costs ~2 % of a step:
+
+    usrm2 train ~/runs/u3_30m6_cv --resume \
+        --steps 60000 --sched wsd --stable-until 54000 --cooldown 6000 --ema auto \
+        --loss-excl 0.1 --loss-selfcons 0.1 --loss-skel 0.05 --skel-iters 4 \
+        --cascade-self-p-anneal 0.1 0.7
+
+(`--steps`, `--sched`, `--stable-until`, `--cooldown` and, under `--ema auto`, `ema_decay` are all in the
+resume `grow` tuple; the four loss weights are new keys, which the resume check does not object to, and
+they change no weight shape. Everything else must match the saved args, as before.)
+
+**u4b -- the affinity arm (experiment 3), a WARM START, cout 2 -> 2 + 9.** On an **A6000 48 GB**: the A100
+already sits at 46-48 GB at batch 2 / 256^3 / `--ckpt-act 0`, and Phase A adds ~0.6-0.8 GB, so the A6000
+needs `--ckpt-act 1` (recompute the full-resolution level, which holds most of the activations) to keep
+batch 2. `--batch 1 --accum 2` is the fallback if it still does not fit -- same effective batch, ~15 %
+slower than a real batch 2:
+
+    usrm2 train ~/runs/u4_30m6_cva --size 30m6 --patch 256 --batch 2 --accum 1 --ckpt-act 1 \
+        --deep D --add-skip A --lr 3e-4 \
+        --rungs 2-11 --ctx 1..9 --rung-boost 2=2 --val-rungs 2,3,4,6 \
+        --stores-file ~/stores.txt --stream ~/queue \
+        --cascade mix --cascade-self-p-anneal 0.1 0.7 --cascade-drop 0.1 \
+        --verso --cout 2 --teacher-regions ~/teacher_regions \
+        --aug full2 \
+        --init-from ~/runs/u3_30m6_cv/ckpt.pt --rewarm 800 --new-param-lr-mult 3 \
+        --sched wsd --stable-until 45000 --cooldown 5000 --steps 50000 --ema auto \
+        --loss-excl 0.1 --loss-selfcons 0.1 --loss-skel 0.05 --skel-iters 4 \
+        --affinity 8,16,32 --loss-affinity 0.1
+
+(`--size`, `--deep D`, `--add-skip A`, `--ctx`, `--norm` and `--no-radial` must be copied verbatim from
+`u3`'s own args -- `python -c "import torch,json;print(json.dumps(torch.load('u3/ckpt.pt')['args'],default=str))"`
+-- since a warm start only widens the stem and the head, it does not reshape the trunk.)
+
+Why each value:
+
+- `--affinity 8,16,32` and not `16,32`: the offsets are in voxels at the SAMPLE's rung, and the measured
+  15-35-voxel sheet pitch is a rung-2 number, so `32` brackets the pitch at rung 2, `16` at rung 3 and `8`
+  at rung 4 -- the three rungs that carry almost all the sampling mass. Nine extra head channels,
+  ~+8-15 % of a step by the table above.
+- `--loss-skel 0.05`, half the others: it is the term that can reward a merge bridge. **Abort the arm if
+  `merge_frac` rises**, whatever `continuity` does.
+- `--rewarm 800` is ~1.6 % of 50k, inside the literature's 1-5 %; `--new-param-lr-mult 3` gives the stem
+  and the heads 3x LR through the plateau and 1x during the cooldown.
+- `--sched wsd` with the cooldown at the last 10 %: the run can be extended later by moving
+  `--stable-until` and `--steps` on a resume without re-shaping every earlier step's LR, which is how
+  these runs are actually managed.
+- `--ema auto` is `1 - 50/50000 = 0.999`, i.e. the same window this run would have had by hand -- the
+  point is that it stays 2 % of the run when the run is extended.
+- Keep `--fuse off` and no `--source-w` for this arm: run `usrm2 glc-weights` first and change one thing
+  at a time (experiment 8 is a separate arm).
+
+**After either run:** `usrm2 calibrate RUN/ckpt.pt`, then score with `evalsurf` as usual -- the
+temperatures are applied automatically and `--no-calib` gives the old numbers for comparison.
+
+**Decision rule** (from the survey, against the Phase-A0 bootstrap CIs): `merge_frac` 0.44 -> below 0.40
+(L3, O12) and `continuity` 0.656 -> above 0.68 / ERL up (L8, L4), each outside the CI. Drop any term whose
+loss curve visibly moves while its own target metric does not. And once `--loss-excl` is on, `eval.jsonl`'s
+`overlap` is no longer independent evidence about exclusivity.
+
 ## 27. Physics augmentation v2 (`full2`, implemented 2026-09-21)
 
 Phase D / experiment 10 of `docs/research/synthesis_v2_with_literature.md` (R9), from

@@ -87,6 +87,22 @@ input is a z-scored CT patch, output is one recto-probability logit per voxel.
         --verso-regions-url https://dl.ash2txt.org/community-uploads/forrest/volcomp/PHercParis4/representations/predictions/teacher_regions/verso-2.4um
     usrm2 pretrain PRE --rungs 0-4 --ctx 1..9 --patch 256 --stores-file stores.txt   # masked-cube (MAE)
     usrm2 train RUN --rungs 2-11 --ctx 1..9 --init-from PRE/ckpt.pt   # ... warm-starts the same trunk
+
+- **Phase A** (`docs/unified_design.md` section 26): four label-free losses and a training recipe, every
+  flag OFF by default and recorded in the checkpoint args only when on, so a run without them is
+  byte-identical to one built before them. `--loss-excl W` soft exclusivity `relu(p_recto + p_verso - 1)`
+  where both channels carry weight (needs `--verso`); `--loss-selfcons W` cascade self-consistency,
+  `|pool2(p) - pool2(CASCADE)|` on the samples whose cascade channel came from the model's own coarse
+  forward (no extra forward); `--cascade-self-p-anneal 0.1 0.7` scheduled sampling of `--cascade-self-p`;
+  `--loss-skel W` skeleton recall, `1 - mean p` along the TARGET's medial surface (a GAPS term -- watch
+  `merge_frac`); `--affinity 8,16,32 --loss-affinity W` long-range affinity, 3 extra head channels per
+  offset (one per axis) predicting whether the voxels `d/2` back and forward are the SAME sheet.
+  Inference never reads the affinity channels and a warm start zero-inits their rows.
+  Recipe: `--sched wsd --stable-until S --cooldown C` (both changeable on a resume -- the budget is not
+  committed at run start), `--ema auto` (`1 - K/steps`, a window that is a fixed fraction of the run),
+  `--rewarm N` and `--new-param-lr-mult M` on a warm start, `--scan-meta PATH`,
+  `--fuse agreement` / `--source-w store=1 mask=1` for teacher fusion.
+
     usrm2 rung-mix stores.txt --patch 256      # the sampling mix and the local CT coverage per rung
     usrm2 predict RUN/ckpt.pt out.zarr --rung 4 --origin ... --size ...   # origin/size in rung-4 voxels
 
@@ -97,4 +113,6 @@ input is a z-scored CT patch, output is one recto-probability logit per voxel.
     usrm2 evalsurf --ckpt RUN/ckpt.pt --teacher /vesuvius/usrm2/teacher/eval.zarr
     usrm2 evalsurf --ckpt RUN/ckpt.pt --ceiling --json /vesuvius/usrm2/eval/run.json   # value (ceiling) [CI]
     usrm2 evalsurf-curve RUN --metric dice        # fitted asymptote / step95 / slope per 10k steps
+    usrm2 calibrate RUN/ckpt.pt                   # one temperature per rung, written into the checkpoint
+    usrm2 glc-weights mask=/vesuvius/usrm2/teacher/eval.zarr store=REG.zarr   # suggested --source-w
     usrm2 ablate /vesuvius/usrm2/runs/ablate1 --presets geo,all --steps 3000 --patch 96 --batch 4
