@@ -176,7 +176,7 @@ def png(path, ct, p_u8, origin, pts, thr=0.5):
 def run(origin=VAL_BOX[0], size=VAL_BOX[1], ckpt=None, store=None, teacher=None, tifxyz=TIFXYZ,
         volume=None, window=128, halo=16, device=None, png_path=None, cache=None, tta=0, luts=(), head=0,
         cascade=None, cascade_depth=3, ceil=None, json_out=None, boot=200, seed=0, betti=True,
-        betti_margin=8, betti_band=6, no_ceiling_cache=False):
+        betti_margin=8, betti_band=6, betti_dilate=2.0, no_ceiling_cache=False):
     """Score one checkpoint or store on the box. `ceil` (a store path, or "" for the default published
     recto pyramid / the `--teacher` store) adds the noise ceiling; every headline number is then printed
     as "value (ceiling) [bootstrap CI]". See docs/unified_design.md section 25."""
@@ -195,7 +195,7 @@ def run(origin=VAL_BOX[0], size=VAL_BOX[1], ckpt=None, store=None, teacher=None,
                                   "recall/precision are not comparable with a recto run."}))
     surfaces = surface_list(o, s, tifxyz)
     kw = dict(pts=pts, nrm=nrm, surfaces=surfaces, tifxyz=tifxyz, ct=ct, um=um, boot=boot, seed=seed,
-              betti=betti, betti_margin=betti_margin, betti_band=betti_band,
+              betti=betti, betti_margin=betti_margin, betti_band=betti_band, betti_dilate=betti_dilate,
               ref=mesh_reference(o, s, surfaces) if betti else None)  # rasterized once, shared by all sources
     cres = None
     if ceil is not None:
@@ -449,15 +449,15 @@ def mesh_reference(origin, size, surfaces):
     return topo.rasterize([g for _, g, _, _ in surfaces], tuple(int(x) for x in size), origin)
 
 
-def betti_of(p_u8, origin, size, surfaces, thr=0.5, margin=8, band=6, ref=None):
+def betti_of(p_u8, origin, size, surfaces, thr=0.5, margin=8, band=6, dilate=2.0, ref=None):
     """Betti-0/1 error of the thresholded band against the mesh-rasterized reference, on the box interior."""
     from usrm2 import topo
     ref = mesh_reference(origin, size, surfaces) if ref is None else ref
-    return topo.betti_error(np.asarray(p_u8) >= thr * 255, ref, margin=margin, band=band)
+    return topo.betti_error(np.asarray(p_u8) >= thr * 255, ref, margin=margin, band=band, dilate=dilate)
 
 
 def evaluate_all(p_u8, origin, size, pts, nrm, surfaces, tifxyz=TIFXYZ, ax=None, ct=None, thr=0.5, r=4,
-                 far=40, um=2.4, boot=200, seed=0, betti=True, betti_margin=8, betti_band=6, ref=None):
+                 far=40, um=2.4, boot=200, seed=0, betti=True, betti_margin=8, betti_band=6, betti_dilate=2.0, ref=None):
     """The whole v2 suite on one probability box: the pooled legacy numbers (unchanged), ERL, Betti-0/1,
     per-surface rows and bootstrap CIs."""
     m = metrics(p_u8, origin, pts, nrm, thr=thr, far=far)
@@ -468,7 +468,8 @@ def evaluate_all(p_u8, origin, size, pts, nrm, surfaces, tifxyz=TIFXYZ, ax=None,
     out["ci"] = bootstrap(rows, n=boot, seed=seed)
     out["surfaces"] = [{k: v for k, v in row.items() if not k.startswith("_")} for row in rows]
     if betti:
-        out["betti"] = betti_of(p_u8, origin, size, surfaces, thr=thr, margin=betti_margin, band=betti_band, ref=ref)
+        out["betti"] = betti_of(p_u8, origin, size, surfaces, thr=thr, margin=betti_margin, band=betti_band,
+                                dilate=betti_dilate, ref=ref)
     return out
 
 

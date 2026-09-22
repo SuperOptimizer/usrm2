@@ -73,7 +73,7 @@ def band_of(ref, radius):
     return ndi.distance_transform_edt(~ref) <= float(radius)
 
 
-def betti_error(pred, ref, margin=8, band=6, chunk=CHUNK):
+def betti_error(pred, ref, margin=8, band=6, dilate=2.0, chunk=CHUNK):
     """Betti-0/1 error of `pred` against `ref` (both bool, same box), measured on the box INTERIOR.
 
     `margin` voxels are cropped off every face first, so a sheet the box merely cuts through does not
@@ -93,7 +93,8 @@ def betti_error(pred, ref, margin=8, band=6, chunk=CHUNK):
             "betti0_ref": r0, "betti1_ref": r1, "betti2_ref": r2, "euler_ref": rc,
             "betti0_err": abs(p0 - r0), "betti1_err": abs(p1 - r1),
             "betti0_err_norm": abs(p0 - r0) / max(r0, 1), "betti1_err_norm": abs(p1 - r1) / max(r1, 1),
-            "betti_margin": int(margin), "betti_band": float(band), "betti_interior_vox": int(p.size)}
+            "betti_margin": int(margin), "betti_band": float(band), "betti_dilate": float(dilate),
+            "betti_interior_vox": int(p.size)}
     # TODO: Betti MATCHING error (Stucki et al., ICML 2023; arXiv:2407.04683) -- the counts above cannot
     # tell a loop in the right place from a loop in the wrong place. It needs a 3D persistent-homology
     # implementation; the efficient one is C++/CUDA and is not a dependency we carry today.

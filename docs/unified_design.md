@@ -1140,9 +1140,26 @@ Two masks make the number mean something:
   and a merge stops being visible; a bridge longer than the band is likewise invisible. This is the
   metric's main blind spot and is why `merge_frac`/`lost_merge_frac` are kept alongside it.
 
+- **Reference thickness** (`--betti-dilate`, default 2 voxels either side): a mesh rasterizes to a ONE
+  voxel staircase, and a 26-connected staircase traps a background voxel in every corner. Measured raw on
+  the val box the reference has **b2 = 48679 cavities and b1 = 19786 loops that are pure rasterization
+  artefacts** (dilate 1 -> 11897 / 7422, dilate 2 -> 4765 / 3351, dilate 3 -> 1706 / 1612), while a
+  predicted band at thr 0.5 is 3-5 voxels thick and has none of them. Dilating the reference to a
+  comparable thickness is what makes the two counts comparable at all.
+
 The reference is the mesh itself: `topo.rasterize` fills every quad whose four corners are finite on a
-lattice dense enough (0.4 voxel) that the rasterized sheet is 26-connected -- the tifxyz grid is many
+lattice dense enough (0.7 voxel) that the rasterized sheet is 26-connected -- the tifxyz grid is many
 voxels coarse, and rasterizing the bare grid points would give a cloud of specks with a meaningless `b0`.
+Quads with no corner within 64 voxels of the box are dropped first: a published surface spans the whole
+scroll and the box is one window of it.
+
+**How much to believe it, today.** `betti0_err` is usable: on the val box the reference is ~21-23
+components and a thresholded prediction that fragments the same sheets into ~5x as many pieces says so
+directly. `betti1_err` is **not** yet a number to tune against: the published grids are ~9% NaN inside
+this box, every grid hole is a genuine loop in the reference, and after dilation the reference still
+carries thousands of them, so the difference is dominated by mesh incompleteness rather than by the
+model. Read it as a relative number between checkpoints measured with identical `--betti-*` settings,
+never as an absolute, and quote `betti1_ref` beside it.
 
 ### 25.4 Bootstrap confidence intervals and `--json`
 
