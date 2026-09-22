@@ -81,8 +81,11 @@ def trilerp(V, q):
     return out
 
 
-def metrics(p_u8, origin, pts, nrm, thr=0.5, far=40, win=16):
-    """recall@r / offset bias / precision proxy / merge count at the surface points."""
+def metrics(p_u8, origin, pts, nrm, thr=0.5, far=40, win=16, precision=True):
+    """recall@r / offset bias / precision proxy / merge count at the surface points.
+
+    `precision=False` drops `precision6`/`pos_frac` only (their KD-tree is over the whole box and is not a
+    per-surface quantity); every other number is bit-for-bit what it has always been."""
     V, q = np.asarray(p_u8, np.float32) / 255.0, (pts - np.asarray(origin, np.float32))
     ts = np.arange(-far, far + 1, dtype=np.float32)
     S = np.stack([trilerp(V, q + t * nrm) for t in ts])  # (2*far+1, N)
@@ -97,15 +100,16 @@ def metrics(p_u8, origin, pts, nrm, thr=0.5, far=40, win=16):
     o = off[hit]
     b = S >= thr
     runs = b[0].astype(np.int32) + (b[1:] & ~b[:-1]).sum(0)
-    from scipy.spatial import cKDTree  # EDT of the rasterized points, exactly (points are float)
-    pos = np.argwhere(V >= thr).astype(np.float32)
-    d = cKDTree(q).query(pos, distance_upper_bound=6.0)[0] if len(pos) and len(q) else np.array([np.inf])
     m.update({"n_points": int(len(pts)), "offset_frac": float(hit.mean()),
               "offset_mean": float(o.mean()) if len(o) else float("nan"),
               "offset_std": float(o.std()) if len(o) else float("nan"),
               "offset_le3": float((np.abs(o) <= 3).mean()) if len(o) else float("nan"),
-              "precision6": float((d <= 6.0).mean()), "pos_frac": float((V >= thr).mean()),
               "merge_runs": float(runs.mean()), "merge_frac": float((runs > 1).mean())})
+    if precision:
+        from scipy.spatial import cKDTree  # EDT of the rasterized points, exactly (points are float)
+        pos = np.argwhere(V >= thr).astype(np.float32)
+        d = cKDTree(q).query(pos, distance_upper_bound=6.0)[0] if len(pos) and len(q) else np.array([np.inf])
+        m.update({"precision6": float((d <= 6.0).mean()), "pos_frac": float((V >= thr).mean())})
     return m
 
 
@@ -146,7 +150,7 @@ def continuity(p_u8, origin, size, tifxyz=TIFXYZ, ax=None, thr=0.5, r=4, min_pts
 def read_box(path, origin, size):
     """A box of a probability store (uint8), by global origin."""
     a = data.open_zarr(path)
-    lo = np.asarray(origin, np.int64) - np.asarray(a.attrs["origin_zyx"], np.int64)
+    lo = np.asarray(origin, np.int64) - np.asarray(a.attrs.get("origin_zyx", (0, 0, 0)), np.int64)  # a whole-scroll pyramid starts at 0
     assert (lo >= 0).all() and (lo + size <= np.array(a.shape[-3:])).all(), f"{path} does not cover the box"
     s = tuple(slice(int(l), int(l) + int(n)) for l, n in zip(lo, size))
     return a[(0,) + s] if a.ndim == 4 else a[s]
@@ -168,7 +172,11 @@ def png(path, ct, p_u8, origin, pts, thr=0.5):
 
 def run(origin=VAL_BOX[0], size=VAL_BOX[1], ckpt=None, store=None, teacher=None, tifxyz=TIFXYZ,
         volume=None, window=128, halo=16, device=None, png_path=None, cache=None, tta=0, luts=(), head=0,
-        cascade=None, cascade_depth=3):
+        cascade=None, cascade_depth=3, ceil=None, json_out=None, boot=200, seed=0, betti=True,
+        betti_margin=8, betti_band=6, no_ceiling_cache=False):
+    """Score one checkpoint or store on the box. `ceil` (a store path, or "" for the default published
+    recto pyramid / the `--teacher` store) adds the noise ceiling; every headline number is then printed
+    as "value (ceiling) [bootstrap CI]". See docs/unified_design.md section 25."""
     o, s = tuple(origin), tuple(size)
     import hashlib
     key = hashlib.md5(f"{s}|{tifxyz}|{data.UMBILICUS}".encode()).hexdigest()[:8]
@@ -176,20 +184,437 @@ def run(origin=VAL_BOX[0], size=VAL_BOX[1], ckpt=None, store=None, teacher=None,
     ct = data.open_zarr(volume or data.CT)[o[0]:o[0] + s[0], o[1]:o[1] + s[1], o[2]:o[2] + s[2]]
     keep = ct[tuple(np.clip(np.rint(pts - o).astype(int), 0, np.array(s) - 1).T)] > 0  # points in masked CT can't be predicted
     pts, nrm = pts[keep], nrm[keep]
-    print(json.dumps({"box": [*o, *s], "surfaces": counts, "masked_points_dropped": int((~keep).sum())}))
+    um = data.native_um(data.pyramid_base(volume or data.CT))
+    print(json.dumps({"box": [*o, *s], "surfaces": counts, "masked_points_dropped": int((~keep).sum()), "voxel_um": um}))
     if str(head) == "verso" or (isinstance(head, int) and head == 1):
         print(json.dumps({"note": "head verso is scored at the RECTO surface points: there is no published "
                                   "verso surface. offset_mean is then the sheet thickness, not a bias; "
                                   "recall/precision are not comparable with a recto run."}))
+    surfaces = surface_list(o, s, tifxyz)
+    kw = dict(pts=pts, nrm=nrm, surfaces=surfaces, tifxyz=tifxyz, ct=ct, um=um, boot=boot, seed=seed,
+              betti=betti, betti_margin=betti_margin, betti_band=betti_band,
+              ref=mesh_reference(o, s, surfaces) if betti else None)  # rasterized once, shared by all sources
+    cres = None
+    if ceil is not None:
+        cres = ceiling(o, s, ceil or teacher or CEILING_STORE, cache=not no_ceiling_cache, **kw)
+        print(json.dumps({"ceiling": cres["source"], **{k: v for k, v in cres.items()
+                                                        if k not in ("surfaces", "ci", "source")}}))
     if ckpt:
         prob, st = P.probs(ckpt, volume or data.CT, *o, *s, window=window, halo=halo, device=device, tta=tta, luts=luts, head=head,
                            cascade=cascade, cascade_depth=cascade_depth)
         p_u8, name = P.u8(prob), f"{ckpt}@{st.get('step')}" + (f"+tta{tta}" if tta > 1 else "") + (f"+lut{len(luts)}" if luts else "") + f"+head{head}"
+        step = st.get("step")
     else:
-        p_u8, name = read_box(store, o, s), store
-    print(json.dumps({"source": name, **metrics(p_u8, o, pts, nrm), **continuity(p_u8, o, s, tifxyz)}))
+        p_u8, name, step = read_box(store, o, s), store, None
+    res = evaluate_all(p_u8, o, s, **kw)
+    res["source"], res["step"], res["box"] = name, step, [*o, *s]
+    print(json.dumps({"source": name, **{k: v for k, v in res.items() if k not in ("surfaces", "ci", "betti", "source", "step", "box")}}))
+    print(table(res, cres))
+    tres = None
     if teacher:
-        pt = read_box(teacher, o, s)
-        print(json.dumps({"source": teacher, **metrics(pt, o, pts, nrm), **continuity(pt, o, s, tifxyz)}))
+        tres = evaluate_all(read_box(teacher, o, s), o, s, **kw)
+        tres["source"] = teacher
+        print(json.dumps({"source": teacher, **{k: v for k, v in tres.items() if k not in ("surfaces", "ci", "betti", "source")}}))
     if png_path:
         print(json.dumps({"png": png(png_path, ct, p_u8, o, pts)[0]}))
+    if json_out:
+        os.makedirs(os.path.dirname(os.path.abspath(json_out)), exist_ok=True)
+        json.dump({"box": [*o, *s], "voxel_um": um, "tifxyz": tifxyz, "surface_points": counts,
+                   "result": res, "ceiling": cres, "teacher": tres}, open(json_out, "w"), indent=1)
+        print(json.dumps({"json": json_out}))
+    return res
+
+
+
+# ---------------------------------------------------------------------------------------------------
+# Evaluation v2 (docs/unified_design.md section 25): noise ceiling, ERL, Betti-0/1, bootstrap CIs.
+# Everything below is ADDITIVE: `metrics()` and `continuity()` above are untouched, so every number this
+# file printed before still means exactly what it meant.
+# ---------------------------------------------------------------------------------------------------
+
+# The published recto mask pyramid, the default noise ceiling: a human-verified-ish machine label whose
+# own agreement with the meshes bounds what any student trained on it can score (lit_evaluation_metrics
+# section 6). `--ceiling PATH` or USRM2_CEILING_STORE overrides it.
+CEILING_STORE = os.environ.get(
+    "USRM2_CEILING_STORE",
+    "/vesuvius/usrm/volcomp/PHercParis4/representations/predictions/surfaces/"
+    "20260411134726-surface-20260413141734-surface-recto-2um-ps256-L0-th0.45.zarr/2.4")
+CEILING_CACHE = os.environ.get("USRM2_CEILING_CACHE", "")  # default: next to the eval box (data.VAL)
+
+
+def surface_list(origin, size, tifxyz=TIFXYZ, ax=None, min_pts=200):
+    """[(name, g (H,W,3), inside (H,W) bool, n (H,W,3))] for every published surface crossing the box.
+
+    Same selection rule as `sites()`/`continuity()` (bbox test, then >= min_pts points inside the box), so
+    the per-surface breakdown covers exactly the surfaces the pooled numbers are computed from."""
+    from usrm2 import refine as R
+    o, s = np.asarray(origin, np.float32), np.asarray(size, np.float32)
+    ax = ax if ax is not None else data.axis()
+    out = []
+    for d in R.surfaces_in(tifxyz, o, s, min_pts):
+        g = read_surface(d)
+        n = R.normals(g, ax)
+        k = np.isfinite(g).all(-1) & ((g >= o) & (g < o + s)).all(-1) & np.isfinite(n).all(-1)
+        if k.sum() >= min_pts:
+            out.append((os.path.basename(d), g, k, n))
+    return out
+
+
+def _runs_1d(ok, ln):
+    """Total length of every maximal run of True edges: ok (M,) bool, ln (M,) edge lengths -> (R,)."""
+    e = np.diff(np.concatenate([[0], ok.astype(np.int8), [0]]))
+    a, b = np.where(e == 1)[0], np.where(e == -1)[0]
+    c = np.concatenate([[0.0], np.cumsum(np.where(ok, ln, 0.0))])
+    return c[b] - c[a]
+
+
+def _walk_axis(good, valid, g, axis, um):
+    """Runs and path length along one grid axis. Returns (run lengths um, total path length um,
+    per-vertex length share um (H,W))."""
+    sl0 = (slice(None, -1), slice(None)) if axis == 0 else (slice(None), slice(None, -1))
+    sl1 = (slice(1, None), slice(None)) if axis == 0 else (slice(None), slice(1, None))
+    ev = valid[sl0] & valid[sl1]                                   # an edge exists between two in-box points
+    ln = np.linalg.norm(g[sl1] - g[sl0], axis=-1).astype(np.float64) * um
+    ln = np.where(ev & np.isfinite(ln), ln, 0.0)
+    ok = ev & good[sl0] & good[sl1]
+    share = np.zeros(valid.shape, np.float64)                      # half of each incident edge
+    share[sl0] += 0.5 * ln
+    share[sl1] += 0.5 * ln
+    lines = ln.T if axis == 0 else ln                              # walk along the axis -> put it last
+    oks = ok.T if axis == 0 else ok
+    sep = np.zeros((lines.shape[0], 1))
+    r = _runs_1d(np.concatenate([oks, sep.astype(bool)], 1).ravel(),
+                 np.concatenate([lines, sep], 1).ravel())
+    return r, float(ln.sum()), share
+
+
+def erl(p_u8, origin, g, k, n, thr=0.5, r=4, far=40, um=2.4):
+    """Expected run length (Januszewski et al. 2018) along one published surface, in MICROMETRES.
+
+    The tifxyz UV grid is the walk graph: an edge between two neighbouring in-box grid points is
+    traversable when BOTH its endpoints are good, where a vertex is good when the probability reaches
+    `thr` within +-r voxels along its normal (no break) AND the ray crosses `thr` exactly once over
+    +-far (no merge -- the same `merge_runs` test `metrics()` uses). ERL = sum(L_i^2)/sum(L_total): the
+    expected length of the run containing a point drawn uniformly by length, so a 2 mm break costs far
+    more than a 2 voxel one. `erl_break_um` / `erl_merge_um` repeat the walk with only one of the two
+    stopping conditions, and `lost_break_frac` / `lost_merge_frac` split the surface length between them
+    by giving every vertex half of each incident edge."""
+    from usrm2 import refine as R
+    V, o = np.asarray(p_u8, np.float32) / 255.0, np.asarray(origin, np.float32)
+    S = R.profile(V, g[k] - o, n[k], far)                          # (2*far+1, M)
+    c = far
+    b = S >= thr
+    hit = np.zeros(g.shape[:2], bool)
+    hit[k] = b[c - r:c + r + 1].max(0)
+    merged = np.zeros(g.shape[:2], bool)
+    merged[k] = (b[0].astype(np.int32) + (b[1:] & ~b[:-1]).sum(0)) > 1
+    gf = np.where(np.isfinite(g), g, 0.0)
+    out, tot = {}, 0.0
+    for name, good in (("", k & hit & ~merged), ("_break", k & hit), ("_merge", k & ~merged)):
+        rl, tl = [], 0.0
+        for a in (0, 1):
+            ra, la, _ = _walk_axis(good, k, gf, a, um)
+            rl.append(ra); tl += la
+        rl = np.concatenate(rl) if rl else np.zeros(0)
+        out["erl" + name + "_um"] = float((rl ** 2).sum() / tl) if tl > 0 else 0.0
+        out["_runsq" + name] = float((rl ** 2).sum())
+        tot = tl
+    share = sum(_walk_axis(k, k, gf, a, um)[2] for a in (0, 1))
+    out["path_um"] = tot
+    out["break_um"] = float(share[k & ~hit].sum())
+    out["merge_um"] = float(share[k & hit & merged].sum())
+    out["lost_break_frac"] = out["break_um"] / tot if tot > 0 else 0.0
+    out["lost_merge_frac"] = out["merge_um"] / tot if tot > 0 else 0.0
+    return out
+
+
+def surface_rows(p_u8, origin, size, tifxyz=TIFXYZ, ax=None, ct=None, thr=0.5, r=4, far=40, um=2.4,
+                 min_pts=200, surfaces=None):
+    """Per-surface metrics: the existing suite restricted to one surface, plus ERL. One row per surface,
+    with the sufficient statistics (`_*` keys) that `pool()` needs to recombine them exactly."""
+    o, s = np.asarray(origin, np.float32), np.asarray(size, np.float32)
+    rows = []
+    for name, g, k, n in (surfaces if surfaces is not None else surface_list(origin, size, tifxyz, ax, min_pts)):
+        pts, nrm = g[k], n[k]
+        if ct is not None:  # points inside masked CT cannot be predicted (same filter run() applies)
+            keep = np.asarray(ct)[tuple(np.clip(np.rint(pts - o).astype(int), 0, np.asarray(size) - 1).T)] > 0
+            pts, nrm = pts[keep], nrm[keep]
+        m = metrics(p_u8, origin, pts, nrm, thr=thr, far=far, precision=False) if len(pts) else {}
+        cy = continuity_one(p_u8, origin, g, k, n, thr=thr, r=r)
+        e = erl(p_u8, origin, g, k, n, thr=thr, r=r, far=far, um=um)
+        V = np.asarray(p_u8, np.float32) / 255.0
+        q = (pts - o)
+        off = _abs_offsets(V, q, nrm, far=far, win=16, thr=thr) if len(pts) else np.zeros(0, np.float32)
+        rows.append({"surface": name, **{kk: vv for kk, vv in m.items() if kk not in ("precision6", "pos_frac")},
+                     **cy, **e, "offset_hd95": float(np.percentile(off, 95)) if len(off) else float("nan"),
+                     "offset_p99": float(np.percentile(off, 99)) if len(off) else float("nan"),
+                     "_n": int(len(pts)), "_noff": int(round(len(pts) * m.get("offset_frac", 0.0))),
+                     "_absoff": off})
+    return rows
+
+
+def _abs_offsets(V, q, nrm, far=40, win=16, thr=0.5):
+    """|sub-voxel peak offset| at the points where a band is found -- the sample HD95/P99 are taken from."""
+    ts = np.arange(-far, far + 1, dtype=np.float32)
+    S = np.stack([trilerp(V, q + t * nrm) for t in ts])
+    w = S[far - win:far + win + 1]
+    k = np.clip(w.argmax(0), 1, 2 * win - 1)
+    y0, y1, y2 = (np.take_along_axis(w, k[None] + j, 0)[0] for j in (-1, 0, 1))
+    den = np.minimum(y0 - 2 * y1 + y2, -1e-6)
+    off = (k - win) + np.clip(0.5 * (y0 - y2) / den, -1, 1)
+    return np.abs(off[w.max(0) >= thr]).astype(np.float32)
+
+
+def continuity_one(p_u8, origin, g, k, n, thr=0.5, r=4):
+    """`continuity()`'s numbers for ONE surface, with the same definitions (8-neighbour hit consistency,
+    hit fraction, mean run length along grid rows) plus the counts `pool()` weights them by."""
+    from usrm2 import refine as R
+    V, o = np.asarray(p_u8, np.float32) / 255.0, np.asarray(origin, np.float32)
+    S = R.profile(V, g[k] - o, n[k], r)
+    hit = np.zeros(g.shape[:2], bool)
+    hit[k] = S.max(0) >= thr
+    inner = k.copy()
+    inner[:1], inner[-1:], inner[:, :1], inner[:, -1:] = False, False, False, False
+    nb = np.ones(g.shape[:2], bool)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            nb[1:-1, 1:-1] &= hit[1 + dy:hit.shape[0] - 1 + dy, 1 + dx:hit.shape[1] - 1 + dx]
+    c = inner & hit
+    runs = []
+    for row in hit & k:
+        if row.any():
+            e = np.diff(np.concatenate([[0], row.astype(int), [0]]))
+            runs += (np.where(e == -1)[0] - np.where(e == 1)[0]).tolist()
+    return {"continuity": float(nb[c].sum()) / max(int(c.sum()), 1), "hit_frac": int(c.sum()) / max(int(k.sum()), 1),
+            "mean_run": float(np.mean(runs)) if runs else 0.0,
+            "_nhit": int(c.sum()), "_ncont": int(k.sum()), "_nruns": len(runs)}
+
+
+POOL_W = {"recall@2": "_n", "recall@4": "_n", "recall@8": "_n", "offset_frac": "_n", "merge_runs": "_n",
+          "merge_frac": "_n", "offset_le3": "_noff", "continuity": "_nhit", "hit_frac": "_ncont",
+          "mean_run": "_nruns"}
+
+
+def pool(rows):
+    """Recombine per-surface rows into the pooled numbers, exactly (point-weighted means, pooled variance,
+    length-weighted ERL, quantiles over the concatenated offsets)."""
+    if not rows:
+        return {}
+    out = {"n_surfaces": len(rows), "n_points": int(sum(r["_n"] for r in rows))}
+    for key, wk in POOL_W.items():
+        v = np.array([r.get(key, np.nan) for r in rows], float)
+        w = np.array([r.get(wk, 0) for r in rows], float)
+        m = np.isfinite(v) & (w > 0)
+        out[key] = float((v[m] * w[m]).sum() / w[m].sum()) if m.any() else float("nan")
+    v = np.array([r.get("offset_mean", np.nan) for r in rows], float)
+    sd = np.array([r.get("offset_std", np.nan) for r in rows], float)
+    w = np.array([r["_noff"] for r in rows], float)
+    m = np.isfinite(v) & np.isfinite(sd) & (w > 0)
+    if m.any():
+        mu = float((v[m] * w[m]).sum() / w[m].sum())
+        out["offset_mean"] = mu
+        out["offset_std"] = float(np.sqrt(max(((sd[m] ** 2 + v[m] ** 2) * w[m]).sum() / w[m].sum() - mu ** 2, 0.0)))
+    else:
+        out["offset_mean"] = out["offset_std"] = float("nan")
+    a = np.concatenate([r["_absoff"] for r in rows]) if any(len(r["_absoff"]) for r in rows) else np.zeros(0)
+    out["offset_hd95"] = float(np.percentile(a, 95)) if len(a) else float("nan")
+    out["offset_p99"] = float(np.percentile(a, 99)) if len(a) else float("nan")
+    tot = sum(r["path_um"] for r in rows)
+    for suf in ("", "_break", "_merge"):
+        out["erl" + suf + "_um"] = float(sum(r["_runsq" + suf] for r in rows) / tot) if tot > 0 else 0.0
+    out["path_um"] = float(tot)
+    out["lost_break_frac"] = float(sum(r["break_um"] for r in rows) / tot) if tot > 0 else 0.0
+    out["lost_merge_frac"] = float(sum(r["merge_um"] for r in rows) / tot) if tot > 0 else 0.0
+    return out
+
+
+def bootstrap(rows, n=200, seed=0, lo=2.5, hi=97.5):
+    """Resample SURFACES with replacement (points inside one surface are far too correlated to resample
+    individually) and repool; returns {metric: [lo, hi]} 95% percentile intervals."""
+    if len(rows) < 2:
+        return {}
+    rng = np.random.default_rng(seed)
+    draws = [pool([rows[i] for i in rng.integers(0, len(rows), len(rows))]) for _ in range(int(n))]
+    keys = [k for k in draws[0] if isinstance(draws[0][k], float)]
+    return {k: [float(np.nanpercentile([d[k] for d in draws], lo)),
+                float(np.nanpercentile([d[k] for d in draws], hi))] for k in keys}
+
+
+def mesh_reference(origin, size, surfaces):
+    """The mesh-derived binary reference sheet for the box (quads filled in; see topo.rasterize)."""
+    from usrm2 import topo
+    return topo.rasterize([g for _, g, _, _ in surfaces], tuple(int(x) for x in size), origin)
+
+
+def betti_of(p_u8, origin, size, surfaces, thr=0.5, margin=8, band=6, ref=None):
+    """Betti-0/1 error of the thresholded band against the mesh-rasterized reference, on the box interior."""
+    from usrm2 import topo
+    ref = mesh_reference(origin, size, surfaces) if ref is None else ref
+    return topo.betti_error(np.asarray(p_u8) >= thr * 255, ref, margin=margin, band=band)
+
+
+def evaluate_all(p_u8, origin, size, pts, nrm, surfaces, tifxyz=TIFXYZ, ax=None, ct=None, thr=0.5, r=4,
+                 far=40, um=2.4, boot=200, seed=0, betti=True, betti_margin=8, betti_band=6, ref=None):
+    """The whole v2 suite on one probability box: the pooled legacy numbers (unchanged), ERL, Betti-0/1,
+    per-surface rows and bootstrap CIs."""
+    m = metrics(p_u8, origin, pts, nrm, thr=thr, far=far)
+    c = continuity(p_u8, origin, size, tifxyz, ax=ax, thr=thr, r=r)
+    rows = surface_rows(p_u8, origin, size, tifxyz, ax=ax, ct=ct, thr=thr, r=r, far=far, um=um, surfaces=surfaces)
+    pooled = pool(rows)
+    out = {**m, **c, **{k: v for k, v in pooled.items() if k not in m and k not in c}}
+    out["ci"] = bootstrap(rows, n=boot, seed=seed)
+    out["surfaces"] = [{k: v for k, v in row.items() if not k.startswith("_")} for row in rows]
+    if betti:
+        out["betti"] = betti_of(p_u8, origin, size, surfaces, thr=thr, margin=betti_margin, band=betti_band, ref=ref)
+    return out
+
+
+HEADLINE = ("recall@2", "recall@4", "recall@8", "offset_le3", "offset_mean", "offset_std", "offset_hd95",
+            "offset_p99", "precision6", "merge_runs", "merge_frac", "continuity", "hit_frac", "mean_run",
+            "erl_um", "erl_break_um", "erl_merge_um", "lost_break_frac", "lost_merge_frac", "path_um")
+
+
+def table(res, ceil=None):
+    """`metric  value (ceiling)  [lo, hi]`, the form every number is meant to be quoted in from now on."""
+    ci, out = res.get("ci") or {}, []
+    for k in HEADLINE:
+        if k not in res:
+            continue
+        v = res[k]
+        s = f"{k:<18} {v:>10.4g}"
+        s += f" ({ceil[k]:.4g})" if ceil and k in ceil and np.isfinite(ceil[k]) else " " * 9
+        s += f"  [{ci[k][0]:.4g}, {ci[k][1]:.4g}]" if k in ci else ""
+        out.append(s)
+    b, bc = res.get("betti"), (ceil or {}).get("betti")
+    if b:
+        out.append(f"{'betti0_err':<18} {b['betti0_err']:>10d}" + (f" ({bc['betti0_err']:d})" if bc else "")
+                   + f"   b0 {b['betti0']} vs ref {b['betti0_ref']}")
+        out.append(f"{'betti1_err':<18} {b['betti1_err']:>10d}" + (f" ({bc['betti1_err']:d})" if bc else "")
+                   + f"   b1 {b['betti1']} vs ref {b['betti1_ref']}")
+    return "\n".join(out)
+
+
+def ceiling_cache_path(origin, size, store, tifxyz=TIFXYZ):
+    import hashlib
+    d = CEILING_CACHE or os.path.dirname(data.VAL.rstrip("/")) or "."
+    k = hashlib.md5(f"{store}|{tuple(origin)}|{tuple(size)}|{tifxyz}|{data.UMBILICUS}".encode()).hexdigest()[:10]
+    return f"{d}/evalsurf_ceiling_{origin[0]}_{origin[1]}_{origin[2]}_{k}.json"
+
+
+def ceiling(origin, size, store=None, cache=True, **kw):
+    """The noise ceiling: the identical metric suite scored for `store` (the published recto mask pyramid by
+    default) against the same meshes. Cached per (box, store) as json next to the eval box, so every later
+    run prints "value (ceiling)" for free (lit_evaluation_metrics section 6)."""
+    store = store or CEILING_STORE
+    p = ceiling_cache_path(origin, size, store, kw.get("tifxyz", TIFXYZ))
+    if cache and os.path.exists(p):
+        return {**json.load(open(p)), "cached": p}
+    res = evaluate_all(read_box(store, origin, size), origin, size, **kw)
+    res["source"] = store
+    if cache:
+        try:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            json.dump(res, open(p, "w"))
+        except OSError as e:  # a read-only mirror must not lose the eval
+            print(json.dumps({"ceiling_cache_error": repr(e)}))
+    return res
+
+
+# ---------------------------------------------------------------------------------------------------
+# Plateau fitting (`usrm2 evalsurf-curve`): is this metric still moving, or is it done?
+# ---------------------------------------------------------------------------------------------------
+
+def fit_curve(steps, vals, bounded=True, gain95=0.95):
+    """Fit a saturating curve to (step, metric) and say whether the run is done.
+
+    Two forms are tried and the lower-RMSE one wins (Hestness et al. 2017 for the power law; the
+    literature's own caveat is that a power law does not saturate below 1, so for a [0,1] metric a
+    logistic in log-step is usually the honest fit):
+        power     y = c - a * step^-alpha
+        logistic  y = c / (1 + exp(-k * (log10 step - m)))
+    Returns the fitted asymptote `c`, `step95` (where 95% of the gain still outstanding at the LAST
+    measured step has been collected) and `slope_per_10k` (dy/dstep * 1e4 at the last step). Do not trust
+    a saturation call from fewer than ~10-15 points, and never without the Phase-A0 bootstrap CI to
+    compare the slope against."""
+    s = np.asarray(steps, float)
+    y = np.asarray(vals, float)
+    k = np.isfinite(s) & np.isfinite(y) & (s > 0)
+    s, y = s[k], y[k]
+    o = np.argsort(s)
+    s, y = s[o], y[o]
+    if len(s) < 4:
+        return {"model": None, "n": int(len(s)), "error": "need at least 4 points"}
+    hi = 1.0 if bounded else float(y.max() * 4 + 1)
+    from scipy.optimize import curve_fit
+
+    def power(x, c, a, al):
+        return c - a * x ** (-al)
+
+    def logis(x, c, kk, m):
+        return c / (1.0 + np.exp(-kk * (np.log10(x) - m)))
+
+    fits = []
+    for f, p0, bnd in (
+            (power, [min(max(y.max() * 1.05, y.max() + 1e-3), hi), max(y.max() - y.min(), 1e-3) * s[0] ** 0.5, 0.5],
+             ([y.max(), 0.0, 1e-3], [hi, np.inf, 5.0])),
+            (logis, [min(max(y.max() * 1.05, y.max() + 1e-3), hi), 2.0, float(np.log10(s.mean()))],
+             ([y.max(), 1e-3, -10.0], [hi, 100.0, 12.0]))):
+        try:
+            p, _ = curve_fit(f, s, y, p0=p0, bounds=bnd, maxfev=40000)
+            fits.append((float(np.sqrt(np.mean((f(s, *p) - y) ** 2))), f.__name__, p))
+        except Exception:
+            pass
+    if not fits:
+        return {"model": None, "n": int(len(s)), "error": "no fit converged"}
+    rmse, name, p = min(fits, key=lambda t: t[0])
+    c, last = float(p[0]), float(s[-1])
+    ylast = float(power(last, *p) if name == "power" else logis(last, *p))
+    rem = c - ylast
+    if name == "power":
+        _, a, al = p
+        slope = float(a * al * last ** (-al - 1) * 1e4)
+        s95 = float((a / max((1 - gain95) * rem, 1e-12)) ** (1.0 / al)) if rem > 1e-9 else last
+    else:
+        _, kk, m = p
+        e = np.exp(-kk * (np.log10(last) - m))
+        slope = float(c * kk * e / (1 + e) ** 2 / (last * np.log(10)) * 1e4)
+        t = (1 - gain95) * rem
+        s95 = float(10 ** (m + np.log(max(c / max(c - t, 1e-12) - 1, 1e-12)) / -kk)) if rem > 1e-9 else last
+    return {"model": name, "n": int(len(s)), "rmse": rmse, "params": [float(x) for x in p],
+            "asymptote": c, "last_step": last, "last_value": ylast, "remaining": float(rem),
+            "step95": s95, "steps_to_95": float(max(s95 - last, 0.0)), "slope_per_10k": slope}
+
+
+def curve(run_dir, metric="dice", bounded=True, out=None):
+    """Fit the plateau of one metric over a run: `run_dir/eval.jsonl` (val dice per step) when it exists,
+    otherwise a directory of `evalsurf --json` dumps (each carrying `step` and its pooled metrics)."""
+    pts = []
+    f = os.path.join(run_dir, "eval.jsonl")
+    if os.path.exists(f):
+        src = f
+        for line in open(f):
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if metric in d and d.get("step") is not None:
+                pts.append((float(d["step"]), float(d[metric])))
+    else:
+        src = run_dir
+        for g in sorted(glob.glob(os.path.join(run_dir, "*.json"))):
+            d = json.load(open(g))
+            if d.get("step") is not None and metric in d:
+                pts.append((float(d["step"]), float(d[metric])))
+    pts = [p for p in pts if np.isfinite(p[1])]
+    res = {"source": src, "metric": metric, "points": len(pts),
+           **(fit_curve([p[0] for p in pts], [p[1] for p in pts], bounded=bounded) if len(pts) >= 4
+              else {"model": None, "error": f"only {len(pts)} points"})}
+    print(json.dumps(res))
+    if res.get("model"):
+        print(f"{metric}: asymptote {res['asymptote']:.4f} ({res['model']} fit, rmse {res['rmse']:.4g}, "
+              f"{res['points']} points)\n  at step {res['last_step']:.0f}: {res['last_value']:.4f}, "
+              f"slope {res['slope_per_10k']:+.4f} / 10k steps\n  95% of the remaining "
+              f"{res['remaining']:.4f} by step {res['step95']:.0f} ({res['steps_to_95']:.0f} more)")
+    if out:
+        json.dump(res, open(out, "w"), indent=1)
+    return res

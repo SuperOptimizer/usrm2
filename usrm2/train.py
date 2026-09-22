@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from usrm2 import aug as A, data, model as M, prep
+from usrm2 import aug as A, data, losses as L, model as M, prep
 
 
 def weighted(tgt, wtgt=()):
@@ -84,6 +84,68 @@ def losses(logit, tgt, ridge_w=0.0, wtgt=(), w=None):
     return losses_tw(logit, tgt, wv, ridge_w)
 
 
+# ----------------------------------------------------------------- the training recipe (section 26)
+
+def lr_lambda(steps, warmup, lr_floor=0.0, sched="cosine", stable_until=None, cooldown=0):
+    """The LambdaLR factor. `cosine` is the original formula, unchanged to the last float op.
+
+    `wsd` (warmup-stable-decay, MiniCPM / `lit_optimisation_schedules.md`): linear warmup, then a FLAT
+    plateau until step `stable_until`, then the same cosine cooling over `cooldown` steps. Its point is
+    that the step budget need not be committed at run start: `stable_until` and `cooldown` are not part
+    of the weights, so a resume may move them (they are in the resume `grow` tuple) and the plateau
+    simply runs longer. The defaults follow the literature's 10 % cooldown: `cooldown = 0.1 * steps`
+    and `stable_until = steps - cooldown`.
+    """
+    if str(sched) != "wsd":
+        return lambda s: min((s + 1) / warmup, 1.0) * \
+            (lr_floor + (1 - lr_floor) * 0.5 * (1 + math.cos(math.pi * min(s / steps, 1.0))))
+    C = int(cooldown) if cooldown else max(int(round(0.1 * steps)), 1)
+    S = int(stable_until) if stable_until is not None else max(int(steps) - C, 1)
+
+    def f(s):
+        wu = min((s + 1) / warmup, 1.0)
+        if s < S:
+            return wu
+        t = min((s - S) / max(C, 1), 1.0)
+        return wu * (lr_floor + (1 - lr_floor) * 0.5 * (1 + math.cos(math.pi * t)))
+    return f
+
+
+EMA_K = 50  # `--ema auto` = 1 - k / steps: the averaging window is steps / k, i.e. 1 / 50 = 2 % of the
+            # run, the middle of `lit_optimisation_schedules.md`'s 1-3 % recommendation. k = 10 would be
+            # a 10 % window. A fixed 0.999 is a 1000-step window: 1.7 % of a 60k run and 0.5 % of a 200k one.
+
+
+def ema_auto(steps, k=EMA_K):
+    """`1 - k / steps`, clamped to [0.9, 0.9999] so a very short or very long run stays sane."""
+    return float(min(max(1.0 - float(k) / max(int(steps), 1), 0.9), 0.9999))
+
+
+def new_param_names(cin_grew, cout_grew, net):
+    """State-dict names of the tensors that hold NEWLY INITIALISED rows after a warm start: the stem
+    convolution (new input planes) and the heads (new output rows).
+
+    Param groups are per TENSOR, not per row, so putting the whole stem/head in the boosted group also
+    boosts the warm-started rows inside them. That is the standard practical form of the
+    "new parameters take full LR" recipe and it is cheap here: the head is a 1x1x1 convolution and the
+    stem is one 3x3x3 convolution out of ~200 tensors."""
+    out = []
+    if cin_grew:
+        out.append("enc.0.0.weight")
+    if cout_grew:
+        out += [k for k in net.state_dict() if k.startswith("head.") or k.startswith("deep_heads.")]
+    return set(out)
+
+
+def param_groups(net, new_names, mult):
+    """[(params), (new params)] for AdamW when `mult != 1`, else one group exactly as before."""
+    if mult == 1.0 or not new_names:
+        return [{"params": list(net.parameters())}], False
+    new = [p for n, p in net.named_parameters() if n in new_names]
+    old = [p for n, p in net.named_parameters() if n not in new_names]
+    return [{"params": old}, {"params": new}], bool(new)
+
+
 @torch.no_grad()
 def ema_update(ema, model, decay=0.999):
     """Same update as `e.mul_(decay).add_(v, alpha=1-decay)` per tensor, batched with the foreach kernels:
@@ -106,7 +168,7 @@ def autocast(dev):
 
 
 @torch.no_grad()
-def evaluate(net, grid, dev, wtgt=(), norad=False, cascade=None, channels=None):
+def evaluate(net, grid, dev, wtgt=(), norad=False, cascade=None, channels=None, cout_t=None):
     """bce / dice / mae over the val patches. A grid entry is (x, tgt) -- the old convention, optionally with
     `wtgt` weight channels -- or a compact rung sample (data.rung_item), whose input is built on the device
     by `prep.prepare`; its weights then scale every metric and each rung is also scored on its own
@@ -136,6 +198,8 @@ def evaluate(net, grid, dev, wtgt=(), norad=False, cascade=None, channels=None):
             ww = torch.ones_like(tg)
         with autocast(dev):
             logit = net(ct).float()
+        if cout_t is not None:  # the AFFINITY channels are a training-only head: never scored, never shown
+            logit = logit[:, :int(cout_t)]
         p = torch.sigmoid(logit)
         h, t = (p >= 0.5).float(), (tg >= 0.5).float()
         C = p.shape[1]
@@ -174,7 +238,7 @@ def grid_cout(item):
     return grid_cin_cout(item)[1]
 
 
-def val_png(path, net, grid, dev, norad=False, cascade=None):
+def val_png(path, net, grid, dev, norad=False, cascade=None, cout_t=None):
     """Middle z-slice of the first 4 val patches: CT (gray), each teacher target and each student OUTPUT
     CHANNEL as a red opacity overlay (no threshold), tiled patches x [CT, targets..., channels...]. With
     `--verso` (cout 2) it is three tiles: CT | recto target red + verso target blue | recto prediction red +
@@ -191,6 +255,7 @@ def val_png(path, net, grid, dev, norad=False, cascade=None):
             with autocast(dev):
                 y = net(x[None].to(dev).to(memory_format=M.memfmt()))
                 y = y[0] if isinstance(y, (list, tuple)) else y  # deep supervision returns [main, coarse...]
+                y = y if cout_t is None else y[:, :int(cout_t)]  # never draw the affinity channels
                 p = torch.sigmoid(y.float())[0].cpu()
             z = x.shape[1] // 2
             c = x[0, z].numpy()
@@ -212,7 +277,7 @@ def val_png(path, net, grid, dev, norad=False, cascade=None):
     Image.fromarray(np.concatenate(rows, 0).astype(np.uint8)).save(path)
 
 
-def warm_start(src, cin, cout, cascade=False, src_scale=False):
+def warm_start(src, cin, cout, cascade=False, src_scale=False, ncopy=None):
     """Adapt another run's weights to (cin, cout). Extra input channels get zero weights, so the net starts
     with the same output: the image channels stay first and the radial vector stays last, which is what
     zero-fills the scale plane of the unified model (13 -> 14 channels). Heads: more heads are copies of the
@@ -225,7 +290,13 @@ def warm_start(src, cin, cout, cascade=False, src_scale=False):
     would slide the scale weights into the cascade slot and zero the scale plane instead, which changes the
     output at every rung but 2. With both flags the 14 -> 15 warm start is exact: the new channel's weights
     are zero, so it contributes nothing whatever the channel holds, and the outputs agree with the source's
-    to a float32 ulp (the stem convolution accumulates 15 products instead of 14)."""
+    to a float32 ulp (the stem convolution accumulates 15 products instead of 14).
+
+    `ncopy`: how many of the `cout` head rows follow the copy rule. The rows at and above it are NEW and
+    are zero-initialised (weight and bias both 0, i.e. p = 0.5) instead of copying a probability filter
+    -- that is the per-channel policy the AFFINITY channels need (`--affinity`, section 26): they are not
+    another recto/verso probability, so `copy mod n` would be wrong, and because the head is 1x1x1 the
+    recto/verso rows are bit-identical whatever the new rows hold."""
     src = dict(src)
     w = src["enc.0.0.weight"]
     if w.shape[1] != cin:
@@ -237,12 +308,17 @@ def warm_start(src, cin, cout, cascade=False, src_scale=False):
         else:
             w2[:, :n - 3], w2[:, cin - 3:] = w[:, :n - 3], w[:, n - 3:]  # image chans first, radial last
         src["enc.0.0.weight"] = w2
+    nc = cout if ncopy is None else int(ncopy)
     for hk in [k for k in src if k == "head.weight" or (k.startswith("deep_heads.") and k.endswith(".weight"))]:
         hw, hb = src[hk], src[hk[:-6] + "bias"]
         if hw.shape[0] == cout:
-            continue
-        j = torch.arange(cout, device=hw.device) % hw.shape[0] if hw.shape[0] < cout else torch.arange(cout, device=hw.device)
-        src[hk], src[hk[:-6] + "bias"] = hw[j].clone(), hb[j].clone()
+            continue   # the source head already has exactly these rows: nothing is new, nothing is zeroed
+        grew = hw.shape[0] < cout
+        j = torch.arange(cout, device=hw.device) % hw.shape[0] if grew else torch.arange(cout, device=hw.device)
+        w2, b2 = hw[j].clone(), hb[j].clone()
+        if grew and nc < cout:  # rows >= ncopy are NEW (the affinity channels): zero weight and bias, so
+            w2[nc:], b2[nc:] = 0, 0   # they start at p = 0.5 and the recto/verso rows are untouched
+        src[hk], src[hk[:-6] + "bias"] = w2, b2
     return src
 
 
@@ -251,7 +327,11 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
           ema_decay=0.999, lr_floor=0.0, ridge_w=0.0, dense_pow=0.0, norm="patch", ctx=(), init_from=None, wtgt=(),
           compile=False, ckpt_act=0, add_skip=0, deep=0, rungs=None, rung_boost=None, val_rungs=data.VAL_RUNGS,
           require_targets=False, stream=None, cascade="off", cascade_self_p=0.5, cascade_drop=0.1,
-          cascade_noise=True, verso=False, verso_regions=None, verso_regions_url=None, cout=None, **kw):
+          cascade_noise=True, verso=False, verso_regions=None, verso_regions_url=None, cout=None,
+          loss_excl=0.0, loss_selfcons=0.0, loss_skel=0.0, loss_affinity=0.0, affinity=None,
+          skel_iters=4, affinity_all=False, cascade_self_p_anneal=None,
+          sched="cosine", stable_until=None, cooldown=0, ema_k=None, rewarm=0, new_param_lr_mult=1.0,
+          fuse="off", source_w=None, **kw):
     """accum: gradient accumulation (micro-batches per optimizer step), for big models on small cards.
     lr_floor: the cosine decays to lr_floor * lr instead of 0. norm: "patch" (per-patch z-score) or "global"
     (fixed scan mean/std, stored in the checkpoint). dense_pow / ridge_w: see data.Patches / losses.
@@ -279,6 +359,23 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     it is recorded in the args so a resume can tell how the run was fed. `cout`, when given, is an
     assertion: the number of output channels is derived from the target channels (+ verso), and `--cout 2`
     just says out loud that you expect two.
+
+    PHASE A (docs/unified_design.md section 26). Every one of these defaults to OFF and is recorded in the
+    checkpoint args only when it is on, so a run started without them is byte-identical to one started
+    before they existed, and an existing run resumes unchanged.
+    loss_excl: weight of L3 soft exclusivity, relu(p_recto + p_verso - 1) where both channels have weight.
+    loss_selfcons: weight of L4 cascade self-consistency, |pool2(p) - pool2(CASCADE)| on the samples whose
+    cascade channel came from the model's own coarse forward (`--cascade self|mix`); no extra forward.
+    loss_skel: weight of L8 skeleton recall, 1 - mean p along the TARGET's medial surface (usrm2/losses.py).
+    affinity / loss_affinity: O12. `affinity` is a list of EVEN voxel offsets (e.g. "16,32"); the head grows
+    by 3 channels per offset (one per axis) which predict "are the voxels d/2 back and d/2 forward along
+    this axis the same sheet", and `loss_affinity` weighs their BCE. Inference never reads them.
+    cascade_self_p_anneal (START, END): linear scheduled-sampling anneal of `--cascade-self-p` over the run.
+    sched / stable_until / cooldown: "cosine" (unchanged) or "wsd" (see `lr_lambda`).
+    ema_k: `--ema auto`, ema_decay = 1 - ema_k / steps (see `ema_auto`).
+    rewarm: on a warm start (`init_from`) warm the LR up over this many steps instead of `warmup`.
+    new_param_lr_mult: LR multiplier of a second AdamW param group holding the tensors a warm start grew.
+    fuse / source_w: teacher fusion and per-source loss weights (usrm2/data.py, `usrm2 glc-weights`).
 
     stream: a queue directory filled by `usrm2 stream-plan` (usrm2/stream.py). The loader then replays that
     queue out of a rolling local buffer instead of sampling, and every 20 steps `train.jsonl` carries
@@ -320,6 +417,42 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
             main and print(f"--verso-regions-url {verso_regions_url} is recorded but NOT fetched by train: "
                            f"`usrm2 stream-plan --verso --verso-regions-url ...` downloads into "
                            f"{verso_regions}; this run only reads what is there", flush=True)
+    # ---- Phase A (section 26). Recorded only when ON, so every older run's args -- and its resume
+    # check -- are untouched and a run without these flags is byte-identical to one built before them.
+    offsets = L.parse_offsets(affinity)
+    naff = L.n_affinity(offsets)
+    assert not naff or rungs is not None, "--affinity needs the rung ladder (--rungs)"
+    assert not naff or loss_affinity > 0, "--affinity adds output channels: give it --loss-affinity W"
+    phase_a = dict(loss_excl=float(loss_excl), loss_selfcons=float(loss_selfcons), loss_skel=float(loss_skel),
+                   loss_affinity=float(loss_affinity))
+    for k, v in list(phase_a.items()):
+        if not v:
+            phase_a.pop(k)
+    if naff:
+        phase_a.update(affinity=list(offsets), affinity_all=bool(affinity_all))
+    if loss_skel:
+        phase_a["skel_iters"] = int(skel_iters)
+    if cascade_self_p_anneal:
+        a0, a1 = (float(v) for v in cascade_self_p_anneal)
+        phase_a["cascade_self_p_anneal"] = [a0, a1]
+    if str(sched) != "cosine":
+        phase_a.update(sched=str(sched), stable_until=(None if stable_until is None else int(stable_until)),
+                       cooldown=int(cooldown or 0))
+    if ema_k:
+        phase_a["ema_k"] = float(ema_k)
+        ema_decay = ema_auto(steps, ema_k)
+        args["ema_decay"] = ema_decay
+    if rewarm:
+        phase_a["rewarm"] = int(rewarm)
+    if new_param_lr_mult and float(new_param_lr_mult) != 1.0:
+        phase_a["new_param_lr_mult"] = float(new_param_lr_mult)
+    if str(fuse or "off") != "off":
+        phase_a["fuse"] = str(fuse)
+    if source_w:
+        phase_a["source_w"] = dict(source_w)
+    args.update(phase_a)
+    if loss_excl and not verso:
+        main and print("--loss-excl needs two probability channels (--verso); it will be inactive", flush=True)
     if norm == "global":
         args["norm_stats"] = data.global_norm(kw.get("ct", data.CT))
         main and print("global normalization", args["norm_stats"], flush=True)
@@ -341,17 +474,24 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         grid = data.val_grid(patch=patch, ct=kw.get("ct", data.CT), store=kw.get("val", data.VAL), limit=val_patches, ctx=ctx)
     assert grid, f"validation store {kw.get('val', data.VAL)} is smaller than the patch ({patch})"
     # CT + context cubes (+ scale plane) + radial vector; one output channel per target channel (+ verso)
-    cin, cout = grid_cin_cout(grid[0])
-    assert cout_arg is None or int(cout_arg) == cout, \
-        f"--cout {cout_arg} but the output channels are {args.get('channels')} (cout {cout}): " \
+    cin, cout_t = grid_cin_cout(grid[0])
+    assert cout_arg is None or int(cout_arg) == cout_t, \
+        f"--cout {cout_arg} but the output channels are {args.get('channels')} (cout {cout_t}): " \
         "--verso is what adds the verso output channel"
+    # the AFFINITY channels sit AFTER the target channels in the same 1x1x1 head; `cout_t` is what the
+    # loader, the loss, the evaluation and inference see, `cout` is the head width
+    cout = cout_t + naff
+    if naff:
+        args["cout_t"], args["channels"] = cout_t, list(args.get("channels") or []) + L.affinity_names(offsets)
     args["cin"], args["cout"] = cin, cout
     net = M.build(size, cout=cout, cin=cin, ckpt_act=ckpt_act, add_skip=add_skip, deep=deep).to(dev)
     args["ckpt_act"], args["add_skip"], args["deep"] = ckpt_act, add_skip, deep
+    newp = set()
     if init_from:  # warm start from another run's EMA weights; extra input channels get zero weights (same output at step 0)
         sst = torch.load(init_from, map_location=dev)
         src = warm_start(sst["ema"], cin, cout, cascade=cascade != "off",
-                         src_scale=bool(sst.get("args", {}).get("scale_plane")))
+                         src_scale=bool(sst.get("args", {}).get("scale_plane")),
+                         ncopy=cout_t if naff else None)
         own = net.state_dict()
         skipped = [k for k, v in src.items() if k in own and tuple(own[k].shape) != tuple(v.shape)]
         src = {k: v for k, v in src.items() if k not in skipped}  # e.g. dec.0 under --add-skip, new deeper levels
@@ -359,9 +499,20 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         main and print(f"warm start from {init_from}: {len(missing.missing_keys)} missing, {len(missing.unexpected_keys)} unexpected, "
                        f"{len(skipped)} shape-mismatched skipped", flush=True)
         args["init_from"] = str(init_from)
-    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=0.01)
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min((s + 1) / warmup, 1.0) *
-                                              (lr_floor + (1 - lr_floor) * 0.5 * (1 + math.cos(math.pi * min(s / steps, 1.0)))))
+        sa = sst.get("args", {})
+        newp = new_param_names(int(sa.get("cin", 0) or 0) < cin, int(sa.get("cout", 0) or 0) < cout, net)
+    warm = int(rewarm) if (rewarm and init_from) else warmup  # a decayed tail is not where a warm start resumes
+    groups, split = param_groups(net, newp, float(new_param_lr_mult or 1.0))
+    opt = torch.optim.AdamW(groups, lr=lr, weight_decay=0.01)
+    sched_name = str(sched or "cosine")
+    base = lr_lambda(steps, warm, lr_floor, sched=sched_name, stable_until=stable_until, cooldown=cooldown)
+    if split:  # the new rows carry no memory to protect: M x LR through the stable phase, then M = 1
+        S = (int(stable_until) if stable_until is not None else
+             max(int(steps) - (int(cooldown) if cooldown else max(int(round(0.1 * steps)), 1)), 1)) \
+            if sched_name == "wsd" else int(steps)
+        m = float(new_param_lr_mult)
+        base = [base, (lambda s, f=base, m=m, S=S: f(s) * (m if s < S else 1.0))]
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, base)
     ema = {k: v.detach().clone() for k, v in net.state_dict().items()}
     step = 0
     ck = out / "ckpt.pt"
@@ -373,7 +524,11 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         grow = ("steps", "stores", "stores_file", "val", "val_rungs", "val_patches", "compile", "workers",
                 "require_targets", "rung_boost", "eval_every", "continued_from", "ckpt_act",
                 "stream", "teacher_regions", "region", "windows_per_region",
-                "verso_regions", "verso_regions_url")
+                "verso_regions", "verso_regions_url",
+                # WSD's whole point is that the budget is NOT committed at run start: the plateau may be
+                # extended and the cooldown moved on a resume, because neither is part of the weights.
+                "sched", "stable_until", "cooldown") + \
+               (("ema_decay",) if (ema_k or st["args"].get("ema_k")) else ())
         # a continued run may train longer, on more data, with other bookkeeping -- and from another queue
         diff = {k: (st["args"][k], args.get(k)) for k in st["args"] if k not in grow and k != "aug_cfg" and st["args"][k] != args.get(k)}
         assert not diff, f"resume with different arguments (saved, now): {diff}"
@@ -406,9 +561,11 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
                      exclude=kw.get("val", data.VAL), seed=step + 7919 * rank, sym=cfg.get("sym", True), aug=cfg, dense_pow=dense_pow, ctx=ctx,
                      stores_file=kw.get("stores_file"),  # a stores file is re-read as it grows (data.Patches)
                      # region mode / the region teacher stores reach the DATASET, not just the args record
-                     **(dict(rungs=rungs, rung_boost=rung_boost, channels=args.get("channels"),
+                     **(dict(rungs=rungs, rung_boost=rung_boost,
+                             channels=(args.get("channels") or [])[:cout_t] or None,
                              require_targets=require_targets, cascade=cascade,
                              verso=verso, verso_regions=verso_regions,
+                             fuse=fuse, source_w=source_w,
                              **{q: kw[q] for q in ("region", "windows_per_region", "region_fails",
                                                    "teacher_regions") if kw.get(q)}) if rungs is not None else {}),
                      **(dict(stream=stream) if stream else {}))
@@ -434,6 +591,9 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     log("train.jsonl", {"step": step, "aug": aug, "cfg": cfg, "size": size, "patch": patch, "batch": batch})
     t0, micro, rung_n = time.time(), 0, {}
     wait_ms, stream_idx = 0.0, -1
+    aux_on = bool(loss_excl or loss_selfcons or loss_skel or loss_affinity)
+    aux_dt = torch.bfloat16 if dev.type == "cuda" else torch.float32
+    aux_log = {}
     # the planner may evict a chunk once every worker is past it; the DataLoader is up to this many entries
     # ahead of what the training loop has actually seen
     # (x world: every rank replays its own share of the one queue, and the bound must clear the slowest)
@@ -450,18 +610,39 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
                 stream_idx = max(stream_idx, int(item["idx"].max()))
             if cas is not None:
                 cas.sync(ema)  # the self-mode coarse pass always runs on the current EMA weights
+                if cascade_self_p_anneal:  # scheduled sampling: mostly `mask` early, mostly `self` late
+                    a0, a1 = (float(v) for v in cascade_self_p_anneal)
+                    cas.self_p = a0 + (a1 - a0) * min(step / max(steps, 1), 1.0)
             ct, tg, wt = prep.prepare(item, dev, norad=no_radial, cascade=cas)
             tg = torch.cat([tg, wt], 1)  # the weights ride along as extra target channels so every
         else:                            # geometric aug transforms them identically
             ct, tg = item[0].to(dev, non_blocking=True), item[1].to(dev, non_blocking=True)
         ct, tg = A.apply(ct, tg, cfg, nimg=(cin - 5) if cascade != "off" else None)
         if wt is not None:
-            tg, wt = tg[:, :cout], tg[:, cout:]
+            tg, wt = tg[:, :cout_t], tg[:, cout_t:]
         ct = ct.to(memory_format=M.memfmt())
         with autocast(dev):
             pred = model(ct)
-            bce, dice = deep_losses([o.float() for o in pred] if isinstance(pred, (list, tuple)) else pred.float(), tg, ridge_w, wtgt, wt)
+            outs = [o.float() for o in pred] if isinstance(pred, (list, tuple)) else [pred.float()]
+            bce, dice = deep_losses([o[:, :cout_t] for o in outs] if len(outs) > 1 else outs[0][:, :cout_t],
+                                    tg, ridge_w, wtgt, wt)
         loss = bce + dice
+        if aux_on:  # Phase A: every term is computed from tensors this step already holds
+            t_a, w_a = weighted(tg, wtgt)
+            w_a = wt if w_a is None else (w_a if wt is None else w_a * wt)
+            w_a = torch.ones_like(t_a) if w_a is None else w_a
+            # in the AUX dtype (bf16 on the card): the skeleton and the affinity targets are 0/1 fields
+            # the size of the target, and at 256^3 fp32 they alone would be ~1.6 GB of temporaries
+            cv = (lambda q: None if q is None else q.to(aux_dt))
+            ax = L.aux_losses(cv(outs[0]), cv(t_a), cv(w_a),
+                              w_excl=loss_excl, w_selfcons=loss_selfcons, w_skel=loss_skel,
+                              w_affinity=loss_affinity, offsets=offsets, skel_iters=skel_iters,
+                              aff_fg_only=not affinity_all,
+                              cascade=(cv(ct[:, cin - 5:cin - 4]) if cascade != "off" else None),
+                              cascade_self=(cas.last_self if cas is not None else None))
+            if "aux" in ax:
+                loss = loss + ax["aux"].float()
+            aux_log = {k: float(v) for k, v in ax.items()}
         (loss / accum).backward()
         micro += 1
         if micro < accum:
@@ -474,6 +655,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         if step % 20 == 0:
             dt = time.time() - t0
             log("train.jsonl", {"step": step, "loss": loss.item(), "bce": bce.item(), "dice": dice.item(),
+                                **aux_log,
                                 "lr": sched.get_last_lr()[0], "vox_s": round(20 * accum * batch * world * int(np.prod(data.shape3(patch))) / dt),
                                 "vram_MiB": round(torch.cuda.max_memory_allocated() / 2 ** 20) if dev.type == "cuda" else 0,
                                 **({"rung": {str(k): rung_n[k] for k in sorted(rung_n)}} if rung_n else {}),
@@ -488,9 +670,9 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         if (step % eval_every == 0 or step == steps) and main:
             evnet.load_state_dict(ema)
             log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev, wtgt, norad=no_radial, cascade=casval,
-                                            channels=args.get("channels"))})
+                                            channels=args.get("channels"), cout_t=cout_t)})
             try:
-                val_png(out / f"val_{step:06d}.png", evnet, grid, dev, norad=no_radial, cascade=casval)
+                val_png(out / f"val_{step:06d}.png", evnet, grid, dev, norad=no_radial, cascade=casval, cout_t=cout_t)
             except Exception as e:  # a missing PIL must not stop training
                 print("val_png:", repr(e))
             save()
@@ -503,7 +685,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
             if main:
                 evnet.load_state_dict(ema)
                 log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev, wtgt, norad=no_radial, cascade=casval,
-                                            channels=args.get("channels"))})
+                                            channels=args.get("channels"), cout_t=cout_t)})
     save()
     if world > 1:
         dist.barrier()

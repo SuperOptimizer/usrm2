@@ -335,6 +335,7 @@ def _sheetcomp(x, tg, k, m):
 
 # pipeline order (tsm's, extended): resolution -> sharpen -> class contrast -> photometric ->
 # noise -> detector artefacts -> tone -> boxes.  `window`/`volcomp`/`blank` are worker-side (data.py).
+# With cfg["shuffle"] (the `full2` preset) that fixed order is replaced by a per-sample permutation.
 # --- ESRF/nabu reconstruction family: what the recon pipeline itself does differently per scan
 # (pitch 1.13-45.5 um, 53-137 keV, propagation 0.2/1.2/11 m; uint8 ESRF products vs uint16 legacy).
 
@@ -355,6 +356,74 @@ def _haze(c, k):
 
 def _unsharp(c, k):  # nabu's unsharp mask I' = (1+a) I - a Gauss(I, s); its default is a=1, s=1
     return c + _p(c, k["a_lo"], k["a_hi"]) * (c - _blur1(c, _lu(k["s_lo"], k["s_hi"])))
+
+
+# --- Paganin jitter (docs/unified_design.md section 27) -------------------------------------------
+# nabu's phase step is a Fourier-domain LOW-PASS (Paganin 2002) followed by an unsharp mask, both
+# applied to the projections; their net effect on the reconstruction is close to isotropic, so we
+# model the pair as one 3D transfer function.  With f the spatial frequency in cycles/um,
+#
+#     H(f; db) = 1 / (1 + pi * db * lambda * D * f^2)          Paganin, a Lorentzian low-pass
+#     U(f; a, s) = 1 + a * (1 - exp(-2 pi^2 s^2 f^2))          nabu's unsharp, I' = (1+a)I - a G_s*I
+#
+# with db = delta/beta, lambda = 1.2398e-3 / E[keV] um, D = sampleDetectorDistance in um, s the
+# unsharp sigma in um.  (Paganin's own form is 1/(1 + db*lambda*D*|k|^2/(4 pi)) for the ANGULAR
+# wavenumber k = 2 pi f, which is the same thing.)  A scan is reconstructed once, with its own
+# (db0, a0, s0); to ask "what would this cube look like had nabu been run with (db', a', s')" we
+# apply the RATIO of the two transfer functions to the reconstructed cube:
+#
+#     T(f) = H(f; db') U(f; a', s') / (H(f; db0) U(f; a0, s0))
+#          = (1 + L0^2 f^2) / (1 + L1^2 f^2) * U(f; a', s') / U(f; a0, s0),   L^2 = pi db lambda D
+#
+# so the scan's own parameters give T == 1 exactly: the IDENTITY IS IN THE RANGE, which is what makes
+# this safe to switch on for a scan whose metadata we have.  Everything enters as L/vox and s/vox, so
+# the frequency grid is in cycles/VOXEL and the op is scale-aware for free: a coarser rung has a
+# larger voxel, hence a proportionally smaller sigma in voxels, for the same physics.
+# T is clamped to [1/gmax, gmax] (a small db' is a deconvolution and would otherwise amplify the noise
+# floor without bound) and the result is kept inside the sample's own tone range widened by `keep`.
+
+
+def _pscalar(c, lo, hi, log=False):  # (B,1,1,1) per-sample scalar, to broadcast over an (Z,Y,X) freq grid
+    u = torch.empty(c.shape[0], 1, 1, 1, device=c.device, dtype=torch.float32)
+    if log:
+        return u.uniform_(math.log(max(lo, 1e-12)), math.log(max(hi, 1e-12))).exp()
+    return u.uniform_(lo, hi)
+
+
+def _vox_um(k, c):  # the sample's voxel pitch in um: a float, or one per sample
+    v = k.get("vox_um", RUNG2_UM)
+    if isinstance(v, (int, float)):
+        return torch.full((c.shape[0], 1, 1, 1), float(v), device=c.device, dtype=torch.float32)
+    return torch.as_tensor(v, device=c.device, dtype=torch.float32).reshape(-1, 1, 1, 1).expand(c.shape[0], 1, 1, 1)
+
+
+def _paganin_jitter(c, k):
+    """Re-filter the cube as if nabu's Paganin delta/beta and unsharp (coeff, sigma) had been different.
+
+    One rfftn/irfftn; see the block comment above for the maths.  `k` carries the scan's own parameters
+    (`energy_kev`, `dist_mm`, `db`, `a`, `s_um`) and the sampling ranges (`db_lo/db_hi` log-uniform,
+    `a_lo/a_hi` uniform, `s_lo/s_hi` log-uniform, sigmas in MICRONS); `vox_um` (set by `for_rung`) is the
+    sample's voxel pitch."""
+    S = c.shape[2:]
+    vox = _vox_um(k, c)
+    f2 = sum(torch.fft.fftfreq(n, device=c.device, dtype=torch.float32).pow(2)
+             .view([-1 if i == j else 1 for j in range(3)])
+             for i, n in enumerate(S[:2]))  # cycles^2 / voxel^2, the two full-length axes
+    f2 = f2 + torch.fft.rfftfreq(S[2], device=c.device, dtype=torch.float32).pow(2).view(1, 1, -1)
+    lam = 1.2398e-3 / max(float(k.get("energy_kev", 78.0)), 1e-6)          # um
+    L2 = math.pi * lam * float(k.get("dist_mm", 220.0)) * 1e3 / vox.pow(2)  # L^2 per unit delta/beta, vox^2
+    db1 = _pscalar(c, k["db_lo"], k["db_hi"], log=True)
+    a1, s1 = _pscalar(c, k["a_lo"], k["a_hi"]), _pscalar(c, k["s_lo"], k["s_hi"], log=True)
+    db0 = float(k.get("db", 1000.0))
+    u = lambda a, s: 1 + a * (1 - torch.exp(-2 * math.pi ** 2 * (s / vox).pow(2) * f2))  # noqa: E731
+    T = (1 + L2 * db0 * f2) / (1 + L2 * db1 * f2) * u(a1, s1) / u(float(k.get("a", 4.0)),
+                                                                 float(k.get("s_um", 2.88)))
+    g = float(k.get("gmax", 4.0))
+    y = torch.fft.irfftn(torch.fft.rfftn(c.float(), dim=(2, 3, 4)) * T.clamp(1 / g, g).unsqueeze(1),
+                         s=S, dim=(2, 3, 4)).to(c.dtype)
+    lo, hi = c.amin((2, 3, 4), True), c.amax((2, 3, 4), True)
+    m = (hi - lo) * float(k.get("keep", 0.25))  # the filter overshoots at edges; keep the tone range sane
+    return y.clamp(min=lo - m).clamp(max=hi + m)
 
 
 def _quant(c, k):
@@ -386,24 +455,71 @@ def _cor(x, k, m):
 
 
 INTENS = [("bias", _bias), ("lowres", _lowres), ("thick", _thick), ("pool", _pool), ("blur", _blur),
-          ("aniso_blur", _aniso_blur), ("haze", _haze), ("sharpen", _sharpen), ("unsharp", _unsharp),
+          ("aniso_blur", _aniso_blur), ("haze", _haze), ("sharpen", _sharpen),
+          ("paganin", _paganin_jitter), ("unsharp", _unsharp),
           ("class_contrast", _class_contrast), ("gamma", _gamma), ("contrast", _contrast),
           ("bright", _bright), ("noise", _noise), ("mulnoise", _mulnoise), ("spectral_noise", _spectral),
           ("ring", _ring), ("stripe", _stripe), ("tone", _tone), ("quant", _quant), ("zjit", _zjit),
           ("clip", _clip), ("airbox", _boxes), ("cutout", _boxes)]
 
 
-def intensity(c, cfg):
-    for name, f in INTENS:
+# --- sigmas in microns, not voxels (docs/unified_design.md section 27) ----------------------------
+# The PSF-type ops below take a Gaussian sigma.  Their ranges were calibrated on 2.4 um data (rung 2),
+# so their numbers ARE sigma_um / 2.4; `for_rung` rewrites them for another rung as
+# sigma_vox(k) = sigma_um / rung_um(k) = sigma_vox(rung 2) * 2.4 / rung_um(k) = sigma_vox(2) * 2^(2-k),
+# i.e. the same physical blur at every rung, and EXACTLY today's numbers at rung 2.
+# Not converted: `ring`/`stripe` widths (a detector line is a fixed number of DETECTOR pixels, not a
+# fixed length in the sample), `elastic`/`sheetcomp` smoothing (geometry, not a PSF), `haze`'s r_*
+# (a blob count divisor, not a length), and `paganin`'s s_lo/s_hi (already in microns).
+RUNG2_UM = 2.4  # data.rung_um(2); rung k is 0.6 * 2^k um
+SIGMA_KEYS = {"blur": ("lo", "hi"), "sharpen": ("sigma",), "unsharp": ("s_lo", "s_hi"),
+              "aniso_blur": ("z_lo", "z_hi", "yx_lo", "yx_hi"), "haze": ("s_lo", "s_hi")}
+# SinoSynth (arXiv:2409.18355) randomises the COMPOSITION ORDER of its degradation chain per sample,
+# not just each step's occurrence: a fixed order lets the network learn order-specific correlations
+# that no real acquisition chain guarantees.  `cfg["shuffle"]` turns that on for the intensity list.
+
+
+def rung_um(k):
+    return 0.6 * 2.0 ** float(k)
+
+
+def for_rung(cfg, rung=2):
+    """`cfg` with the voxel-defined sigmas rescaled from rung 2 to `rung` (a scalar, or one per sample).
+
+    A per-sample `rung` scales the scalar-sigma ops by the batch's median rung (they draw one sigma for
+    the whole batch anyway) and gives `paganin` the true per-sample pitch, which it applies exactly."""
+    ks = [float(rung)] if isinstance(rung, (int, float)) else [float(v) for v in rung]
+    kmed = sorted(ks)[len(ks) // 2]
+    out, f = dict(cfg), RUNG2_UM / rung_um(kmed)
+    for name, keys in SIGMA_KEYS.items():
         k = cfg.get(name)
         if k:
+            out[name] = {**k, **{q: k[q] * f for q in keys if q in k}}
+    if cfg.get("paganin"):
+        out["paganin"] = {**cfg["paganin"], "vox_um": rung_um(ks[0]) if len(ks) == 1 else [rung_um(v) for v in ks]}
+    return out
+
+
+def intensity(c, cfg):
+    ops = [(n, f, cfg[n]) for n, f in INTENS if cfg.get(n)]
+    if not cfg.get("shuffle"):
+        for name, f, k in ops:
             m = _m(c.shape[0], c.device, k["p"]).bool()
             if m.any():  # an aug that selected no sample of this batch costs nothing (half the time at p=0.3, B=2)
                 c = torch.where(m, f(c, k), c)
+        return c
+    b, n = c.shape[0], len(ops)
+    sel = torch.stack([_m(b, c.device, k["p"]).bool().view(b) for _, _, k in ops], 1)  # (B, n)
+    slot = torch.rand(b, n, device=c.device).argsort(1)  # slot[b, t] = the op sample b applies t-th
+    for t in range(n):
+        for i, (name, f, k) in enumerate(ops):
+            m = sel[:, i] & (slot[:, t] == i)  # only the samples that put op i in slot t, and drew it
+            if m.any():
+                c = torch.where(m.view(b, 1, 1, 1, 1), f(c, k), c)
     return c
 
 
-def apply(x, tg, cfg, nimg=None):
+def apply(x, tg, cfg, nimg=None, rung=None):
     """(B,C,Z,Y,X) input (image channels, then the 3 radial-vector channels) + (B,T,Z,Y,X) target -> augmented
     pair (float32). Intensity augs act on every image channel with the same per-sample parameters.
 
@@ -411,9 +527,15 @@ def apply(x, tg, cfg, nimg=None):
     vector) is what the 13/14-channel stacks always used. A cascade run passes the cube count, so the
     intensity augs leave the CASCADE channel and the scale plane alone: they are not images, and a
     brightness shift would move a dropped (zero) cascade channel off the "no coarse prediction" value the
-    model is taught to read. Spatial augs always act on every channel."""
+    model is taught to read. Spatial augs always act on every channel.
+
+    `rung`: the ladder rung the batch was sampled at (an int, or one per sample), which converts the
+    PSF-type sigmas from microns to voxels (`for_rung`) and gives `paganin` its voxel pitch. The default
+    is rung 2 (2.4 um), where the conversion is the identity and the effective ranges are exactly today's."""
     if not cfg:
         return x, tg
+    if rung is not None:
+        cfg = for_rung(cfg, rung)
     ni = x.shape[1] - 3
     nim = ni if nimg is None else int(nimg)
     x, tg = spatial(x.float(), tg.float(), cfg)
@@ -457,6 +579,14 @@ HAZE = {"haze": {"p": 0.3, "r_lo": 10.0, "r_hi": 40.0, "thr": 0.6, "edge": 0.8,
 UNSHARP = {"unsharp": {"p": 0.3, "a_lo": 0.0, "a_hi": 1.5, "s_lo": 0.5, "s_hi": 3.0}}
 QUANT = {"quant": {"p": 0.5, "lo_lo": 0.005, "lo_hi": 0.05, "hi_lo": 0.95, "hi_hi": 0.995}}
 COR = {"cor": {"p": 0.3, "lo": 0.3, "hi": 1.5, "a_lo": 0.05, "a_hi": 0.15}}
+# Paganin jitter: the scan's own parameters are the 2.4 um 78 keV PHerc-Paris4 B_HA defaults
+# (scanmeta.DEFAULTS), so the identity sits inside the range; the sampled ranges are the corpus span
+# (delta/beta 500-1000, unsharp 4.0 at 2.75-2.88 um) widened 2x each way (scanmeta.ranges_for, which
+# recentres all of this on whatever scan `--scan-meta` names).  s_lo/s_hi are MICRONS.
+PAGANIN = {"paganin": {"p": 0.3, "energy_kev": 78.0, "dist_mm": 220.0, "db": 1000.0, "a": 4.0, "s_um": 2.88,
+                       "db_lo": 250.0, "db_hi": 2000.0, "a_lo": 2.0, "a_hi": 8.0,
+                       "s_lo": 1.375, "s_hi": 5.76, "gmax": 4.0, "keep": 0.25}}
+SHUFFLE = {"shuffle": True}  # SinoSynth-style per-sample composition order for the intensity ops
 
 
 def _pre(*ds):
@@ -498,7 +628,24 @@ PRESETS["p4"] = _pre({"lowres": INTENSITY["lowres"]}, BLANK, VOLCOMP)  # sweeps 
 # helped Paris 4 recall (blank/volcomp 0.61 vs 0.57 baseline) plus the one that generalized (lowres)
 PRESETS["all2_light"] = {k: ({**v, "p": v["p"] / 2} if isinstance(v, dict) else v)
                          for k, v in PRESETS["all2"].items()}
+PRESETS["geo+paganin"] = _pre(PAGANIN)
+PRESETS["geo+shuffle"] = _pre(SCAN, SHUFFLE)
+# full2 = full + the physics-augmentation v2 ops (docs/unified_design.md section 27): the Paganin
+# delta/beta + unsharp jitter and the per-sample artefact order.  `full` itself is untouched.
+PRESETS["full2"] = _pre(SPATIAL, INTENSITY, CUTOUT, SCAN, TONE, THICK, POOL, VOLCOMP, BLANK, ZJIT,
+                        SHEETCOMP, PAGANIN, SHUFFLE)
 
 
-def get(name):
-    return PRESETS[name]
+def get(name, meta=None, rung=None):
+    """The preset `name`, optionally recentred on one scan's metadata and one rung.
+
+    `meta`: a `scanmeta.load()` dict (the `--scan-meta` hook point). Its `ranges_for` overrides are
+    merged PER OP into the ops the preset already configures, so a preset without `paganin` does not
+    grow one and `full` keeps its shape. `rung`: see `apply`/`for_rung`; augmentation ranges are
+    calibrated at rung 2 and converted from microns for anything else."""
+    cfg = PRESETS[name]
+    if meta is not None:
+        from usrm2 import scanmeta
+        r = scanmeta.ranges_for(meta)
+        cfg = {k: ({**v, **r[k]} if k in r and isinstance(v, dict) else v) for k, v in cfg.items()}
+    return cfg if rung is None else for_rung(cfg, rung)

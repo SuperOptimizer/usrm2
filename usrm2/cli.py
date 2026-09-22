@@ -25,7 +25,9 @@ def main(argv=None):
     t.add_argument("--eval-every", type=int, default=500)
     t.add_argument("--val-patches", type=int, default=32)
     t.add_argument("--accum", type=int, default=1, help="gradient accumulation: micro-batches per optimizer step")
-    t.add_argument("--ema", type=float, default=0.999, help="EMA decay of the evaluated weights (0.9995 for 100k+ steps)")
+    t.add_argument("--ema", default="0.999", help="EMA decay of the evaluated weights (0.9995 for 100k+ "
+                   "steps), or 'auto' = 1 - K/--steps with K from --ema-k (a window that is a fixed "
+                   "fraction of the run instead of a fixed 1000 steps)")
     t.add_argument("--lr-floor", type=float, default=0.0, help="cosine decays to this fraction of --lr instead of 0")
     t.add_argument("--ridge-w", type=float, default=0.0, help="extra BCE weight on the band core (target >= 0.9)")
     t.add_argument("--dense-pow", type=float, default=0.0, help="bias sampling towards sheet-dense patches (1-2)")
@@ -71,6 +73,48 @@ def main(argv=None):
     t.add_argument("--no-cascade-noise", action="store_true", help="do NOT roughen the mask-derived cascade channel (it is then a blurred copy of the target: a leak)")
     t.add_argument("--stream", default=None, help="replay a `usrm2 stream-plan` queue directory instead of "
                    "sampling: the windows come from the rolling local buffer the planner fills")
+    # ---- Phase A losses and training recipe (docs/unified_design.md section 26). Every one is OFF by
+    # default and is recorded in the checkpoint args only when it is on, so a run without them is
+    # byte-identical to one started before they existed.
+    t.add_argument("--loss-excl", type=float, default=0.0, metavar="W", help="L3 soft exclusivity: "
+                   "relu(p_recto + p_verso - 1) averaged where BOTH channels carry weight (needs --verso)")
+    t.add_argument("--loss-selfcons", type=float, default=0.0, metavar="W", help="L4 cascade "
+                   "self-consistency: |pool2(p) - pool2(CASCADE)| on the samples whose cascade channel came "
+                   "from the model's own coarse forward (--cascade self|mix). No extra forward")
+    t.add_argument("--loss-skel", type=float, default=0.0, metavar="W", help="L8 skeleton recall: "
+                   "1 - mean predicted probability along the TARGET's medial surface (a GAPS term; watch "
+                   "merge_frac while it is on, a bridge scores well under it)")
+    t.add_argument("--skel-iters", type=int, default=4, help="--loss-skel: erosions used to build the "
+                   "medial surface (the cap of the distance transform, in voxels)")
+    t.add_argument("--affinity", default=None, metavar="OFFSETS", help="O12 long-range affinity: EVEN voxel "
+                   "offsets, e.g. '16,32'. The head grows by 3 channels per offset (one per axis) which "
+                   "predict whether the voxels d/2 back and d/2 forward along that axis are the SAME sheet. "
+                   "Inference and evaluation never read them; a warm start zero-inits their rows")
+    t.add_argument("--loss-affinity", type=float, default=0.0, metavar="W", help="weight of the affinity BCE")
+    t.add_argument("--affinity-all", action="store_true", help="score the affinity channels everywhere "
+                   "instead of only where BOTH voxels of the pair are foreground (the default)")
+    t.add_argument("--cascade-self-p-anneal", type=float, nargs=2, default=None, metavar=("START", "END"),
+                   help="scheduled sampling: anneal --cascade-self-p linearly from START to END over the run")
+    t.add_argument("--sched", default="cosine", choices=["cosine", "wsd"], help="LR schedule: cosine over "
+                   "--steps (unchanged), or warmup-stable-decay (flat after warmup until --stable-until, "
+                   "then cosine over --cooldown). WSD's plateau and cooldown MAY be changed on a resume")
+    t.add_argument("--stable-until", type=int, default=None, help="--sched wsd: step the plateau ends "
+                   "(default: --steps minus --cooldown)")
+    t.add_argument("--cooldown", type=int, default=0, help="--sched wsd: cooldown length (default 10% of --steps)")
+    t.add_argument("--ema-k", type=float, default=None, metavar="K", help="ema_decay = 1 - K / --steps "
+                   "(an averaging window of steps/K; K=50 is 2%%, the middle of the literature's 1-3%%). "
+                   "Overrides --ema")
+    t.add_argument("--rewarm", type=int, default=0, metavar="N", help="on a warm start (--init-from) warm "
+                   "the LR up over N steps instead of --warmup: resuming on a decayed tail generalises worse")
+    t.add_argument("--new-param-lr-mult", type=float, default=1.0, metavar="M", help="a second AdamW param "
+                   "group, at M x LR through the stable phase, for the tensors a warm start GREW (the stem "
+                   "convolution and the heads): new rows carry no memory to protect")
+    t.add_argument("--fuse", default="off", choices=["off", "agreement"], help="how a region teacher store "
+                   "and the exported mask are combined where BOTH cover a voxel: 'off' = the store replaces "
+                   "the mask (what every run so far did), 'agreement' = a confidence-weighted mean whose "
+                   "loss weight is the sources' agreement (usrm2/data.py fuse_agreement)")
+    t.add_argument("--source-w", nargs="*", default=(), metavar="SRC=W", help="per-source loss weights, e.g. "
+                   "'mask=1 store=1'; `usrm2 glc-weights` suggests them from the published meshes")
     sp = sub.add_parser("stream-plan", help="plan and stream the training windows into a rolling disk buffer "
                         "(usrm2/stream.py): the planner IS the sampler")
     sp.add_argument("stores_file")
@@ -186,6 +230,23 @@ def main(argv=None):
     s.add_argument("--cascade", default="auto", choices=["auto", "on", "off"], help="see `predict --cascade`")
     s.add_argument("--cascade-depth", type=int, default=3)
     s.add_argument("--device", default=None)
+    s.add_argument("--ceiling", nargs="?", const="", default=None, metavar="STORE",
+                   help="also score the noise ceiling and print every number as \"value (ceiling)\": the "
+                        "store given here, else --teacher, else the published recto mask pyramid. Cached "
+                        "per (box, store) next to the eval box (docs/unified_design.md section 25)")
+    s.add_argument("--no-ceiling-cache", action="store_true", help="recompute the ceiling, ignoring the cache")
+    s.add_argument("--json", dest="json_out", default=None, metavar="OUT",
+                   help="dump everything (per-surface rows, pooled metrics, bootstrap CIs, Betti, ceiling) as json")
+    s.add_argument("--bootstrap", type=int, default=200, help="bootstrap draws over surfaces for the 95%% CIs (0 = off)")
+    s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--no-betti", action="store_true", help="skip the Betti-0/1 pass (the one costly new metric)")
+    s.add_argument("--betti-margin", type=int, default=8, help="voxels cropped off every box face before counting")
+    s.add_argument("--betti-band", type=float, default=6.0, help="voxels around the mesh the topology is counted in")
+    sc = sub.add_parser("evalsurf-curve", help="fit the plateau of a metric over a run (eval.jsonl or evalsurf --json dumps)")
+    sc.add_argument("run_dir")
+    sc.add_argument("--metric", default="dice", help="a key of eval.jsonl (dice, dice_r2, bce, ...) or of an evalsurf json")
+    sc.add_argument("--unbounded", action="store_true", help="the metric is not confined to [0,1]")
+    sc.add_argument("--json", dest="json_out", default=None)
     t = sub.add_parser("teacher", help="run the upstream teacher over a box")
     t.add_argument("out")
     t.add_argument("--origin", type=int, nargs=3, required=True, metavar=("Z0", "Y0", "X0"))
@@ -242,6 +303,48 @@ def main(argv=None):
     b.add_argument("--streams", type=int, default=1, help="concurrent CUDA streams (with --gpu-acc)")
     b.add_argument("--procs", type=int, default=1, help="worker processes sharing the GPU (each takes every k-th box)")
     b.add_argument("--shard", type=int, nargs=2, default=(0, 1), metavar=("I", "K"), help="(internal) this worker's share")
+    # ----------------------------------------------------- masked-cube pretraining (docs/unified_design.md 28)
+    pt = sub.add_parser("pretrain", help="in-domain masked-cube (MAE-style) pretraining of the SAME encoder/"
+                        "decoder `train` uses: no labels, reconstruct the masked CT. The checkpoint warm-"
+                        "starts a fine-tuning run with `usrm2 train --init <out>/ckpt.pt`")
+    pt.add_argument("out_dir")
+    pt.add_argument("--size", default="1m", choices=list(model_presets()))
+    pt.add_argument("--steps", type=int, default=20000)
+    pt.add_argument("--patch", type=int, nargs="+", default=[256])
+    pt.add_argument("--batch", type=int, default=1)
+    pt.add_argument("--lr", type=float, default=3e-4)
+    pt.add_argument("--workers", type=int, default=4)
+    pt.add_argument("--accum", type=int, default=1)
+    pt.add_argument("--warmup", type=int, default=200)
+    pt.add_argument("--ema", type=float, default=0.999)
+    pt.add_argument("--lr-floor", type=float, default=0.0)
+    pt.add_argument("--eval-every", type=int, default=500)
+    pt.add_argument("--val-patches", type=int, default=4)
+    pt.add_argument("--val", nargs="+", default=None, help="held-out box, excluded from sampling and used for the reconstruction metric")
+    pt.add_argument("--stores", nargs="+", default=None, help="'ct_base,target_group' lines, as `train --stores`: no label is read, the target group only bounds the sampled box")
+    pt.add_argument("--stores-file", default=None, help="text file of those lines (one per line)")
+    pt.add_argument("--rungs", default="0-4", help="rungs to pretrain at (default the fine half, 0-4); rungs no scan is native at are dropped with a message")
+    pt.add_argument("--ctx", nargs="*", default=(), help="context offsets, e.g. 1..9 (must match the fine-tuning run's)")
+    pt.add_argument("--aug", default="geo", help="augmentation preset (see aug.PRESETS)")
+    pt.add_argument("--no-radial", action="store_true")
+    pt.add_argument("--norm", default="patch", choices=["patch", "global"])
+    pt.add_argument("--ckpt-act", type=int, default=0)
+    pt.add_argument("--add-skip", type=int, default=0)
+    pt.add_argument("--deep", type=int, default=0, help="deep supervision levels; the coarse reconstruction heads are dropped by the warm start like the main one")
+    pt.add_argument("--compile", action="store_true")
+    pt.add_argument("--resume", action="store_true")
+    pt.add_argument("--mask-block", type=int, default=32, help="edge of the masked blocks, in voxels")
+    pt.add_argument("--mask-lo", type=float, default=0.5, help="lowest per-sample masking ratio")
+    pt.add_argument("--mask-hi", type=float, default=0.75, help="highest per-sample masking ratio")
+    pt.add_argument("--sheet-p", type=float, default=0.5, help="probability a sample is masked ALONG SHEETS (blocks drawn proportional to their foreground fraction) instead of uniformly")
+    pt.add_argument("--sheet-pct", type=float, default=0.7, help="the CT quantile the foreground proxy thresholds at")
+    pt.add_argument("--no-mask-ctx", action="store_true", help="do NOT blank the context channels' footprint (they then hand the model a coarse copy of the answer)")
+    pt.add_argument("--loss", default="l1", choices=["l1", "l2"], help="reconstruction loss on the masked voxels")
+    pt.add_argument("--no-cascade-slot", action="store_true", help="build the 14-channel stem instead of the 15-channel one (pretrain this way only for a fine-tuning run with --cascade off: warm_start can widen a stem, never narrow one)")
+    pt.add_argument("--rung-aux", type=float, default=0.0, help="weight of the VoCo-flavoured 'which rung' head on the bottleneck (off by default; it hides the scale plane on the steps it scores)")
+    pt.add_argument("--rung-aux-p", type=float, default=0.5, help="fraction of steps that hide the scale plane and score the aux head")
+    pt.add_argument("--fg-min", type=float, default=0.0, help="foreground rejection threshold (0 = take every non-air window: pretraining wants texture, not labels)")
+    pt.add_argument("--air-keep", type=float, default=0.1, help="probability an all-air window is kept")
     a = ap.parse_args(argv)
     from usrm2 import data, model, predict as P, train as T
 
@@ -268,6 +371,10 @@ def main(argv=None):
     def parse_boost(vs):
         return {int(q.split("=")[0]): float(q.split("=")[1]) for q in vs}
 
+    def parse_kv(vs):
+        """'mask=1 store=0.7' -> {"mask": 1.0, "store": 0.7}."""
+        return {q.split("=")[0]: float(q.split("=")[1]) for q in vs}
+
     def parse_cascade(v):
         """`--cascade auto|on|off` at INFERENCE -> what predict.probs wants: None = follow the checkpoint."""
         return None if str(v) == "auto" else (str(v) != "off")
@@ -280,12 +387,19 @@ def main(argv=None):
                              allowed=None if rs is True else rs, boost=parse_boost(a.rung_boost))
         print(data.format_rung_mix(rows))
     elif a.cmd == "train":
-        T.train(a.out_dir, accum=a.accum, ema_decay=a.ema, lr_floor=a.lr_floor, ridge_w=a.ridge_w, dense_pow=a.dense_pow,
+        ema_k = a.ema_k if a.ema_k else (T.EMA_K if str(a.ema).lower() == "auto" else None)
+        T.train(a.out_dir, accum=a.accum, ema_decay=(0.999 if str(a.ema).lower() == "auto" else float(a.ema)), lr_floor=a.lr_floor, ridge_w=a.ridge_w, dense_pow=a.dense_pow,
                 norm=a.norm, ctx=parse_ctx(a.ctx), stream=a.stream, init_from=a.init_from, wtgt=tuple(a.wtgt), compile=a.compile, ckpt_act=a.ckpt_act, add_skip=a.add_skip, deep=a.deep, size=a.size, steps=a.steps, patch=a.patch if len(a.patch) > 1 else a.patch[0], batch=a.batch, lr=a.lr,
                 workers=a.workers, eval_every=a.eval_every, val_patches=a.val_patches, resume=a.resume,
                 aug=a.aug, no_radial=a.no_radial,
                 cascade=a.cascade, cascade_self_p=a.cascade_self_p, cascade_drop=a.cascade_drop,
                 cascade_noise=not a.no_cascade_noise,
+                loss_excl=a.loss_excl, loss_selfcons=a.loss_selfcons, loss_skel=a.loss_skel,
+                loss_affinity=a.loss_affinity, affinity=a.affinity, skel_iters=a.skel_iters,
+                affinity_all=a.affinity_all, cascade_self_p_anneal=a.cascade_self_p_anneal,
+                sched=a.sched, stable_until=a.stable_until, cooldown=a.cooldown,
+                rewarm=a.rewarm, new_param_lr_mult=a.new_param_lr_mult, ema_k=ema_k,
+                fuse=a.fuse, source_w=parse_kv(a.source_w),
                 **({"rungs": parse_rungs(a.rungs), "rung_boost": parse_boost(a.rung_boost),
                     "val_rungs": [int(q) for q in a.val_rungs.split(",")], "require_targets": a.require_targets,
                     "region": a.region, "windows_per_region": a.windows_per_region,
@@ -293,6 +407,18 @@ def main(argv=None):
                     "verso_regions": a.verso_regions, "verso_regions_url": a.verso_regions_url,
                     "cout": a.cout} if a.rungs else {}),
                 **{k: v for k, v in dict(stores=a.stores, stores_file=a.stores_file, val=a.val).items() if v})
+    elif a.cmd == "pretrain":
+        from usrm2 import pretrain as PT
+        PT.pretrain(a.out_dir, size=a.size, steps=a.steps, patch=a.patch if len(a.patch) > 1 else a.patch[0],
+                    batch=a.batch, lr=a.lr, workers=a.workers, warmup=a.warmup, eval_every=a.eval_every,
+                    val_patches=a.val_patches, resume=a.resume, aug=a.aug, no_radial=a.no_radial,
+                    accum=a.accum, ema_decay=a.ema, lr_floor=a.lr_floor, norm=a.norm, ctx=parse_ctx(a.ctx),
+                    compile=a.compile, ckpt_act=a.ckpt_act, add_skip=a.add_skip, deep=a.deep,
+                    rungs=parse_rungs(a.rungs), mask_block=a.mask_block, mask_lo=a.mask_lo,
+                    mask_hi=a.mask_hi, sheet_p=a.sheet_p, sheet_pct=a.sheet_pct,
+                    mask_ctx=not a.no_mask_ctx, loss=a.loss, cascade_slot=not a.no_cascade_slot,
+                    rung_aux=a.rung_aux, rung_aux_p=a.rung_aux_p, fg_min=a.fg_min, air_keep=a.air_keep,
+                    **{k: v for k, v in dict(stores=a.stores, stores_file=a.stores_file, val=a.val).items() if v})
     elif a.cmd == "umbilicus":
         from usrm2 import umbilicus as U
         bases = []
@@ -342,7 +468,12 @@ def main(argv=None):
         E.run(b[:3], b[3:], ckpt=a.ckpt, store=a.store, teacher=a.teacher, tifxyz=a.tifxyz or E.TIFXYZ,
               volume=a.volume, window=a.window, halo=a.halo, device=a.device, png_path=a.png, tta=a.tta, luts=luts,
               head=a.head,  # resolved against the checkpoint's own channel list in predict.probs
-              cascade=parse_cascade(a.cascade), cascade_depth=a.cascade_depth)
+              cascade=parse_cascade(a.cascade), cascade_depth=a.cascade_depth,
+              ceil=a.ceiling, json_out=a.json_out, boot=a.bootstrap, seed=a.seed, betti=not a.no_betti,
+              betti_margin=a.betti_margin, betti_band=a.betti_band, no_ceiling_cache=a.no_ceiling_cache)
+    elif a.cmd == "evalsurf-curve":
+        from usrm2 import evalsurf as E
+        E.curve(a.run_dir, metric=a.metric, bounded=not a.unbounded, out=a.json_out)
     elif a.cmd == "refine":
         from usrm2 import refine
         outs = refine.run(a.surfaces, a.store, a.out, eval_store=a.eval_store, far=a.far, sigma=a.sigma, iters=a.iters, thr=a.thr,

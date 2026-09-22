@@ -875,6 +875,45 @@ def verso_region_url(lo2, base=None):
     return f"{str(base or VERSO_REGIONS_URL).rstrip('/')}/region_{z}_{y}_{x}.zarr"
 
 
+FUSE_MODES = ("off", "agreement")
+
+
+def binary_confidence(p):
+    """1 - H2(p)/ln 2 for p in [0,1]: 1 where a source commits (p = 0 or 1), 0 where it is undecided
+    (p = 0.5). The normalised binary entropy is the cheapest per-voxel confidence that needs nothing
+    but the probability itself."""
+    q = np.clip(np.asarray(p, np.float32), 1e-6, 1 - 1e-6)
+    h = -(q * np.log(q) + (1 - q) * np.log1p(-q)) / np.log(2.0)
+    return (1.0 - h).astype(np.float32)
+
+
+def fuse_agreement(ps, pm, ws=1.0, wm=1.0, floor=0.05):
+    """(probability, weight multiplier) of two teacher sources over the same voxel (R7 / experiment 8).
+
+    Today (`--fuse off`) a region teacher store simply REPLACES the exported mask wherever it covers the
+    window, and the two lineages' bands differ systematically (32 % vs 23 % coverage of a mid-scroll
+    cube), so the choice of which one wins is arbitrary per voxel. `--fuse agreement` instead:
+
+        p   = (a_s p_s + a_m p_m) / (a_s + a_m),   a_x = w_x * (confidence(p_x) + floor)
+        mul = 1 - |p_s - p_m|
+
+    i.e. a CONFIDENCE-weighted mean (the source that commits carries the voxel, UA-MT's "gate by
+    agreement, not by one threshold"), whose loss weight is the sources' AGREEMENT, so a voxel the two
+    lineages disagree about is down-weighted smoothly instead of being decided by lineage order.
+    `w_s` / `w_m` are the per-source weights (`--source-w`, `usrm2 glc-weights`); `floor` keeps a
+    voxel both sources call 0.5 from dividing by zero.
+
+    Both inputs and both outputs are float32 in [0,1]. The pitfall the survey names is that where the
+    two teachers agree AND are both wrong this fuses confidently into the same error: only the meshes
+    can see that, which is what `usrm2 glc-weights` measures.
+    """
+    ps, pm = np.asarray(ps, np.float32), np.asarray(pm, np.float32)
+    a_s = float(ws) * (binary_confidence(ps) + float(floor))
+    a_m = float(wm) * (binary_confidence(pm) + float(floor))
+    p = (a_s * ps + a_m * pm) / np.maximum(a_s + a_m, 1e-6)
+    return p.astype(np.float32), (1.0 - np.abs(ps - pm)).astype(np.float32)
+
+
 def read_teacher(a, k, lo, p, on_reopen=None):
     """(cube, inside) of a region teacher store read at rung k (2, or 3 = its 2x mean pool): the uint8
     probability over the window at corner `lo` (rung-k voxels) and the mask of the voxels the store
@@ -936,7 +975,7 @@ class Patches(torch.utils.data.IterableDataset):
                  fg_keep=0.25, sym=True, aug=None, dense_pow=0.0, dense_ref=0.2, ctx=(), stores_file=None,
                  recheck=200, rungs=None, rung_boost=None, channels=None, require_targets=False, stream=None,
                  region=0, windows_per_region=64, region_fails=0, teacher_regions=None, cascade="off",
-                 verso=False, verso_regions=None):
+                 verso=False, verso_regions=None, fuse="off", source_w=None):
         """dense_pow > 0 biases sampling towards sheet-dense patches: a patch whose target mean m is below
         dense_ref is kept with probability (m / dense_ref) ** dense_pow (crushed windings are where students fail).
         stores_file: instead of `stores`, a text file with one comma-joined group per line that is re-read
@@ -987,6 +1026,12 @@ class Patches(torch.utils.data.IterableDataset):
         # finished verso store covers, the channel's WEIGHT is 0 and the sample trains recto alone.
         self.verso = bool(verso)
         self.verso_regions = (None if verso_regions in (None, "") else str(verso_regions)) or self.teacher_regions
+        # TEACHER FUSION and per-source loss weights (docs/unified_design.md section 26, experiment 8).
+        # "off" is what every run so far did: the region store REPLACES the exported mask. `source_w`
+        # keys are "store" (a region teacher store), "mask" (an exported target pyramid) and "verso".
+        self.fuse = str(fuse or "off")
+        assert self.fuse in FUSE_MODES, f"--fuse {fuse}: one of {FUSE_MODES}"
+        self.source_w = dict(source_w or {})
         self._tstore = {}
         # CASCADE (docs/unified_design.md section 22): the rung-(k+1) prediction as an extra input channel.
         # "off" (nothing changes), "mask" (the rung-(k+1) target block), "self" (the model's own coarse
@@ -1290,13 +1335,33 @@ class Patches(torch.utils.data.IterableDataset):
                 if va is not None:
                     v, ins = self._read_region(va, verso, k, lo)
                     np.copyto(tg[c], v, where=inside_ct)
-                    w[c] = np.where(ins & inside_ct, np.uint8(255), np.uint8(0))
+                    w[c] = np.where(ins & inside_ct,
+                                    np.uint8(min(round(255 * self.source_w.get("verso", 1.0)), 255)),
+                                    np.uint8(0))
                 continue  # no store here: weight 0, i.e. the verso channel is ignored on this sample
             if ta is not None and chan == (ta.attrs.get("channel") or
                                            (list(ta.attrs.get("channels") or []) or [None])[0] or self.channels[0]):
                 v, ins = self._read_region(ta, teacher, k, lo)
+                sw = float(self.source_w.get("store", 1.0))
+                t2 = s["targets"].get(chan)
+                if self.fuse == "agreement" and t2 is not None:
+                    # both lineages cover this voxel: a confidence-weighted mean, weight = agreement
+                    blo, bs = target_box(t2, k)
+                    both = np.zeros(tuple(p), bool)
+                    a = np.maximum(blo - lo, 0)
+                    b = np.minimum(blo + bs - lo, p)
+                    if (b > a).all():
+                        both[a[0]:b[0], a[1]:b[1], a[2]:b[2]] = True
+                    both &= ins
+                    if both.any():
+                        pm = read_rung(t2["pyr"], k, lo, p, dtype=np.uint8).astype(np.float32) / 255.0
+                        pf, mul = fuse_agreement(v.astype(np.float32) / 255.0, pm, sw,
+                                                 float(self.source_w.get("mask", 1.0)) * t2["weight"])
+                        v = np.where(both, np.rint(pf * 255.0).astype(np.uint8), v)
+                        sw = np.where(both, sw * mul, sw).astype(np.float32)
                 np.copyto(tg[c], v, where=inside_ct)
-                w[c] = np.where(ins & inside_ct, np.uint8(255), np.uint8(0))
+                w[c] = np.where(ins & inside_ct, np.clip(np.rint(255 * sw), 0, 255).astype(np.uint8),
+                                np.uint8(0))
                 continue
             t = s["targets"].get(chan)
             if t is None:
@@ -1308,7 +1373,9 @@ class Patches(torch.utils.data.IterableDataset):
             if (b > a).all():
                 ins[a[0]:b[0], a[1]:b[1], a[2]:b[2]] = True
             np.copyto(tg[c], read_rung(t["pyr"], k, lo, p, dtype=np.uint8), where=inside_ct)  # masked CT: no surface
-            w[c] = np.where(ins & inside_ct, np.uint8(round(255 * t["weight"])), np.uint8(0))
+            w[c] = np.where(ins & inside_ct,
+                            np.uint8(min(round(255 * t["weight"] * self.source_w.get("mask", 1.0)), 255)),
+                            np.uint8(0))
         return tg, w
 
     def _open_stream(self):

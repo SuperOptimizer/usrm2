@@ -136,6 +136,11 @@ class Cascade:
         assert self.mode in data.CASCADE_MODES, f"cascade {mode}: one of {data.CASCADE_MODES}"
         self.self_p, self.drop, self.noise, self.net = float(self_p), float(drop), bool(noise), net
         self.gen = None if seed is None else torch.Generator().manual_seed(int(seed))
+        # (B,) 1 where the last `channel()` call took the SELF source for that sample. The cascade
+        # self-consistency loss (usrm2/losses.py, section 26) scores ONLY those samples: the `mask`
+        # source is the coarse TARGET, so a consistency term against it would be a second, blurrier
+        # copy of the supervised loss, and a dropped channel is all zeros.
+        self.last_self = None
 
     @property
     def on(self):
@@ -215,6 +220,8 @@ class Cascade:
         if not self.on:
             return out
         rung = b["rung"].reshape(-1).tolist()
+        sel = torch.zeros(B, dtype=dtype, device=dev)
+        self.last_self = sel
         for i in range(B):
             if int(rung[i]) + 1 >= data.NRUNGS:      # rung 11: no rung above it, so no coarse prediction
                 continue
@@ -223,6 +230,7 @@ class Cascade:
             if self.mode == "self" or (self.mode == "mix" and float(self._rand()) < self.self_p):
                 assert self.net is not None and "cx" in b, "cascade self mode needs a net and the tenth context cube"
                 out[i:i + 1] = self._self(b, i, dev, dtype, S)
+                sel[i] = 1
             else:
                 out[i:i + 1] = self._mask(b, i, dev, dtype, S)
         return out
