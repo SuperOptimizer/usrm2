@@ -267,6 +267,8 @@ def main(argv=None):
     s.add_argument("--no-betti", action="store_true", help="skip the Betti-0/1 pass (the one costly new metric)")
     s.add_argument("--betti-margin", type=int, default=8, help="voxels cropped off every box face before counting")
     s.add_argument("--betti-band", type=float, default=6.0, help="voxels around the mesh the topology is counted in")
+    s.add_argument("--betti-dilate", type=float, default=2.0, help="thicken the rasterized mesh by this many "
+                   "voxels before counting, so a one-voxel staircase is not compared with a 3-5 voxel band")
     sc = sub.add_parser("evalsurf-curve", help="fit the plateau of a metric over a run (eval.jsonl or evalsurf --json dumps)")
     sc.add_argument("run_dir")
     sc.add_argument("--metric", default="dice", help="a key of eval.jsonl (dice, dice_r2, bce, ...) or of an evalsurf json")
@@ -511,7 +513,8 @@ def main(argv=None):
               head=a.head,  # resolved against the checkpoint's own channel list in predict.probs
               cascade=parse_cascade(a.cascade), cascade_depth=a.cascade_depth,
               ceil=a.ceiling, json_out=a.json_out, boot=a.bootstrap, seed=a.seed, betti=not a.no_betti,
-              betti_margin=a.betti_margin, betti_band=a.betti_band, no_ceiling_cache=a.no_ceiling_cache)
+              betti_margin=a.betti_margin, betti_band=a.betti_band, betti_dilate=a.betti_dilate,
+              no_ceiling_cache=a.no_ceiling_cache)
     elif a.cmd == "evalsurf-curve":
         from usrm2 import evalsurf as E
         E.curve(a.run_dir, metric=a.metric, bounded=not a.unbounded, out=a.json_out, smooth=a.smooth, tail=a.tail)
