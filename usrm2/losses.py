@@ -111,7 +111,7 @@ def skel_recall(p, tgt, wv=None, iters=4, thr=0.5):
 
 def parse_offsets(spec):
     """`--affinity 16,32` -> (16, 32). Offsets are EVEN and in voxels at the sample's own rung."""
-    if spec in (None, "", False):
+    if spec is None or spec is False or (not isinstance(spec, (int, float)) and len(spec) == 0):
         return ()
     if isinstance(spec, (list, tuple)):
         vs = [int(v) for v in spec]

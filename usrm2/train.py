@@ -331,7 +331,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
           loss_excl=0.0, loss_selfcons=0.0, loss_skel=0.0, loss_affinity=0.0, affinity=None,
           skel_iters=4, affinity_all=False, cascade_self_p_anneal=None,
           sched="cosine", stable_until=None, cooldown=0, ema_k=None, rewarm=0, new_param_lr_mult=1.0,
-          fuse="off", source_w=None, **kw):
+          fuse="off", source_w=None, scan_meta=None, **kw):
     """accum: gradient accumulation (micro-batches per optimizer step), for big models on small cards.
     lr_floor: the cosine decays to lr_floor * lr instead of 0. norm: "patch" (per-patch z-score) or "global"
     (fixed scan mean/std, stored in the checkpoint). dense_pow / ridge_w: see data.Patches / losses.
@@ -392,13 +392,17 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         device = f"cuda:{local}"
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    cfg = dict(A.get(aug), **({"norad": True} if no_radial else {}))
+    # `--scan-meta`: recentre the scan-domain augmentation ranges on ONE scan's recorded metadata
+    # (usrm2/scanmeta.py). Without it `A.get(aug)` is exactly the preset, as before.
+    meta = None if not scan_meta else __import__("usrm2.scanmeta", fromlist=["load"]).load(scan_meta)
+    cfg = dict(A.get(aug, meta=meta), **({"norad": True} if no_radial else {}))
     no_radial = bool(cfg.get("norad"))
     patch = int(patch[0]) if not np.isscalar(patch) and len(patch) == 1 else (patch if np.isscalar(patch) else [int(v) for v in patch])
     args = dict(size=size, steps=steps, patch=patch, batch=batch, lr=lr, aug=aug, aug_cfg=cfg,
                 no_radial=no_radial, accum=accum, ema_decay=ema_decay, lr_floor=lr_floor, ridge_w=ridge_w, wtgt=list(wtgt),
                 dense_pow=dense_pow, norm=norm, ctx=list(ctx), world=world,
-                stream=str(stream) if stream else None, **kw)
+                stream=str(stream) if stream else None,
+                **({"scan_meta": str(scan_meta)} if scan_meta else {}), **kw)
     cascade = str(cascade or "off")
     assert cascade in data.CASCADE_MODES, f"--cascade {cascade}: one of {data.CASCADE_MODES}"
     assert cascade == "off" or rungs is not None, "--cascade needs the rung ladder (--rungs)"
@@ -617,7 +621,10 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
             tg = torch.cat([tg, wt], 1)  # the weights ride along as extra target channels so every
         else:                            # geometric aug transforms them identically
             ct, tg = item[0].to(dev, non_blocking=True), item[1].to(dev, non_blocking=True)
-        ct, tg = A.apply(ct, tg, cfg, nimg=(cin - 5) if cascade != "off" else None)
+        # the PSF-type augmentation sigmas are defined in MICRONS, so they are converted to voxels at
+        # the rung this batch was drawn at (`aug.for_rung`); rung 2 is the identity, i.e. bit-identical
+        ct, tg = A.apply(ct, tg, cfg, nimg=(cin - 5) if cascade != "off" else None,
+                         rung=(item["rung"].reshape(-1).tolist() if isinstance(item, dict) else None))
         if wt is not None:
             tg, wt = tg[:, :cout_t], tg[:, cout_t:]
         ct = ct.to(memory_format=M.memfmt())
