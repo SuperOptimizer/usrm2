@@ -228,7 +228,7 @@ def up2x_np(a):
 
 
 def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, tta=0, luts=(), head=0, radial_sign=1.0, batch=1, rung=None,
-          cascade=None, cascade_depth=3):
+          cascade=None, cascade_depth=3, calib=True):
     """Sliding-window recto probability (float32) over a box; returns (prob, checkpoint state).
     tta: number of axis flips to average; luts: intensity LUTs (uint8->float) whose predictions are averaged in;
     head: which OUTPUT CHANNEL to write -- an index, a channel name of the checkpoint ("recto" / "verso",
@@ -270,11 +270,18 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
     depth0 = 0 if (off or not use_cas) else max(int(cascade_depth), 0)  # 0 = the channel is fed as zeros
     head = resolve_head(head, st["args"])
     pick = (lambda p: p) if head == "all" else HEADS[head] if isinstance(head, str) else (lambda p: p[:, int(head)])
-    fn = lambda t: pick(torch.sigmoid(net(t)))  # (B,C,...) -> (B,...)  (or (B,C,...) for "all")
+    # A run with `--affinity` carries extra output channels that exist only for the training loss
+    # (docs/unified_design.md section 26): inference never reads them, so the head is cut to `cout_t`
+    # before anything selects or reduces over channels.
+    ct_n = int(st["args"].get("cout_t", st["args"].get("cout", 1)))
+    # PER-RUNG TEMPERATURE (usrm2/calib.py): a no-op unless `usrm2 calibrate` has written `args["temps"]`
+    from usrm2 import calib as CAL
+    temp = lambda kk_: CAL.temp_for(st["args"], kk_, use=calib)  # noqa: E731
+    logits = lambda t, kk_: net(t)[:, :ct_n] / temp(kk_)  # noqa: E731
+    fn = lambda t: pick(torch.sigmoid(logits(t, k)))  # (B,C,...) -> (B,...)  (or (B,C,...) for "all")
     if tta > 1:
         assert head != "all", "tta and head=all do not combine"
         fn = flips_vec(fn, tta)
-    fn0 = lambda t: torch.sigmoid(net(t))[:, 0]  # the coarse passes only ever need head 0
 
     def cascade_for(kk_, o, s, depth):
         """The rung-(kk_+1) prediction over the footprint of the box (o, s), upsampled 2x onto that box's
@@ -303,6 +310,7 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
     def at_rung(kk_, o, s, depth):
         """Head-0 probability over a box at rung kk_ (rung-kk_ voxels), cascading `depth` rungs above it."""
         sub = data.read_rung(data.rungs(volume), kk_, o, s).astype(np.uint8)
+        fn0 = lambda t: torch.sigmoid(logits(t, kk_))[:, 0]  # the coarse passes only ever need head 0
         return slide(fn0, sub, window, halo, dev, make_prep(kk_, o, cascade_for(kk_, o, s, depth)))
 
     casc = cascade_for(k, (z0, y0, x0), (Z, Y, X), depth0) if use_cas else None
@@ -334,9 +342,9 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
 
 
 def predict(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=None, volcomp=True, tta=0, luts=(), head=0, radial_sign=1.0, rung=None,
-            cascade=None, cascade_depth=3):
+            cascade=None, cascade_depth=3, calib=True):
     prob, st = probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=window, halo=halo, device=device, tta=tta, luts=luts, head=head, radial_sign=radial_sign, rung=rung,
-                     cascade=cascade, cascade_depth=cascade_depth)
+                     cascade=cascade, cascade_depth=cascade_depth, calib=calib)
     h = resolve_head(head, st["args"])
     ch = [str(c) for c in (st["args"].get("channels") or CHANNEL_DEFAULT)]
     # the store says WHICH output it holds: the region loaders key the verso stores on it
