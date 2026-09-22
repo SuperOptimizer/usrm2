@@ -16,6 +16,8 @@ The four terms, in the order of `docs/research/synthesis_v2_with_literature.md` 
 All of them are computed from tensors that already exist at the loss site: no extra forward, no extra
 store, no extra loader channel.
 """
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -232,3 +234,297 @@ def aux_losses(logit, tgt, wv, w_excl=0.0, w_selfcons=0.0, w_skel=0.0, w_affinit
     if total is not None:
         out["aux"] = total
     return out
+
+
+# ============================================================ PHASE B / C (section 29)
+# Distance regression, the Eikonal regulariser, normals, construction-based pairing and the topology
+# pilot. Everything below is reached only when a `--sdist` / `--pair` / `--loss-ect` flag is set; with
+# none of them `aux_losses` and `train.py` behave exactly as they did for Phase A.
+
+UNIT = 0.25    # voxels per uint8 code step of a distance store (usrm2/targets.py)
+OFF = 128.0    # the code of distance 0
+CAP = 31.75    # the representable range, +- this many voxels
+TMIN = 3.0     # the floor on a sheet thickness, in voxels (see `pair_bands`)
+WMIN = 0.95    # a distance voxel counts only at (almost) full weight: see `dist_weight`
+
+
+def decode_signed(u):
+    """A loader target channel (0..1, i.e. code / 255) -> voxels. `targets.decode_signed` in torch."""
+    return (u * 255.0 - OFF) * UNIT
+
+
+def decode_unsigned(u):
+    return u * 255.0 * UNIT
+
+
+def dist_weight(w):
+    """The per-voxel weight of a DISTANCE channel: the loader's weight, hard-gated at `WMIN`.
+
+    The spatial augmentations resample the target and the weight together, so a voxel on the boundary
+    between a real distance and a no-data code comes out of `aug.warp` with a fractional weight and an
+    INTERPOLATED value -- and interpolating across the no-data code 0 (which decodes to -32 voxels, not
+    to "nothing") gives a number that is simply wrong. For a probability channel that is a harmless soft
+    edge; for a distance channel it is a bogus target, so a partially-weighted distance voxel is dropped
+    instead of down-weighted. Inside a block of valid data the weight is exactly 1 and nothing is lost."""
+    return w * (w >= WMIN).to(w.dtype)
+
+
+def grad3(d):
+    """Central differences of (B,1,Z,Y,X) along z, y, x -> (B,3,Z,Y,X), in units of "per voxel".
+
+    The field is replicate-padded, so the outermost voxel of each face gets a ONE-SIDED difference, which
+    is half the true slope of a linear field. Every caller therefore drops a one-voxel border from the
+    weight (`border_mask`) rather than pretending the face is interior."""
+    g = []
+    for a in (2, 3, 4):
+        pad = [0] * 6
+        i = 2 * (4 - a)
+        pad[i] = pad[i + 1] = 1
+        p = F.pad(d, pad, mode="replicate")
+        n = p.shape[a]
+        g.append(0.5 * (p.narrow(a, 2, n - 2) - p.narrow(a, 0, n - 2)))
+    return torch.cat(g, 1)
+
+
+def border_mask(x, n=1):
+    """1 in the interior, 0 in the outer `n` voxels of every face; shaped to broadcast over `x`."""
+    m = torch.ones_like(x[:, :1])
+    m[..., :n, :, :] = m[..., -n:, :, :] = 0
+    m[..., :, :n, :] = m[..., :, -n:, :] = 0
+    m[..., :, :, :n] = m[..., :, :, -n:] = 0
+    return m
+
+
+def normals_from(d, eps=1e-4):
+    """Unit normals from a predicted signed distance field: `n = grad(d) / |grad(d)|`, (B,3,Z,Y,X).
+
+    The sign follows from the target's: d grows towards the RECTO side (radially outward), so grad(d)
+    points from verso to recto and `dot(n, radial) > 0`, which is the tracer contract's convention
+    (docs/research/synthesis_v2_with_literature.md section 2). No extra output channels and no extra
+    parameters -- this is `--normals derive`.
+
+    `lit_implicit_surfaces_manifold.md` warns that a ReLU/SiLU conv decoder has piecewise-constant
+    gradients, so a normal read off the decoder's own AUTOGRAD gradient is noisy; this is not that. It is
+    a finite difference of the PREDICTED FIELD's values, which is what the export does to the stored
+    field (there with a Scharr kernel), so the training-time normal and the exported one are the same
+    quantity computed the same way."""
+    g = grad3(d)
+    return g / g.norm(dim=1, keepdim=True).clamp_min(eps)
+
+
+def sdist_loss(pred, tgt, w, delta=2.0, cap=CAP, logvar=None):
+    """Clamped Huber of a predicted distance (in VOXELS) against the decoded target, on weight > 0.
+
+    `pred` (B,1,Z,Y,X) is the head's raw output -- the head predicts voxels directly, so a zero-initialised
+    row (`warm_start`'s policy for a regression channel) says "the surface is here", which is the
+    encoding's own zero (code 128). `tgt` is the loader's 0..1 channel and is decoded and clamped to the
+    store's range, so a target the encoder saturated cannot pull the prediction past the cap.
+
+    `logvar` (B,1,...), when given, is the heteroscedastic log-variance channel (`--sdist-hetero`):
+
+        L = exp(-s) * huber(pred, tgt) + 0.5 * s
+
+    the standard Gaussian-likelihood form with the residual replaced by the Huber (Kendall & Gal 2017;
+    `lit_implicit_surfaces_manifold.md`). The model may raise s where it cannot localise the surface --
+    which is exactly the `conf` channel the tracer contract asks for, obtained free rather than as a
+    separate head (`predict.probs(head="conf")` turns it into 1 / (1 + exp(s/2))).
+    """
+    t = decode_signed(tgt).clamp(-cap, cap)
+    h = F.huber_loss(pred, t, reduction="none", delta=float(delta))
+    if logvar is not None:
+        s = logvar.clamp(-8.0, 8.0)
+        h = torch.exp(-s) * h + 0.5 * s
+    return (h * w).sum() / w.sum().clamp_min(1e-6)
+
+
+def thickness_loss(pred, tgt, w, delta=2.0):
+    """Huber of a predicted thickness (voxels, already positive: see `soft_thickness`) against the store."""
+    t = decode_unsigned(tgt)
+    return (F.huber_loss(pred, t, reduction="none", delta=float(delta)) * w).sum() / w.sum().clamp_min(1e-6)
+
+
+def eikonal(d, w, band=8.0, tgt=None):
+    """`mean (|grad d| - 1)^2` over the BAND: the voxels the field says are within `band` of a surface.
+
+    IGR (Gropp et al., ICML 2020): the Eikonal residual is what makes a regressed field an actual
+    distance function between the samples that pin it down. It carries NO localisation on its own -- the
+    Huber term does that -- so it is a regulariser, not a supervision term, and it is evaluated where the
+    field matters: near the zero level set. The band is taken from the TARGET when there is one (so the
+    term cannot be satisfied by pushing the predicted surface out of the patch) and from the prediction
+    otherwise. The one-voxel border is dropped: `grad3` has a one-sided difference there."""
+    g = grad3(d).norm(dim=1, keepdim=True)
+    ref = d if tgt is None else decode_signed(tgt)
+    m = w * (ref.abs() <= float(band)).to(w.dtype) * border_mask(d)
+    return (((g - 1.0) ** 2) * m).sum() / m.sum().clamp_min(1e-6)
+
+
+def normal_head_loss(nh, d, w, band=8.0, tgt=None):
+    """`--normals head`: the three explicit normal channels are pulled onto the normalised gradient of the
+    predicted distance field (detached), plus a unit-norm term.
+
+    There is no normal TARGET in any store -- a normal is a derived quantity, and the contract derives it
+    from the stored distance field. So the head is a distillation of `normals_from` into three channels
+    that inference can read without a finite difference (and that a later loss can use directly). With
+    `--normals derive` the head does not exist and `normals_from` is used everywhere instead."""
+    ref = normals_from(d).detach()
+    ref_n = ref  # already unit
+    m = w * border_mask(d)
+    if tgt is not None:
+        m = m * (decode_signed(tgt).abs() <= float(band)).to(m.dtype)
+    e = ((nh - ref_n) ** 2).sum(1, keepdim=True) + (nh.norm(dim=1, keepdim=True) - 1.0) ** 2
+    return (e * m).sum() / m.sum().clamp_min(1e-6)
+
+
+# --------------------------------------------------------- construction-based pairing (`--pair construct`)
+
+def soft_thickness(raw, tmin=TMIN):
+    """`t = tmin + softplus(raw)`: a predicted thickness that CANNOT go below the minimum physical sheet
+    thickness, whatever the head says. A zero-initialised head row gives `tmin + ln 2`."""
+    return float(tmin) + F.softplus(raw)
+
+
+def band_fn(u, half=1.5, tau=0.5):
+    """The soft band: `sigmoid((half - |u|) / tau)`, 0.5 exactly at |u| = half.
+
+    One function, used for both faces, so the pair is symmetric by construction."""
+    return torch.sigmoid((float(half) - u.abs()) / float(tau))
+
+
+def pair_logits(m, t, half=1.5, tau=0.5):
+    """The LOGITS of `pair_bands`: `(half - |m -+ t/2|) / tau`, which is what the BCE wants.
+
+    `band_fn` is a sigmoid, so its logit is its argument -- no `log(p / (1 - p))` round trip, no
+    saturation, and the BCE of the constructed pair is as numerically well behaved as the learned one's.
+    """
+    h = 0.5 * t
+    return (float(half) - (m - h).abs()) / float(tau), (float(half) - (m + h).abs()) / float(tau)
+
+
+def pair_bands(m, t, half=1.5, tau=0.5):
+    """(p_recto, p_verso) built from a midline distance `m` and a thickness `t`, as bands at m = +- t/2.
+
+        p_recto = band(m - t/2)        p_verso = band(m + t/2)
+
+    with `band(u) = sigmoid((half - |u|) / tau)`. The recto face sits at m = +t/2 because m is signed
+    POSITIVE on the recto (radially outward) side, which is the stores' convention and the radial
+    channel's (usrm2/targets.py).
+
+    These two CANNOT overlap when `t >= 2 * half`, exactly, not approximately. For 0 <= m <= t/2 the two
+    arguments are a1 = (half - t/2 + m)/tau and a2 = (half - t/2 - m)/tau, so a2 <= -a1 whenever
+    t >= 2*half, and sigmoid(a1) + sigmoid(a2) <= sigmoid(a1) + sigmoid(-a1) = 1. For |m| > t/2 (>= half)
+    the two arguments sum to 2(half - |m|)/tau <= 0 and the same bound applies; the case m < 0 is the
+    mirror image. So `relu(p_r + p_v - 1)` -- the L3 exclusivity loss -- is identically ZERO for every
+    (m, t) with t >= 2*half, which is what `--pair construct` buys and what `soft_thickness(tmin=2*half)`
+    guarantees. `--loss-excl` is kept as a backstop for the LEARNED channels, which still exist unless
+    `--pair construct-only`.
+    """
+    a, b = pair_logits(m, t, half, tau)
+    return torch.sigmoid(a), torch.sigmoid(b)
+
+
+# ---------------------------------------------------------------- the topology pilot (`--loss-ect`)
+
+def fib_dirs(n, device=None, dtype=torch.float32):
+    """`n` roughly-uniform directions on the sphere (the Fibonacci spiral), (n,3) in ZYX order.
+    Deterministic, so a resume replays the same loss to the last float."""
+    i = torch.arange(n, device=device, dtype=torch.float64) + 0.5
+    z = 1.0 - 2.0 * i / n
+    r = (1.0 - z * z).clamp_min(0.0).sqrt()
+    a = i * math.pi * (3.0 - math.sqrt(5.0))
+    return torch.stack([z, r * torch.cos(a), r * torch.sin(a)], 1).to(dtype)
+
+
+def chi_cells(p):
+    """The eight cell families of the cubical complex of a (B,1,Z,Y,X) soft occupancy field.
+
+    A cubical complex on a voxel grid has one VERTEX per voxel, an EDGE for each pair of neighbouring
+    voxels along an axis, a FACE for each 2x2 square in a coordinate plane and a CUBE for each 2x2x2
+    block. For a BINARY field a cell is present iff all its vertices are, i.e. it is the PRODUCT of
+    them; for a soft field that same product is the probability the cell is present under independent
+    voxels, so `V - E + F - C` over the products is the EXPECTED Euler characteristic -- and it is
+    differentiable, which is the whole point.
+
+    Returns [(sign, cell tensor, spanned axes), ...]; a cell tensor is indexed by its LOWEST corner and
+    `spanned` says along which axes it has a second corner (which is what fixes its filtration height).
+    """
+    v = p
+    ez = v[:, :, :-1] * v[:, :, 1:]
+    ey = v[:, :, :, :-1] * v[:, :, :, 1:]
+    ex = v[..., :-1] * v[..., 1:]
+    fzy = ez[:, :, :, :-1] * ez[:, :, :, 1:]
+    fzx = ez[..., :-1] * ez[..., 1:]
+    fyx = ey[..., :-1] * ey[..., 1:]
+    cu = fzy[..., :-1] * fzy[..., 1:]
+    return [(1.0, v, ()), (-1.0, ez, (0,)), (-1.0, ey, (1,)), (-1.0, ex, (2,)),
+            (1.0, fzy, (0, 1)), (1.0, fzx, (0, 2)), (1.0, fyx, (1, 2)), (-1.0, cu, (0, 1, 2))]
+
+
+def ect(p, dirs, res=16):
+    """The Euler Characteristic Transform of a (B,1,Z,Y,X) soft field: (B, n_dirs, res).
+
+    For a direction `xi` and a height `h`, the entry is the expected Euler characteristic of the part of
+    the complex whose vertices all satisfy `<v, xi> <= h` -- the classic ECT sweep. A cell enters at the
+    height of its HIGHEST corner, and because `<v, xi>` is LINEAR that height is the lowest corner's plus
+    `sum over the spanned axes of max(0, xi_axis)`: no search, one add. So the whole transform is, per
+    direction, eight `index_add_`s with FIXED (geometry-only, gradient-free) bin indices and the
+    differentiable cell products as values, followed by a cumulative sum over the height axis.
+
+    This is the "fast chi" family of arXiv:2507.23763 (and the chi variant of villa's `ect_loss.py`): no
+    persistence diagram, no matching, no C++ dependency. `lit_topology_merge_losses.md` names it the
+    correct Phase-C topology pilot; the Betti-matching route is the fallback and a hard C++ dependency.
+    """
+    B, _, Z, Y, X = p.shape
+    dev = p.device
+    D = int(dirs.shape[0])
+    g = [torch.arange(n, device=dev, dtype=torch.float32) for n in (Z, Y, X)]
+    out = p.new_zeros((B, D, res))
+    cells = chi_cells(p)
+    for j in range(D):
+        xi = dirs[j].to(torch.float32)
+        h = (xi[0] * g[0])[:, None, None] + (xi[1] * g[1])[None, :, None] + (xi[2] * g[2])[None, None, :]
+        lo = float(h.min()) + min(float(xi.clamp_min(0).sum()), 0.0)
+        hi = float(h.max()) + float(xi.clamp_min(0).sum())
+        sc = (res - 1) / max(hi - lo, 1e-6)
+        for sg, cell, spanned in cells:
+            nz, ny, nx = cell.shape[2], cell.shape[3], cell.shape[4]
+            top = float(sum(max(float(xi[a]), 0.0) for a in spanned))
+            b = ((h[:nz, :ny, :nx] + top - lo) * sc).round().clamp(0, res - 1).to(torch.long).reshape(-1)
+            out[:, j].index_add_(1, b, (sg * cell).reshape(B, -1).to(out.dtype))
+    return out.cumsum(-1)
+
+
+def ect_loss(p, tgt, dirs=8, res=16, margin=8, block=32, nblocks=4, thr=0.5):
+    """Mean squared difference between the ECT of the predicted probability and of the target, over
+    interior sub-blocks.
+
+    The crop is the single most important detail: a topology loss computed on a cropped patch sees every
+    sheet truncated at the patch face and produces a spurious gradient at every crop edge, which is the
+    known failure mode of the whole persistent-homology family. So the loss is computed only on
+    `nblocks` sub-blocks of side `block` taken from the interior of the patch, at least `margin` voxels
+    from every face, chosen on a fixed stride (no rng: a resume replays the same loss).
+
+    The transform is normalised by the number of vertices of a sub-block, so the value does not depend on
+    `block`; it is 0 for identical inputs and finite for any input."""
+    B, _, Z, Y, X = p.shape
+    lo = [margin] * 3
+    hi = [Z - margin, Y - margin, X - margin]
+    if any(hi[i] - lo[i] < block for i in range(3)):
+        return p.sum() * 0.0
+    starts = []
+    for i in range(3):
+        n = max((hi[i] - lo[i]) // block, 1)
+        starts.append([lo[i] + j * (hi[i] - lo[i] - block) // max(n - 1, 1) for j in range(n)])
+    grid = [(z, y, x) for z in starts[0] for y in starts[1] for x in starts[2]]
+    step = max(len(grid) // max(int(nblocks), 1), 1)
+    grid = grid[::step][:max(int(nblocks), 1)]
+    d = fib_dirs(int(dirs), device=p.device)
+    t = (tgt[:, :1] >= thr).to(p.dtype)
+    # every sub-block of every sample is stacked into the BATCH dimension, so the whole term is two
+    # `ect` calls whatever `nblocks` is: the transform is 8 products and 8 index_adds per direction and
+    # the kernel launches, not the arithmetic, are what it costs.
+    pb = torch.cat([p[:, :1, z:z + block, y:y + block, x:x + block] for (z, y, x) in grid])
+    tb = torch.cat([t[:, :1, z:z + block, y:y + block, x:x + block] for (z, y, x) in grid])
+    n = float(block ** 3)
+    with torch.no_grad():
+        b = ect(tb, d, res) / n
+    return ((ect(pb, d, res) / n - b) ** 2).mean()
