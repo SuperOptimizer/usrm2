@@ -377,7 +377,7 @@ class Planner:
                  val=None, jobs=48, report=30.0, limit=0, val_rungs=data.VAL_RUNGS, val_patches=32,
                  region=0, windows_per_region=64, walk=None, active_regions=4, epochs=1, region_fails=0,
                  teacher_regions=None, visits_max=64, cascade="off", verso=False, verso_regions=None,
-                verso_url=None):
+                verso_url=None, planes=(), scan_meta=None):
         from usrm2 import aug as A
         self.dir = str(queue)
         self.stores_file, self.seed, self.W, self.ahead = str(stores_file), int(seed), int(workers), int(ahead)
@@ -390,7 +390,12 @@ class Planner:
                        region=int(region or 0), windows_per_region=int(windows_per_region),
                        region_fails=int(region_fails or 0), teacher_regions=teacher_regions,
                        cascade=str(cascade or "off"), verso=bool(verso),
-                       verso_regions=str(verso_regions) if verso_regions else teacher_regions)
+                       verso_regions=str(verso_regions) if verso_regions else teacher_regions,
+                       planes=data.parse_planes(planes), scan_meta=scan_meta)
+        # The METADATA / RADIUS planes (section 29) change the STEM, so a queue planned with one plane
+        # set may only be replayed by a run that builds the same one; meta.json records it and
+        # `data.Patches._open_stream` asserts it, exactly as it does for --ctx and --cascade.
+        self.planes = data.parse_planes(planes)
         # THE VERSO OUTPUT (docs/unified_design.md section 23). The verso target has no pyramid: it is
         # published, region by region, as the pod finishes it. With `--verso-regions-url` the planner
         # fetches a region's store the first time it plans that region -- two objects, `zarr.json` and the
@@ -632,6 +637,7 @@ class Planner:
                 "rungs": self.kw["rungs"] if self.kw["rungs"] is True else sorted(self.kw["rungs"]),
                 "rung_boost": {str(k): v for k, v in self.kw["rung_boost"].items()},
                 "aug": self.cfg, "dense_pow": self.kw["dense_pow"], "cascade": self.cascade,
+                "planes": list(self.planes),
                 "require_targets": self.require_targets, "channels": self.ds.channels,
                 "region": self.kw["region"], "windows_per_region": self.kw["windows_per_region"],
                 "walk": self.walk_mode, "active_regions": self.K, "epochs": self.epochs,

@@ -58,6 +58,47 @@ def radial_t(cyx, lo, shape, dtype=torch.float32, out=None):
     return out
 
 
+def radius_t(cyx, lo, shape, rmax, dtype=torch.float32, out=None):
+    """`data.radius` on the device: (B,1,Z,Y,X) of `clip(r / r_max, 0, 1)`, the normalised distance from
+    the scroll axis (section 21 item 2, section 29). Same axis interpolation as `radial_t`, so the
+    direction channel and the distance channel cannot disagree; `rmax` (B,) is in the sample's own rung
+    voxels (`data.Patches._plane_extras`)."""
+    Z, Y, X = (int(v) for v in shape)
+    dev = cyx.device
+    ay = torch.arange(Y, device=dev, dtype=torch.float64) + lo[:, 1, None]
+    ax = torch.arange(X, device=dev, dtype=torch.float64) + lo[:, 2, None]
+    dy = (ay[:, None, :] - cyx[:, 0][:, :, None]).to(dtype)[..., None]   # (B,Z,Y,1)
+    dx = (ax[:, None, :] - cyx[:, 1][:, :, None]).to(dtype)[:, :, None]  # (B,Z,1,X)
+    r = (dy * dy + dx * dx).sqrt_().div_(rmax.to(dtype).clamp_min(1e-6).view(-1, 1, 1, 1)).clamp_(0, 1)
+    if out is None:
+        return r[:, None]
+    out[:, 0] = r
+    return out
+
+
+def n_planes_b(b):
+    """How many PLANE channels a compact sample carries (`--planes`; 0 for every sample built before)."""
+    return (1 if "rmax" in b else 0) + (int(b["meta"].shape[-1]) if "meta" in b else 0)
+
+
+def fill_planes_(x, j, cyx=None, lo=None, rmax=None, meta=None, dtype=torch.float32):
+    """Write the PLANE channels into `x[:, j:j+n]` in place and return n.
+
+    The order is the canonical `data.PLANE_ORDER`: the radius FIELD first (one channel), then the five
+    CONSTANT scan planes. Both are plain spatial channels with no vector part, so `sym_apply_t` permutes
+    and flips them like the cascade channel and the scale plane and never negates them."""
+    n = 0
+    if rmax is not None:
+        radius_t(cyx, lo, x.shape[2:], rmax, dtype, out=x[:, j:j + 1])
+        n += 1
+    if meta is not None:
+        m = meta.to(x.device).to(dtype)
+        nm = int(m.shape[-1])
+        x[:, j + n:j + n + nm] = m.reshape(m.shape[0], nm, 1, 1, 1)
+        n += nm
+    return n
+
+
 def zscore_cubes_(img, norm, dtype):
     """z-score (B,C,Z,Y,X) image cubes in place with the sample's (mean, std): std 0 = the per-patch
     z-score, the semantics of data.zscore with NORM unset."""
@@ -86,18 +127,23 @@ def prepare(b, dev, dtype=torch.float32, norad=False, non_blocking=True, cascade
     lo, cyx, norm, rung = to(b["lo"]), to(b["cyx"]), to(b["norm"]), to(b["rung"])
     B, C, S = ct.shape[0], ct.shape[1], ct.shape[2:]
     casc = 1 if "cm" in b else 0
-    x = torch.empty((B, C + 4 + casc) + tuple(S), dtype=dtype, device=ct.device)  # filled in place: no second copy
+    npl = n_planes_b(b)
+    x = torch.empty((B, C + 4 + casc + npl) + tuple(S), dtype=dtype, device=ct.device)  # filled in place: no second copy
     img = x[:, :C]
     img.copy_(ct)
     zscore_cubes_(img, norm, dtype)
     if casc:
         cascade = cascade if cascade is not None else Cascade("mask", drop=0.0, noise=False)
         x[:, C:C + 1] = cascade.channel(b, x, norm, dtype, norad=norad, non_blocking=non_blocking)
-    x[:, C + casc] = ((rung.to(dtype) - 2) / 9.0).view(B, 1, 1, 1)
+    if npl:  # the METADATA / RADIUS planes sit after the cascade channel and before the scale plane
+        fill_planes_(x, C + casc, cyx, lo, dtype=dtype,
+                     rmax=(to(b["rmax"]).reshape(-1) if "rmax" in b else None),
+                     meta=(to(b["meta"]) if "meta" in b else None))
+    x[:, C + casc + npl] = ((rung.to(dtype) - 2) / 9.0).view(B, 1, 1, 1)
     if norad:
-        x[:, C + casc + 1:] = 0
+        x[:, C + casc + npl + 1:] = 0
     else:
-        radial_t(cyx, lo, S, dtype, out=x[:, C + casc + 1:])
+        radial_t(cyx, lo, S, dtype, out=x[:, C + casc + npl + 1:])
     tgt, w = tgt.to(dtype) / 255.0, w.to(dtype) / 255.0
     sym = [int(v) for v in b["sym"].reshape(-1).tolist()]
     if any(sym):  # one symmetry per sample, so the batch is done one sample at a time (B is 1 or 2)
@@ -186,15 +232,21 @@ class Cascade:
         cubes = torch.cat([b["ct"][i, 1:], b["cx"][i]]).to(dev)[None]
         S = cubes.shape[2:]
         C = cubes.shape[1]
-        x = torch.empty((1, C + 5) + tuple(S), dtype=dtype, device=dev)
+        npl = n_planes_b(b)
+        x = torch.empty((1, C + 5 + npl) + tuple(S), dtype=dtype, device=dev)
         x[:, :C].copy_(cubes)
         zscore_cubes_(x[:, :C], b["norm"][i:i + 1].to(dev), dtype)
         x[:, C] = 0                                                   # its own cascade channel: truncated
-        x[:, C + 1] = (float(int(b["rung"][i]) + 1) - 2) / 9.0
+        cyx1, lo1 = b["cyx1"][i:i + 1].to(dev), b["lo1"][i:i + 1].to(dev)
+        if npl:  # the planes at rung k+1: the scan values are the same, r_max halves with the voxel size
+            fill_planes_(x, C + 1, cyx1, lo1, dtype=dtype,
+                         rmax=(b["rmax"][i:i + 1].to(dev).reshape(-1) * 0.5 if "rmax" in b else None),
+                         meta=(b["meta"][i:i + 1].to(dev) if "meta" in b else None))
+        x[:, C + 1 + npl] = (float(int(b["rung"][i]) + 1) - 2) / 9.0
         if norad:
-            x[:, C + 2:] = 0
+            x[:, C + 2 + npl:] = 0
         else:
-            radial_t(b["cyx1"][i:i + 1].to(dev), b["lo1"][i:i + 1].to(dev), S, dtype, out=x[:, C + 2:])
+            radial_t(cyx1, lo1, S, dtype, out=x[:, C + 2 + npl:])
         return x
 
     @torch.no_grad()
@@ -243,5 +295,7 @@ def batch1(item):
 
 def shapes(item):
     """(input channels, output channels) of a compact sample: CT + context (+ the cascade channel, when the
-    sample carries a `cm` block) + the scale plane + radial."""
-    return int(item["ct"].shape[0]) + 4 + (1 if "cm" in item else 0), int(item["tgt"].shape[0])
+    sample carries a `cm` block) (+ the METADATA / RADIUS planes, when it carries `rmax` / `meta`)
+    + the scale plane + radial."""
+    return (int(item["ct"].shape[0]) + 4 + (1 if "cm" in item else 0) + n_planes_b(item),
+            int(item["tgt"].shape[0]))

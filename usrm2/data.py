@@ -509,26 +509,126 @@ def context(volume, origin, shape, ctx, rung=None, dtype=np.uint8):
     return out
 
 
+# ------------------------------------------------------- METADATA AND RADIUS PLANES (section 29)
+# Section 21 items 2 and 3, the two input channels the direction list asked for and nothing had built:
+# how far out the voxel sits (the radial VECTOR gives only the direction) and what scan it came from.
+# Both sit AFTER the cascade channel and BEFORE the scale plane, so the stem layout is
+#
+#     [CT, ctx_1..ctx_9, CASCADE?, PLANES..., scale?, radial(3)]
+#
+# and `train.warm_start` can still line the scale plane up with the source's. `--planes` is OFF by
+# default: with no planes the stack is exactly the 14/15-channel one every existing run uses.
+
+PLANE_N = {"radius": 1, "meta": 5}
+PLANE_ORDER = ("radius", "meta")   # canonical, so `--planes meta,radius` and `--planes radius,meta`
+                                   # build the SAME stem and a checkpoint is unambiguous
+
+
+def parse_planes(spec):
+    """`--planes meta,radius` -> ("radius", "meta") in the canonical order; None / "" / "off" -> ()."""
+    if spec is None or spec is False:
+        return ()
+    vs = spec if isinstance(spec, (list, tuple)) else [q for q in str(spec).replace(" ", ",").split(",") if q]
+    vs = [str(v) for v in vs if str(v) not in ("", "off", "none")]
+    bad = [v for v in vs if v not in PLANE_N]
+    assert not bad, f"--planes {spec}: unknown plane(s) {bad}; one or more of {sorted(PLANE_N)}"
+    return tuple(q for q in PLANE_ORDER if q in vs)
+
+
+def n_planes(planes):
+    return sum(PLANE_N[q] for q in parse_planes(planes))
+
+
+def plane_names(planes):
+    out = []
+    for q in parse_planes(planes):
+        out += ["radius"] if q == "radius" else ["energy", "log_db", "unsharp_um", "distance", "pitch"]
+    return out
+
+
+# The corpus ranges every scan plane is min-max normalised over. They are DOCUMENTED CONSTANTS, not
+# fitted: a plane must mean the same thing in a run trained on Paris 4 and in a run that later sees a
+# 1.1 um mosaic, so the mapping may not move when the corpus grows. A value outside its range is
+# clipped, which is the honest thing (the plane says "at or past the end of what we have seen").
+META_RANGE = (("energy_kev", 30.0, 120.0, False),        # keV
+              ("delta_beta", 10.0, 10000.0, True),       # Paganin delta/beta, log10
+              ("unsharp_sigma_um", 0.0, 6.0, False),     # the physical PSF, microns
+              ("distance_mm", 0.0, 1000.0, False),       # sample-detector (propagation) distance
+              ("pixel_um", 0.6, 1228.8, True))           # the ladder itself: log2, rung 0 .. rung 11
+
+
+def scan_planes(meta):
+    """The five scan-conditioning plane VALUES of one scan's flat metadata (`usrm2.scanmeta.load`).
+
+    Each is min-max normalised over its documented corpus range (log10 / log2 where the range spans
+    decades) and clipped to 0..1. A field the metadata.json did not supply is ZERO, not its default:
+    `scanmeta.flatten` fills documented defaults so no caller has to branch, but a plane that says
+    "78 keV" when nothing said so would be a lie the model would condition on. `meta=None` (no
+    `--scan-meta`, no metadata.json beside the volume) gives five zeros, which is what every warm start
+    from a run without the planes starts at."""
+    out = np.zeros(len(META_RANGE), np.float32)
+    if not meta or meta.get("missing"):
+        return out
+    bad = set(meta.get("defaulted") or ())
+    for i, (k, lo, hi, lg) in enumerate(META_RANGE):
+        if k in bad or (k == "unsharp_sigma_um" and {"unsharp_sigma_px", "pixel_um"} & bad):
+            continue
+        v = float(meta.get(k, 0.0) or 0.0)
+        if lg:
+            v, lo, hi = math.log10(max(v, 1e-9)), math.log10(lo), math.log10(hi)
+        out[i] = float(np.clip((v - lo) / max(hi - lo, 1e-9), 0.0, 1.0))
+    return out
+
+
+def rmax_vox(ax, shape):
+    """The largest radius any voxel of a box of `shape` (corner at the origin) can have from the axis
+    `ax`, in the same voxels: the far corner of the cross-section, over the z range of the box.
+
+    This is the r_max the radius plane divides by, so the plane is `r / r_max` in 0..1 for every voxel of
+    the scroll and means the same thing for a scroll of any size -- which is the point of the channel
+    (section 21 item 2: core vs mid-wraps vs the outer wrap by the case)."""
+    Z, Y, X = (int(v) for v in shape3(shape))
+    z = np.arange(Z, dtype=np.float64)
+    cy, cx = np.interp(z, ax[0], ax[1]), np.interp(z, ax[0], ax[2])
+    dy = np.maximum(np.abs(cy), np.abs(Y - cy))
+    dx = np.maximum(np.abs(cx), np.abs(X - cx))
+    return float(np.sqrt(dy * dy + dx * dx).max())
+
+
+def radius(ax, origin, shape, rmax):
+    """The (1,Z,Y,X) normalised-radius plane, `clip(r / rmax, 0, 1)`, built from the same axis
+    interpolation as `radial` -- so the direction channel and the distance channel can never disagree
+    about where the axis is."""
+    z = np.arange(shape[0]) + origin[0]
+    cy, cx = np.interp(z, ax[0], ax[1]), np.interp(z, ax[0], ax[2])
+    dy = (np.arange(shape[1]) + origin[1])[None, :, None] - cy[:, None, None]
+    dx = (np.arange(shape[2]) + origin[2])[None, None, :] - cx[:, None, None]
+    r = np.sqrt(dy * dy + dx * dx) / max(float(rmax), 1e-6)
+    return np.clip(r, 0.0, 1.0).astype(np.float32)[None]
+
+
 def scale_plane(rung, shape):
     """The constant scale channel of a sample at rung k: (k - 2) / 9, 0 at 2.4 um."""
     return np.full(tuple(shape3(shape)), (int(rung) - 2) / 9.0, np.float32)
 
 
-def inputs(ct, rad, ctx=(), rung=None, cascade=None):
-    """Model input (1 + len(ctx) + (cascade is not None) + (rung is not None) + 3, Z,Y,X): z-scored CT,
-    z-scored coarse context cubes, the CASCADE channel, the constant scale plane (only when a rung is
+def inputs(ct, rad, ctx=(), rung=None, cascade=None, planes=None):
+    """Model input (1 + len(ctx) + (cascade is not None) + n_planes + (rung is not None) + 3, Z,Y,X):
+    z-scored CT, z-scored coarse context cubes, the CASCADE channel, the METADATA/RADIUS planes
+    (`planes`, an already-built (N,Z,Y,X) stack or None), the constant scale plane (only when a rung is
     given) and the radial unit vector.
 
-    Channel order is [CT, ctx..., CASCADE, scale, radial(3)]: the image channels stay first and the radial
+    Channel order is [CT, ctx..., CASCADE, PLANES..., scale, radial(3)]: the image channels stay first and the radial
     vector stays last, so `train.warm_start` widens a stem by zero-filling the new planes. The cascade
     channel is the model's own rung-(k+1) prediction over the same field of view upsampled 2x -- a
     probability in 0..1, NOT z-scored (it is not an image channel), exactly like the scale plane."""
     sc = [scale_plane(rung, ct.shape)[None]] if rung is not None else []
     cs = [np.asarray(cascade, np.float32)[None]] if cascade is not None else []
-    return np.concatenate([zscore(ct)[None]] + [zscore(c)[None] for c in ctx] + cs + sc + [rad])
+    pl = [] if planes is None else [np.asarray(planes, np.float32).reshape((-1,) + tuple(ct.shape))]
+    return np.concatenate([zscore(ct)[None]] + [zscore(c)[None] for c in ctx] + cs + pl + sc + [rad])
 
 
-def rung_item(ct, tg, w, k, lo, ax, sym=0, norm=None, cm=None, cx=None, lo1=None):
+def rung_item(ct, tg, w, k, lo, ax, sym=0, norm=None, cm=None, cx=None, lo1=None, rmax=None, meta=None):
     """The compact sample the rung loader yields: everything uint8, so a 256^3 sample is ~200 MB instead
     of the ~1 GB of float32 `inputs` + `augment` used to build in the worker. `usrm2.prep.prepare` turns a
     collated batch of these into the model input on the GPU.
@@ -560,6 +660,10 @@ def rung_item(ct, tg, w, k, lo, ax, sym=0, norm=None, cm=None, cx=None, lo1=None
            "cyx": torch.from_numpy(np.ascontiguousarray(cyx)),
            "sym": torch.tensor(int(sym)), "rung": torch.tensor(int(k)),
            "norm": torch.tensor(nm, dtype=torch.float32)}
+    if rmax is not None:   # the radius plane's denominator, in rung-k voxels (section 29)
+        out["rmax"] = torch.tensor(float(rmax), dtype=torch.float32)
+    if meta is not None:   # the five normalised scan-conditioning values of this sample's scan
+        out["meta"] = torch.as_tensor(np.asarray(meta, np.float32))
     if cm is not None:
         out["cm"] = torch.from_numpy(np.ascontiguousarray(np.asarray(cm, np.uint8)))
     if cx is not None:
@@ -851,6 +955,15 @@ REGION = 1024  # the rung-2 region edge the walk and the teacher service agree o
 # which is the per-channel ignore the loss already understands; at every rung but 2 and 3 the whole channel
 # is weight 0 for now.
 VERSO = "verso"
+
+# PHASE B (docs/unified_design.md section 29). Output channels whose target is a DISTANCE, not a
+# probability: uint8 with code 0 reserved for no-data, offset 128 and 0.25-voxel units for the two signed
+# ones (`usrm2/targets.py`). They are written by `usrm2 dist-pyramid` as ordinary target pyramids, so they
+# reach the loader exactly like the recto mask does -- one more `,<group>` on the source line -- and the
+# only rule they need of their own is that a distance is NEVER POOLED: `read_rung` would happily average
+# a rung-2 distance field down to rung 3, and the result is not the rung-3 distance field of anything. So
+# a distance channel is read only at a rung its own store HOLDS, and has weight 0 at every other rung.
+DIST_CHANNELS = ("sdist", "midline", "thickness")
 TSTORE_TTL = 1800.0  # seconds a MISSING region store stays missing in a loader's cache (the pod publishes
                      # continuously, so a negative result must expire; a found store is cached for good)
 
@@ -975,7 +1088,7 @@ class Patches(torch.utils.data.IterableDataset):
                  fg_keep=0.25, sym=True, aug=None, dense_pow=0.0, dense_ref=0.2, ctx=(), stores_file=None,
                  recheck=200, rungs=None, rung_boost=None, channels=None, require_targets=False, stream=None,
                  region=0, windows_per_region=64, region_fails=0, teacher_regions=None, cascade="off",
-                 verso=False, verso_regions=None, fuse="off", source_w=None):
+                 verso=False, verso_regions=None, fuse="off", source_w=None, planes=(), scan_meta=None):
         """dense_pow > 0 biases sampling towards sheet-dense patches: a patch whose target mean m is below
         dense_ref is kept with probability (m / dense_ref) ** dense_pow (crushed windings are where students fail).
         stores_file: instead of `stores`, a text file with one comma-joined group per line that is re-read
@@ -1038,6 +1151,12 @@ class Patches(torch.utils.data.IterableDataset):
         # prediction, built on the GPU in prep) or "mix". The worker's job is only to READ the extras.
         self.cascade = str(cascade or "off")
         assert self.cascade in CASCADE_MODES, f"--cascade {cascade}: one of {CASCADE_MODES}"
+        # METADATA / RADIUS PLANES (section 29): extra constant input planes between the cascade channel
+        # and the scale plane. `scan_meta`, when given, overrides every source's own metadata.json --
+        # one scan's numbers for the whole stores file, which is what `--scan-meta` already means for the
+        # augmentation ranges. () is the default and changes nothing.
+        self.planes = parse_planes(planes)
+        self.scan_meta = None if scan_meta in (None, "") else str(scan_meta)
         self.rungs, self.rung_boost, self.channels = rungs, dict(rung_boost or {}), channels
         self.norm, self.umbilicus = NORM, UMBILICUS  # module state the (spawned) workers must inherit explicitly
         self.stores_file, self.recheck, self.file_mtime = stores_file, recheck, None
@@ -1085,11 +1204,17 @@ class Patches(torch.utils.data.IterableDataset):
             self.channels = list(self.channels) + [VERSO]
         # the verso channel is always LAST and never decides whether a window is worth training on: the
         # foreground / density rejection rules stay exactly what a recto-only run's were
-        self.nrecto = len(self.channels) - (1 if self.channels and self.channels[-1] == VERSO else 0)
+        # ... and a distance channel never does either (section 29): the rejection rules must not change
+        self.nrecto = len([c for c in self.channels if c != VERSO and c not in DIST_CHANNELS])
         allowed = None if self.rungs is True else set(self.rungs)
         for s in self.srcs:
             s["probs"] = rung_probs(s, self.patch, allowed, self.rung_boost)
             s["axis"] = axis(s["umbilicus"])
+            if self.planes:  # once per source, not once per sample
+                kn = min(s["ct_pyr"])
+                s["rmax_um"] = rmax_vox(axis_at(s["axis"], kn), rung_shape(s["ct_pyr"], kn)) * rung_um(kn)
+                from usrm2 import scanmeta as SM
+                s["meta5"] = scan_planes(SM.load(self.scan_meta or s["ct"]))
         self.w = np.array([s["volume_um3"] for s in self.srcs], np.float64)
         self.w /= self.w.sum()
         self.ex = [e if isinstance(e, (tuple, list)) and len(e) == 2 and not isinstance(e[0], str)
@@ -1215,7 +1340,8 @@ class Patches(torch.utils.data.IterableDataset):
             return desc, None
         cx = context(s["ct"], lo, ct.shape, self.ctx, rung=k) if self.ctx else ()
         ex = self._cascade_extras(s, k, lo, ct.shape, blank=blank)
-        return desc, rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, s["axis"], sym, **ex)
+        return desc, rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, s["axis"], sym,
+                               **self._plane_extras(s, k), **ex)
 
     def _rung_build(self, d):
         """A queue descriptor (`_rung_draw`) -> the compact sample, read from the local buffer. No rng: the
@@ -1235,7 +1361,21 @@ class Patches(torch.utils.data.IterableDataset):
             ct = raw_apply(ct, d.get("r") or {})
         cx = context(s["ct"], lo, ct.shape, self.ctx, rung=k) if self.ctx else ()
         ex = self._cascade_extras(s, k, lo, ct.shape, blank=blank)
-        return rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, s["axis"], int(d.get("y", 0)), **ex)
+        return rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, s["axis"], int(d.get("y", 0)),
+                         **self._plane_extras(s, k), **ex)
+
+    def _plane_extras(self, s, k):
+        """The per-sample numbers the METADATA / RADIUS planes need (section 29): r_max at this rung and
+        the five normalised scan values. Empty when `--planes` is off, so `rung_item` yields exactly the
+        keys it always did and a stream queue planned without planes replays unchanged."""
+        if not self.planes:
+            return {}
+        out = {}
+        if "radius" in self.planes:
+            out["rmax"] = float(s["rmax_um"]) / rung_um(int(k))
+        if "meta" in self.planes:
+            out["meta"] = s["meta5"]
+        return out
 
     def cascade_ctx(self):
         """The context offset of the TENTH cube: the one rung the coarse (rung k+1) input needs and the
@@ -1366,14 +1506,20 @@ class Patches(torch.utils.data.IterableDataset):
             t = s["targets"].get(chan)
             if t is None:
                 continue  # per-channel ignore: this source says nothing about that channel
+            if chan in DIST_CHANNELS and int(k) not in t["pyr"]:
+                continue  # a distance is never pooled: no level at this rung means weight 0 here
             ins = np.zeros(tuple(p), bool)
             blo, bs = target_box(t, k)
             a = np.maximum(blo - lo, 0)
             b = np.minimum(blo + bs - lo, p)
             if (b > a).all():
                 ins[a[0]:b[0], a[1]:b[1], a[2]:b[2]] = True
-            np.copyto(tg[c], read_rung(t["pyr"], k, lo, p, dtype=np.uint8), where=inside_ct)  # masked CT: no surface
-            w[c] = np.where(ins & inside_ct,
+            v = read_rung(t["pyr"], k, lo, p, dtype=np.uint8)
+            np.copyto(tg[c], v, where=inside_ct)  # masked CT: no surface
+            ok = ins & inside_ct
+            if chan in DIST_CHANNELS:
+                ok = ok & (v != 0)   # code 0 IS the store's no-data marker (targets.encode_signed)
+            w[c] = np.where(ok,
                             np.uint8(min(round(255 * t["weight"] * self.source_w.get("mask", 1.0)), 255)),
                             np.uint8(0))
         return tg, w
@@ -1386,6 +1532,9 @@ class Patches(torch.utils.data.IterableDataset):
         assert [int(v) for v in m["patch"]] == [int(v) for v in self.patch], \
             f"--stream was planned at patch {m['patch']}, not {[int(v) for v in self.patch]}"
         assert tuple(m["ctx"]) == tuple(self.ctx), f"--stream was planned with --ctx {m['ctx']}"
+        assert tuple(m.get("planes") or ()) == tuple(self.planes), \
+            f"--stream was planned with --planes {','.join(m.get('planes') or ()) or 'off'} " \
+            f"(the plane set is part of the stem, like --ctx)"
         assert str(m.get("cascade", "off")) == self.cascade, \
             f"--stream was planned with --cascade {m.get('cascade', 'off')}, not {self.cascade} " \
             "(the planner fetches the coarse target block and the tenth context cube)"
@@ -1618,7 +1767,7 @@ VAL_RUNGS = (2, 3, 4, 6)  # the rungs the held-out box is scored at
 
 
 def val_grid_rungs(patch, stores, box2, rungs=VAL_RUNGS, limit=8, ctx=(), channels=None, cascade="off",
-                   verso=False, verso_regions=None):
+                   verso=False, verso_regions=None, planes=(), scan_meta=None):
     """Per-rung validation: the held-out box (given at rung 2) read at each rung from the same pyramids
     as training. Returns the same compact uint8 items the rung loader yields (`rung_item`), so 8 patches x
     3 rungs at 256^3 cost ~1.6 GB of host memory instead of the ~22 GB of 14-channel float32 they used to.
@@ -1634,7 +1783,8 @@ def val_grid_rungs(patch, stores, box2, rungs=VAL_RUNGS, limit=8, ctx=(), channe
         if verso and VERSO not in channels:
             channels = channels + [VERSO]
     ds = Patches(patch=patch, stores=stores, exclude=[], rungs=True, ctx=ctx, channels=channels, sym=False,
-                 cascade=cascade, verso=verso, verso_regions=verso_regions)
+                 cascade=cascade, verso=verso, verso_regions=verso_regions, planes=planes,
+                 scan_meta=scan_meta)
     ds._open_rungs()
     p3, out = shape3(patch), []
     o2, s2 = val_box(box2)
@@ -1654,7 +1804,8 @@ def val_grid_rungs(patch, stores, box2, rungs=VAL_RUNGS, limit=8, ctx=(), channe
                 tg, w = ds._rung_target(s, k, lo, ct, verso=ds._verso_store(s, k, lo))
                 cx = context(s["ct"], lo, ct.shape, ctx, rung=k) if ctx else ()
                 ex = ds._cascade_extras(s, k, lo, ct.shape)
-                out.append(rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, s["axis"], **ex))
+                out.append(rung_item(np.stack([ct] + list(cx)), tg, w, k, lo, s["axis"],
+                                     **ds._plane_extras(s, k), **ex))
     assert out, "the validation box is smaller than one patch at every rung"
     return out
 
