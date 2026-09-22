@@ -1769,3 +1769,448 @@ Budget ~16 GPU-h: pretrain ~20k steps (~7 GPU-h) + two fine-tuning arms x 10k st
    have. A gain that only appears at an artificially reduced label count is a note, not an adoption.
 6. Worth a third arm if the first two are close: `--no-mask-ctx`, which tells you how much of any gain was
    real reconstruction and how much was the context channels leaking a coarse answer.
+
+## 29. Phase B/C: distance, normals, pairing, planes, tracer export (implemented 2026-09-21)
+
+`docs/research/synthesis_v2_with_literature.md` Phase B and Phase C, its tracer contract (section 2) and its
+experiments 5, 6 and 7, plus the two input channels section 21 asked for and nothing had built (items 2 and
+3). Code: `usrm2/targets.py` (the offline distance pyramids), `usrm2/losses.py` (the Huber, the Eikonal
+term, the derived normals, the constructed pair, the fast-ECT term), `usrm2/train.py` (the head layout, the
+loss split, the warm-start slot map), `usrm2/data.py` + `usrm2/prep.py` (the distance channels and the
+planes), `usrm2/predict.py` (the field heads and `export-tracer`), `usrm2/cli.py`, `tests/test_phase_bc.py`.
+
+Every flag defaults to OFF and is written into the checkpoint `args` only when it is on, so a run whose
+flags are absent is byte-identical to one built before this section existed and an existing run resumes
+unchanged -- `test_the_flags_off_leave_the_checkpoint_args_untouched` is that claim.
+
+### 29.1 The distance stores (`usrm2 dist-pyramid`)
+
+A distance pyramid is an ordinary target pyramid: levels named by voxel size in microns, zarr v3 sharded,
+128^3 inner chunks, `VolcompCodec(q=8)`, `compressors=None` (18.1b and 24). It joins a source line like any
+other target group, `ct_base,recto_mask,<name>_sdist.zarr`, and the loader reads it through the same
+`_rung_target` path the recto mask goes through.
+
+The encoding is the tracer contract's:
+
+    signed    code = 128 + round(d / 0.25), clamped to 1..255   ->   d = (code - 128) * 0.25 voxels
+    unsigned  code =       round(t / 0.25), clamped to 1..255   ->   t =  code        * 0.25 voxels
+    code 0    = NO DATA
+
+Offset 128, 0.25-voxel units, cap +-31.75 voxels -- the contract's +-32 with the one endpoint given up so
+that 0 can be the no-data marker, which the contract itself demands ("0 is reserved for no-data in every
+uint8 distance field"). The units are WORKING VOXELS OF THAT RUNG, so every store records `voxel_um`.
+
+**Three kinds**, `--kind face midline thickness`:
+
+- **face** (`<mask>_sdist.zarr`, channel `sdist`): the signed distance to the RECTO FACE, the medial surface
+  of the recto band. Positive on the radially OUTWARD side, which is the recto side, i.e. outside the sheet
+  body; negative on the verso side.
+- **midline** (`<mask>_midline.zarr`, channel `midline`): the signed distance to the sheet MIDLINE, same
+  sign convention.
+- **thickness** (`<mask>_thick.zarr`, channel `thickness`): the recto-to-verso separation along the normal,
+  lower-bounded by `--tmin` (default 3.0 voxels = 2 x the default `--pair-band`).
+
+The three come out of one identity. Let `d_r` be the signed distance to the recto face and `d_v` to the
+verso face, both positive outward. A sheet sits between the two, so for a voxel at radial coordinate x, a
+recto face at a and a verso face at a - t,
+
+    d_r = x - a        d_v = x - (a - t) = d_r + t
+
+and therefore, exactly,
+
+    midline m = (d_r + d_v) / 2        thickness t = d_v - d_r
+
+Without a verso source there is no second face: the midline falls back to the recto band's own medial
+surface (m = d_r) and the thickness is not measurable, so its code is 0 -- weight 0, not a guessed number.
+`--verso` takes either a verso pyramid group or the root of the published verso REGION stores
+(`<root>/verso/region_<z>_<y>_<x>.zarr`, rung 2 and its 2x pool), so it works off exactly what the pod
+publishes today.
+
+**The sign** comes from the same radial vector the model gets as an input channel.
+`scipy.ndimage.distance_transform_edt(..., return_indices=True)` gives both the distance to the nearest
+surface voxel and WHICH voxel that is; the displacement from that voxel to this one, dotted with the
+(unnormalised) radial direction, is the side. So "positive" means the same thing in the target, in
+`prep.radial_t` and in the exported normal (`dot(n, radial) > 0`), and it is written into the store's
+`sign_convention` attr in words rather than left to be rediscovered.
+
+**A distance is never pooled.** A 2x mean pool of a rung-k distance field is not the rung-(k+1) distance
+field of anything -- it is a rung-k distance halved by nothing -- so every rung is recomputed from that
+rung's own mask, and `data.DIST_CHANNELS` gives the loader the matching rule: a distance channel is read
+only at a rung whose level the store actually HOLDS, and has weight 0 at every other rung. `read_rung`'s
+pooling fallback is therefore never reached for one.
+
+**Weight 0** (code 0) is written wherever the field is not trustworthy:
+
+| where | why |
+|---|---|
+| no mask level at that rung | nothing to measure from |
+| above rung 4 (`--max-rung`) | the exported level is a pooled area FRACTION; its 0.5 level set is not a surface |
+| above the mask's native rung + 1 | the same, one rung earlier for a coarse-native source |
+| within R of the umbilicus axis | `--axis-r-um`, default **400 um**: the core is crushed and the published masks put `recto_is_in` near 0.5 there. tsm measured ~0.47 and dropped those voxels; so do we. R is in MICRONS, so it is the same physical radius at every rung (167 rung-2 voxels, 42 rung-4 voxels) |
+| CT == 0 | applied by the loader, not here: `_rung_target` masks every channel with CT > 0 |
+| the block's mask is all background | the shard is never written and reads back as 0 |
+
+Blocks are `--block` (default 128) cubes with a `--halo` (default 48) of context on every side, so a
+block's EDT agrees with the whole level's everywhere within the +-32 clamp. `--box Z0 Y0 X0 Z Y X` (given at
+rung 2, like every box here) restricts the pass: a whole Paris 4 level is ~10^12 rung-2 voxels, so the full
+job is done region by region and the held-out box can be done on its own to check the numbers first.
+
+This is CPU work -- two `scipy` EDTs per block per rung. It must not be run on a card a training job is
+using; it does not touch one.
+
+### 29.2 The output heads (`--sdist`, `--thickness`, `--normals`, `--sdist-hetero`)
+
+The head layout, in one 1x1x1 convolution as always:
+
+    [ recto, verso ][ sdist, thickness ][ nz, ny, nx ][ logvar ][ affinity... ]
+      cout_p          cout_t                                    cout
+
+`cout_p` is what may be sigmoided (`predict` never applies one past it), `cout_t` what the loader has a
+target for, `cout` the head width. All three go into the checkpoint args, and the older `cout_t` keeps its
+Phase A meaning.
+
+- **`--sdist face|midline`** adds ONE channel predicting the distance IN VOXELS directly (not a code), so a
+  zero-initialised row says "the surface is here", which is the encoding's own zero. Its loss is a clamped
+  Huber (`--sdist-delta`, default 2 voxels) against the decoded target on the weighted voxels. The loader
+  channel is named `sdist` or `midline`, which is what must appear as the `channel` attr of the store on the
+  source line.
+- **`--thickness`** adds one more, read as `t = TMIN + softplus(raw)`, so a predicted thickness can never
+  fall below the minimum physical sheet thickness whatever the head says.
+- **`--loss-eikonal W`** adds `(|grad d| - 1)^2` over the band the TARGET says is within `--sdist-band`
+  (default 8) voxels of a surface, with the one-voxel patch border dropped (the central difference is
+  one-sided there). IGR (Gropp et al., ICML 2020): the Eikonal residual is what makes a regressed field an
+  actual distance function BETWEEN the voxels that pin it down. It carries no localisation of its own -- the
+  Huber has to do that -- so it is a regulariser, not supervision.
+- **`--normals derive|head`**. `derive` computes `n = grad(d) / |grad(d)|` on the GPU from the predicted
+  field: no extra channels, no extra parameters, used for the pairing loss and for the export. `head` adds
+  three explicit channels and distils that gradient into them (`--loss-normals W`), which is worth it only
+  when something downstream wants a normal without a finite difference. Either way the sign follows from the
+  target's: d grows towards the recto side, so grad(d) points VERSO -> RECTO and `dot(n, radial) > 0`.
+  `lit_implicit_surfaces_manifold.md` warns against reading a normal off the decoder's own AUTOGRAD gradient
+  (a ReLU/SiLU decoder has piecewise-constant gradients; the SIREN pitfall) -- this is not that, it is a
+  finite difference of the decoder's OUTPUT VALUES, the same quantity the export computes with a Scharr
+  kernel from the stored field.
+- **`--sdist-hetero`** adds a log-variance channel and makes the Huber a Gaussian likelihood,
+  `exp(-s) * huber + 0.5 * s` (Kendall & Gal 2017). The model may raise `s` where it cannot localise the
+  surface, which is exactly the `conf` channel the tracer contract asks for -- obtained free rather than as
+  a separate head, which is what the synthesis promoted it to.
+
+**A distance voxel counts only at full weight.** The spatial augmentations resample the target and the
+weight together, so a voxel on the boundary between real data and a no-data code comes out of `aug.warp`
+with a fractional weight and an INTERPOLATED value -- and interpolating across code 0 (which decodes to -32
+voxels, not to "nothing") gives a number that is simply wrong. `losses.dist_weight` therefore DROPS a
+distance voxel whose weight is below 0.95 instead of down-weighting it. Inside a valid block the weight is
+exactly 1 and nothing is lost.
+
+**A distance is an isometry-only target.** A rotation or a flip carries its value unchanged; a scale, a
+shear, an elastic warp or a sheet compression does not, because they change the metric the distance is
+measured in. With `--sdist` on, `scale` / `shear` / `elastic` / `sheetcomp` are dropped from the
+augmentation config for the run, loudly, rather than training silently on wrong numbers. The 48 cube
+symmetries and every intensity aug are unaffected, and `--aug geo` (which has none of the four) is untouched.
+
+**Warm start.** `copy mod n` is right for a probability row and WRONG for a distance one -- it would copy a
+probability filter into a distance slot -- so `ncopy` stops at `cout_p`: every regression, normal,
+log-variance and affinity row is zero-initialised in weight and bias. Because the head is 1x1x1 the
+recto/verso rows come out BIT-IDENTICAL (`torch.equal`, not `allclose`) and the grown net's probability
+output matches the source's to ~1e-7 relative, which is the same acceptance test sections 22, 23 and 26 use.
+
+### 29.3 Construction-based pairing (`--pair construct`)
+
+With `--sdist midline --thickness`, the recto and verso probabilities the loss scores are DERIVED from the
+midline distance m and the thickness t as bands at `m = +- t/2`:
+
+    band(u)  = sigmoid((half - |u|) / tau)        half = --pair-band (1.5 voxels), tau = --pair-tau (0.5)
+    p_recto  = band(m - t/2)
+    p_verso  = band(m + t/2)
+    t        = TMIN + softplus(raw),   TMIN = 2 * half
+
+The recto face sits at `m = +t/2` because m is positive on the recto (radially outward) side, which is the
+stores' convention and the radial channel's.
+
+**They cannot overlap, exactly, not approximately.** For `0 <= m <= t/2` the two logits are
+`a1 = (half - t/2 + m)/tau` and `a2 = (half - t/2 - m)/tau`, so `a2 <= -a1` whenever `t >= 2*half`, and
+`sigmoid(a1) + sigmoid(a2) <= sigmoid(a1) + sigmoid(-a1) = 1`. For `|m| > t/2 >= half` the two logits sum
+to `2(half - |m|)/tau <= 0` and the same bound applies; `m < 0` is the mirror image. So
+`relu(p_r + p_v - 1)` -- the L3 exclusivity loss -- is IDENTICALLY ZERO for every (m, t) with `t >= 2*half`,
+which `soft_thickness(tmin = 2 * half)` guarantees. That is what construction buys over a penalty: crossing
+is unrepresentable rather than discouraged, at zero extra parameter cost. `test_construct_pairing_can_never_overlap`
+checks it over the whole range of m for three (half, tau) settings and for thicknesses from the floor to
+1e3.
+
+The BCE takes the LOGITS directly (`pair_logits`), not `log(p / (1 - p))`, so the constructed pair is as
+numerically well behaved as the learned one.
+
+- **`--pair construct`**: both terms. The learned recto/verso channels keep their own `bce + dice` as an
+  auxiliary, which is also what feeds the deep-supervision heads (the constructed pair exists only at level 0).
+- **`--pair construct-only`**: the learned term is dropped. The rows stay in the head and keep their
+  weights, so inference and a later warm start are unchanged, but they receive no gradient -- and neither do
+  the deep heads. Prefer `construct` in production for that reason.
+- **`--loss-excl` stays available as a backstop** and is now a free assertion: under `--pair construct` it is
+  0 by construction, so a non-zero value means a bug, not a merge.
+
+### 29.4 The topology pilot (`--loss-ect`)
+
+Experiment 7, the fast-ECT arm. For a direction `xi` and a height h, the Euler Characteristic Transform is
+the Euler characteristic of the part of the cubical complex whose vertices all satisfy `<v, xi> <= h`. On a
+voxel grid the complex has one vertex per voxel, an edge per neighbouring pair, a face per 2x2 square and a
+cube per 2x2x2 block; a cell is present iff all its vertices are, i.e. it is their PRODUCT, so for a soft
+field `V - E + F - C` over the products is the expected Euler characteristic and is differentiable. A cell
+enters at the height of its highest corner, and because `<v, xi>` is linear that height is the lowest
+corner's plus `sum over the spanned axes of max(0, xi_axis)` -- no search. The whole transform is, per
+direction, eight products and eight `index_add_`s with fixed, gradient-free bin indices, then a cumsum.
+This is arXiv:2507.23763's "fast chi" and villa's `ect_loss.py` chi variant: no persistence diagram, no
+matching, no C++ dependency. Directions are a Fibonacci spiral, deterministic, so a resume replays the same
+loss to the last float; `chi` of a solid block comes out 1.0.
+
+**The crop is the load-bearing detail.** A topology loss on a cropped patch sees every sheet truncated at
+the patch face and produces a spurious gradient at every crop edge -- the known failure mode of the whole
+PH family, and live at 256^3. So the loss is computed only on `--ect-n` sub-blocks of side `--ect-block`
+taken from the interior, at least `--ect-margin` (default 8) voxels from every face, chosen on a fixed
+stride (no rng), and only on the samples at `--ect-rung` (default 2). Every sub-block of every sample is
+stacked into the batch dimension, so the term is two `ect` calls whatever `--ect-n` is.
+
+`--loss-ect` and the six `--ect-*` knobs are the ONLY Phase B/C flags in the resume `grow` tuple: the term
+has no parameters and no loader channel, and the whole point of a pilot is to switch it on and tune it on an
+existing checkpoint. Every other flag changes a head or a stem and must match, as `cin` and `cout` always have.
+
+**`--loss-warp` (homotopy warping, L7b) is NOT implemented.** It is a TODO. The algorithm warps the ground
+truth towards the binarised prediction by a distance-transform search for the minimal-Hamming-distance
+critical voxels -- the voxels whose flip changes a Betti number, which is precisely a merge bridge -- and
+penalises only those (Hu, NeurIPS 2022, arXiv:2112.07812). It needs no PH library, but it does need a
+per-step EDT of the prediction AND a search over it, and a pure-torch EDT at 256^3 per step is a piece of
+work in its own right (the GPU jump-flood or Felzenszwalb variants are each a day's careful implementation
+plus a correctness suite). The survey ranks fast ECT ahead of it anyway, so the pilot runs ECT first; warping
+is worth building only if experiment 7 says a topology term moves `betti0_err` at all. It is deliberately
+left undone rather than half-built.
+
+### 29.5 Metadata and radius planes (`--planes radius,meta`)
+
+Section 21 items 2 and 3. The stem layout becomes
+
+    [CT, ctx_1..ctx_9, CASCADE?, PLANES..., scale?, radial(3)]
+
+with the planes between the cascade channel and the scale plane. `--planes` takes a comma list and the
+result is put in the CANONICAL order `radius, meta`, so `--planes meta,radius` and `--planes radius,meta`
+build the same stem and a checkpoint is unambiguous. `()` -- the default -- leaves the 14/15-channel stack
+exactly as it was.
+
+- **radius** (1 channel): `clip(r / r_max, 0, 1)`, the normalised distance from the umbilicus axis. The
+  radial VECTOR gives direction, not how far out the voxel sits, and how far out it sits is what sets sheet
+  spacing, curvature and damage (core vs mid-wraps vs the outer wrap by the case). It is built by
+  `prep.radius_t` from the SAME axis interpolation `prep.radial_t` uses, so the direction channel and the
+  distance channel can never disagree about where the axis is. `r_max` is the largest radius any voxel of
+  the scroll's own bounding box can have, computed once per source in `_open_rungs`, stored in microns and
+  converted to the sample's rung; it halves per rung, and `Cascade.coarse_input` halves it again for the
+  rung-(k+1) pass.
+- **meta** (5 channels, constant per sample): energy, log10 delta/beta, unsharp sigma in microns,
+  sample-detector distance and pixel pitch, from the volume's own `metadata.json` through
+  `usrm2/scanmeta.py`. Each is min-max normalised over a DOCUMENTED corpus range and clipped to 0..1:
+
+  | plane | range | scale |
+  |---|---|---|
+  | energy_kev | 30 - 120 keV | linear |
+  | delta_beta | 10 - 10000 | log10 |
+  | unsharp_sigma_um | 0 - 6 um | linear |
+  | distance_mm | 0 - 1000 mm | linear |
+  | pixel_um | 0.6 - 1228.8 um | log2 (the ladder itself: rung 0 to rung 11) |
+
+  The ranges are constants, not fitted: a plane must mean the same thing in a run trained on Paris 4 and in
+  a run that later sees a 1.1 um mosaic, so the mapping may not move when the corpus grows. **A field the
+  metadata.json did not supply is ZERO, not its default.** `scanmeta.flatten` fills documented defaults so
+  no caller has to branch, but a plane saying "78 keV" when nothing said so would be a lie the model would
+  condition on. `--scan-meta PATH` overrides every source with one scan's numbers, exactly as it already
+  does for the augmentation ranges; without it each source reads its own volume's file, which is what a
+  multi-scroll stores file needs.
+
+The planes are plain spatial channels with no vector part, so `prep.sym_apply_t` permutes and flips them
+like the cascade channel and the scale plane and never negates them (the radius is a scalar field, so a cube
+symmetry carries it unchanged), and `aug.apply`'s `nimg` already keeps the intensity augs off everything
+past the image cubes.
+
+**The warm start needed a new mechanism.** Once a variable-width slot sits in the middle of the stem,
+"image channels first, radial last" places nothing in the middle: the source's scale weights would slide
+into a plane slot and the scale plane would be zeroed, which changes the output at every rung but 2 -- the
+exact failure the `cascade`/`src_scale` pair was added to avoid in section 22. So `train.stem_map` names the
+slots on BOTH sides (`[image..., CASCADE?, PLANES..., scale?, radial(3)]`) and matches them by name; a slot
+the source does not have stays zero. `warm_start` reaches it only when `planes` or `src_planes` is non-zero,
+so the two legacy branches are byte-for-byte what they were.
+`test_warm_start_keeps_the_scale_plane_aligned_across_a_plane_growth` widens 15 -> 21 and checks the
+step-0 output against the source's with random values in the six new planes.
+
+The plane set is recorded in the stream queue's `meta.json` and `data.Patches._open_stream` asserts it, like
+`--ctx` and `--cascade`: a queue can only be replayed by a run that builds the same stem. `stream-plan`
+therefore gains `--planes` and `--scan-meta`.
+
+### 29.6 Inference and the tracer export
+
+`predict.probs(head=...)` takes four FIELD names beside the probability channels. They never see a sigmoid
+and never see the per-rung temperature -- a distance is not a probability:
+
+    --head sdist       the signed distance, in voxels at the rung ("midline" is an alias)
+    --head thickness   TMIN + softplus(raw), voxels
+    --head normals     (3, Z, Y, X) ZYX unit vectors, sign verso -> recto; from the normals head when the
+                       checkpoint has one, else the normalised gradient of the predicted distance
+    --head conf        1 / (1 + exp(s / 2)) from the heteroscedastic log-variance, 0..1
+
+`usrm2 export-tracer CKPT OUT --origin Z0 Y0 X0 --size Z Y X [--rung k] [--marching-cubes]` writes the whole
+contract of `synthesis_v2_with_literature.md` section 2 as sharded volcomp stores under `OUT`:
+
+    recto.zarr, verso.zarr   uint8  probability * 255
+    surf_sdist.zarr          uint8  d = (v - 128) * 0.25 voxels, cap +-31.75, v = 0 is NO DATA
+    nz.zarr, ny.zarr, nx.zarr uint8 component = (v - 128) / 127, ZYX order, unit vector
+    gmag.zarr                uint8  |grad d| * 127, so 127 is the Eikonal ideal |grad d| = 1
+    conf.zarr                uint8  confidence * 255          (only with --sdist-hetero)
+    thickness.zarr           uint8  t = v * 0.25 voxels        (only with --thickness)
+
+**Axis order is ZYX everywhere**, and every store says so in its attrs (`axis_order`, `encoding`,
+`no_data`, `sign_convention` in words). **The sign is verso -> recto**: d > 0 and n pointing from the verso
+face towards the recto face, i.e. radially outward from the scroll axis, `dot(n, radial) > 0`. A tracer that
+wants the old `nx`/`ny` hemisphere pair reads nx and ny and recovers nz from the unit constraint; the sign
+of nz is the one the store carries, and the full signed triple is written so that step is a check, not a
+guess.
+
+**A midline checkpoint exports the recto-face convention.** The export is the subtraction `d = m - t/2`,
+done here, so the training-time representation -- which is what buys non-crossing -- never reaches the
+tracer and a midline-trained model and a face-trained one write byte-comparable stores.
+
+**The normal is derived from the EXPORTED field**, with a Scharr kernel (the 1D derivative `[-1, 0, 1]/2`
+along the axis, the `[3, 10, 3]/16` smoother on the other two), never from the net's autograd gradient. What
+the tracer reads is exactly the gradient of what it reads.
+
+**`--marching-cubes`** runs skimage's marching cubes on the ZERO LEVEL of the distance field, one 1024^3
+shard at a time with a one-voxel halo on the high faces so neighbouring shards' triangles meet, and writes
+`OUT/mesh/shard_<z>_<y>_<x>.obj` with vertices in GLOBAL ZYX voxels of this rung (so an .obj reader's x is
+our z -- stated in the file's own header rather than silently swapped, because a swap is the bug this
+contract exists to prevent). Invalid voxels are pushed to +cap so the surface never closes over a no-data
+region. This is the step that replaces `make_surf_sdt.py`'s threshold-and-EDT round trip. It needs
+`scikit-image`, which is in the `dev` extra; without it the flag raises and nothing else is affected.
+
+Deliberately not done: **screened Poisson anywhere in this path** (its documented failure mode is merging
+nearby thin layers and bridging holes -- our exact worst metric), tensor voting on the normal field, and the
+targeted min-cut. Those are post-processing on top of this export, not part of it.
+
+### 29.7 Measured step cost
+
+RTX 5080 (16 GB, laptop, shared with the desktop), `5m` at 128^3 batch 1, 15 input channels, `--deep 2`,
+`--ckpt-act 0`, bf16, whole training step, two passes -- the same protocol as 26.5, so the numbers sit
+beside Phase A's. `uv run python cloud/phase_bc_bench.py`.
+
+| arm | ms / step | vs baseline | peak MiB |
+|---|---|---|---|
+| baseline (`bce + dice`) | 427.2, 438.9 | -- | 6012 |
+| `+ --planes meta,radius` (6 planes) | 442.4, 448.8 | +3.5 %, +2.3 % | 6085 |
+| `+ --sdist` (Huber, hetero) | 450.6, 434.8 | +5.5 %, -0.9 % | 6029 |
+| `+ --loss-eikonal` | 416.1, 410.7 | -2.6 %, -6.4 % | 6029 |
+| `+ --thickness` | 419.9, 438.4 | -1.7 %, -0.1 % | 6046 |
+| `+ --normals head --loss-normals` | 403.0, 407.8 | -5.7 %, -7.1 % | 6048 |
+| `+ --pair construct` | 421.0, 419.6 | -1.5 %, -4.4 % | 6048 |
+| `+ --loss-ect --ect-n 1` | 510.5, 515.4 | +19.5 %, +17.4 % | 6012 |
+| `+ --loss-ect --ect-n 4` | 614.8, 626.3 | +43.9 %, +42.7 % | 6012 |
+| all of the above (`--ect-n 4`) | 536.7, 546.8 | +25.6 %, +24.6 % | 6120 |
+
+Read it as: the card is shared, so pass-to-pass spread is +-5 % and every arm but ECT is inside it. The
+whole Phase B stack -- six input planes, six extra head channels, the Huber, the Eikonal term, the thickness,
+the normal distillation and the constructed pair -- is free at this size; it is a handful of elementwise
+kernels on tensors the step already holds, and it adds ~110 MiB of peak, mostly the six extra input planes.
+**Only the ECT term costs anything**, and what it costs is kernel launches: eight products and eight
+`index_add_`s per direction per sub-block set. `--ect-n 1` is +18 %, `--ect-n 4` is +43 %. Experiment 7's own
+decision rule is "adopt only if Betti error improves AND step cost < +20 %", so **the pilot arm is
+`--ect-n 1 --ect-dirs 8 --ect-block 32`** and `--ect-n 4` is already over budget before it has shown
+anything. (The "all" row is under the `--ect-n 4` row because the extra head channels overlap the ECT's
+launch latency.)
+
+### 29.8 Generating the Paris 4 distance targets
+
+CPU only, on the desk, region by region. The recto mask pyramid is the published one that already serves as
+the noise ceiling (`USRM2_CEILING_STORE`), and the verso source is the region-store root the pod publishes
+into:
+
+```
+M=/vesuvius/usrm/volcomp/PHercParis4/representations/predictions/surfaces/\
+20260411134726-surface-20260413141734-surface-recto-2um-ps256-L0-th0.45.zarr
+U=/vesuvius/usrm/umbilicus/PHercParis4/umbilicus-full-resolution.json
+
+# 1. what it would write, and where
+usrm2 --umbilicus $U dist-pyramid $M --kind face midline thickness \
+      --verso /vesuvius/usrm2/teacher_regions --dry-run
+
+# 2. the HELD-OUT BOX first, to check the numbers before committing the scroll (minutes)
+usrm2 --umbilicus $U dist-pyramid $M --kind face --box 34816 14336 17408 1024 1024 1024
+
+# 3. the scroll, one 4096^3 rung-2 region at a time, nice'd so it never competes with the
+#    teacher processes for CPU (a whole level is ~10^12 rung-2 voxels)
+nice -n 19 usrm2 --umbilicus $U dist-pyramid $M --kind face midline thickness \
+      --verso /vesuvius/usrm2/teacher_regions --rungs 2-4 --box $Z $Y $X 4096 4096 4096
+```
+
+It writes `<M>_sdist.zarr`, `<M>_midline.zarr` and `<M>_thick.zarr` beside the mask, each with the levels
+the mask itself has at rungs 2..4. They then join the stores file as extra target groups on the Paris 4
+line:
+
+    <ct_base>,<recto mask>,<M>_midline.zarr,<M>_thick.zarr
+
+`--kind midline thickness` needs the verso stores to be worth anything: where none covers a voxel the
+midline is the recto face and the thickness is no-data, which is a correct but uninformative target. Verso
+coverage at rungs 2-3 is the same prerequisite Phase C has (section 23), so run `--kind face` over the whole
+scroll now and the midline pair over the regions the pod has finished.
+
+### 29.9 The recommended `u5` flag set
+
+`u5` is the Phase B arm: a WARM START from `u4` (or from `u3_30m6_cv` if `u4` did not land), growing the
+stem by six planes and the head from `cout 2` to `cout 2 + 1 + 1 + 1` (midline, thickness, log-variance).
+It needs the distance pyramids of 29.8 on the source line and it is an A6000 job (`--ckpt-act 1`; the
+fallback is `--batch 1 --accum 2`, ~15 % slower).
+
+```
+usrm2 train ~/runs/u5_30m6_bd --size 30m6 --patch 256 --batch 2 --accum 1 --ckpt-act 1 \
+    --deep D --add-skip A --lr 3e-4 \
+    --rungs 2-11 --ctx 1..9 --rung-boost 2=2 --val-rungs 2,3,4,6 \
+    --stores-file ~/stores.txt --stream ~/queue \
+    --cascade mix --cascade-self-p-anneal 0.1 0.7 --cascade-drop 0.1 \
+    --verso --teacher-regions ~/teacher_regions \
+    --aug full2 \
+    --planes radius,meta \
+    --sdist midline --thickness --normals derive --sdist-hetero \
+    --loss-sdist 1.0 --loss-eikonal 0.1 --sdist-delta 2 --sdist-band 8 \
+    --pair construct --loss-excl 0.1 --loss-selfcons 0.1 --loss-skel 0.05 --skel-iters 4 \
+    --init-from ~/runs/u4_30m6_cva/ckpt.pt --rewarm 800 --new-param-lr-mult 3 \
+    --sched wsd --stable-until 45000 --cooldown 5000 --steps 50000 --ema auto
+```
+
+and the stream queue must be planned to match, because the plane set is part of the stem:
+
+```
+usrm2 stream-plan ~/stores.txt --queue ~/queue --patch 256 --ctx 1..9 --cascade mix \
+    --verso --verso-regions-url <data.VERSO_REGIONS_URL> --teacher-regions ~/teacher_regions \
+    --planes radius,meta --walk mix --region 1024 --windows-per-region 64
+```
+
+Why each value:
+
+- **`--sdist midline` over `face`**: experiment 5 says pick midline for experiment 6 if the two are equal on
+  localisation, and this run IS experiment 6's B arm. The export converts back to the face convention, so
+  nothing downstream cares.
+- **`--normals derive`, not `head`**: three more channels buy nothing until something reads them, and the
+  export derives the normal from the stored field anyway. Add `head` only if a later loss wants an explicit
+  normal in the forward pass.
+- **`--sdist-hetero`**: one channel, free, and it is the `conf` channel the tracer contract wants.
+- **`--loss-eikonal 0.1`**: a regulariser weighted well below the Huber, as the literature's +3-5 % cost
+  estimate assumes. `--loss-normals` is absent because there is no normal head.
+- **`--pair construct`, not `construct-only`**: the learned recto/verso rows keep feeding the
+  deep-supervision heads, and they are the control the constructed pair is measured against.
+- **`--loss-excl 0.1` stays**: under `--pair construct` it is 0 by construction, so it is a free assertion
+  that the pairing really is doing what section 29.3 proves it does.
+- **`--loss-ect` is NOT in this set.** It is experiment 7, a separate arm, and it costs +18 % even at
+  `--ect-n 1`. Run it as `u6` on top of `u5`'s checkpoint -- it is the only Phase B/C flag that may be
+  turned on by a plain `--resume`, which is exactly why it is in the `grow` tuple.
+- **`--affinity` is NOT in this set**: `u4b` owns that arm, and stacking two head growths in one run makes
+  neither attributable.
+
+**Decision rule** (experiments 5 and 6): `offset<=3` 0.36 -> above 0.45 and `offset_hd95` down with
+`recall@4` not regressing (the distance head earns its place on sub-voxel localisation), and `merge_frac`
+0.44 -> below 0.40 with the gap to the ceiling at least halved (the constructed pair earns its place on
+merges). Each must move OUTSIDE the bootstrap CI of section 25.4. `overlap` is no longer independent
+evidence once `--loss-excl` is on, and under `--pair construct` it is not evidence at all -- use
+`merge_frac` and the pair-completeness metric. **Abort** the distance arm if `mae_midline` (in `eval.jsonl`,
+voxels) plateaus above ~2 voxels: a distance head that cannot beat the band's own half-thickness is not
+localising anything, and the Huber is then just a second copy of the segmentation loss.
