@@ -525,3 +525,120 @@ def test_a_curved_sheet_gets_the_sign_of_its_own_radial_direction(tmp_path):
     step = d[gz, ny, nx][sel] - d[gz, gy, gx][sel]
     assert (step > 0).mean() > 0.98                     # OUTWARD is +, on a curved sheet, everywhere
     assert np.median(step) == pytest.approx(3.0, abs=1.0)   # ... and by the distance stepped
+
+
+# ------------------------------------------------------- 29.1: --jobs and --resume over output shards
+
+def tree(root, skip=()):
+    """{relative path: bytes} of every file under `root`, for a byte-for-byte comparison of two stores."""
+    out = {}
+    for d, _, fs in os.walk(root):
+        for f in fs:
+            p = os.path.join(d, f)
+            r = os.path.relpath(p, root)
+            if any(q in r.split(os.sep) for q in skip):
+                continue
+            out[r] = open(p, "rb").read()
+    return out
+
+
+@pytest.fixture
+def tiny_shards(monkeypatch):
+    """Shard at 128^3 instead of 1024^3, so a 256^3 test level really is partitioned into 8 shards.
+
+    `--jobs` splits the work by OUTPUT SHARD; with the real 1024 cap every test level is one shard and
+    the partitioning is never exercised. `P.shard_shape` is what both the store layout and the split
+    read, so shrinking it here is the whole of the change."""
+    monkeypatch.setattr(P, "shard_shape",
+                        lambda shape, chunk=128, cap=128: tuple(min(128, int(q)) for q in TG.pad128(shape)))
+
+
+def test_dist_pyramid_jobs_is_byte_identical_to_the_serial_pass(tmp_path, monkeypatch, tiny_shards):
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    mask = dist_pyr(tmp_path, base=256, nlev=1)
+    kw = dict(kinds=("face",), rungs=(2,), umbilicus=umbilicus(tmp_path), block=128, halo=48,
+              axis_r_um=100.0, log=lambda *a, **k: None)
+    # different --tile as well as different --jobs: neither may move a byte
+    ser = TG.dist_pyramid(mask, out=str(tmp_path / "ser.zarr"), jobs=1, tile=512, **kw)["face"]
+    par = TG.dist_pyramid(mask, out=str(tmp_path / "par.zarr"), jobs=4, tile=128, **kw)["face"]
+    a = tree(ser)
+    b = tree(par)
+    assert sorted(a) == sorted(b) and len(a) > 8, "the 256^3 level must be several shards, not one file"
+    assert a == b, "a --jobs pass must land every byte where --jobs 1 does"
+    v = data.read_rung(data.rungs(par), 2, (0, 0, 0), (256, 256, 256), dtype=np.uint8)
+    assert (v != 0).any()
+
+
+def test_dist_pyramid_jobs_matches_serial_for_every_kind_with_a_verso(tmp_path, monkeypatch, tiny_shards):
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    mask = dist_pyr(tmp_path, base=256, nlev=1)
+    ver = dist_pyr(tmp_path, name="v.zarr", base=256, nlev=1)
+    kinds = ("face", "midline", "thickness")
+    kw = dict(kinds=kinds, rungs=(2,), verso=ver, umbilicus=umbilicus(tmp_path), block=128, halo=48,
+              axis_r_um=100.0, log=lambda *a, **k: None)
+    # the out paths come from the mask name when there is more than one kind, so each pass gets its own
+    for name, jobs in (("s.zarr", 1), ("p.zarr", 3)):
+        os.makedirs(tmp_path / name, exist_ok=True)
+        for q in os.listdir(mask):
+            src, dst = os.path.join(mask, q), os.path.join(tmp_path, name, q)
+            if not os.path.exists(dst):
+                (os.symlink(src, dst))
+    s = TG.dist_pyramid(str(tmp_path / "s.zarr"), jobs=1, **kw)
+    p = TG.dist_pyramid(str(tmp_path / "p.zarr"), jobs=3, **kw)
+    for kd in kinds:
+        a, b = tree(s[kd]), tree(p[kd])
+        assert sorted(a) == sorted(b)
+        for r in a:
+            if r == "zarr.json":
+                continue          # the group node records source_mask, which is the only difference
+            assert a[r] == b[r], f"{kd}: {r} differs between --jobs 1 and --jobs 3"
+
+
+def test_dist_pyramid_resume_skips_finished_shards_and_finishes_the_rest(tmp_path, monkeypatch,
+                                                                         tiny_shards):
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    mask = dist_pyr(tmp_path, base=256, nlev=1)
+    kw = dict(kinds=("face",), rungs=(2,), umbilicus=umbilicus(tmp_path), block=128, halo=48,
+              axis_r_um=100.0, log=lambda *a, **k: None)
+    want = tree(TG.dist_pyramid(mask, out=str(tmp_path / "whole.zarr"), jobs=1, **kw)["face"])
+    out = str(tmp_path / "half.zarr")
+    lines = []
+    # a z-slab first, as a split across hosts would do it, then the whole thing on top of it
+    TG.dist_pyramid(mask, out=out, jobs=2, resume=True, box=((0, 0, 0), (128, 256, 256)),
+                    **{**kw, "log": lambda *a, **k: None})
+    done = len(os.listdir(os.path.join(out, ".shards", "2.4")))
+    assert 0 < done < 8, f"the z-slab should finish some shards, not all: {done}"
+    TG.dist_pyramid(mask, out=out, jobs=2, resume=True, **{**kw, "log": lambda *a, **k: lines.append(a[0])})
+    assert any(f"{done} already done" in q for q in lines), lines
+    assert tree(out) == want, "a resumed build must equal the one-shot build byte for byte"
+
+
+def test_dist_pyramid_resume_never_trusts_a_shard_the_box_only_half_covered(tmp_path, monkeypatch,
+                                                                            tiny_shards):
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    mask = dist_pyr(tmp_path, base=256, nlev=1)
+    kw = dict(kinds=("face",), rungs=(2,), umbilicus=umbilicus(tmp_path), block=64, halo=48,
+              axis_r_um=100.0, log=lambda *a, **k: None)
+    out = str(tmp_path / "part.zarr")
+    # blocks of 64 inside 128 shards: this box covers the LOWER HALF of the z=0 shards only
+    TG.dist_pyramid(mask, out=out, jobs=1, resume=True, box=((0, 0, 0), (64, 256, 256)), **kw)
+    assert not os.path.isdir(os.path.join(out, ".shards", "2.4")) or \
+        os.listdir(os.path.join(out, ".shards", "2.4")) == [], "a half-covered shard must not be marked"
+    lines = []
+    TG.dist_pyramid(mask, out=out, jobs=1, resume=True, **{**kw, "log": lambda *a, **k: lines.append(a[0])})
+    assert any("0 already done" in q for q in lines), lines
+    assert tree(out) == tree(TG.dist_pyramid(mask, out=str(tmp_path / "w.zarr"), jobs=1, **kw)["face"])
+
+
+def test_dist_pyramid_resume_keeps_the_level_a_previous_run_wrote(tmp_path, monkeypatch, tiny_shards):
+    """`predict.out_array` is overwrite=True; without the --resume branch of `_level` a restart would
+    delete every shard it was meant to keep."""
+    monkeypatch.setattr(data, "UMBILICUS", umbilicus(tmp_path))
+    mask = dist_pyr(tmp_path, base=256, nlev=1)
+    kw = dict(kinds=("face",), rungs=(2,), umbilicus=umbilicus(tmp_path), block=128, halo=48,
+              axis_r_um=100.0, log=lambda *a, **k: None)
+    out = str(tmp_path / "k.zarr")
+    TG.dist_pyramid(mask, out=out, jobs=1, resume=True, box=((0, 0, 0), (128, 256, 256)), **kw)
+    kept = tree(out, skip=(".shards",))
+    TG.dist_pyramid(mask, out=out, jobs=1, resume=True, box=((0, 0, 0), (128, 256, 256)), **kw)
+    assert tree(out, skip=(".shards",)) == kept and len(kept) > 1

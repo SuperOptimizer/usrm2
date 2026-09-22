@@ -336,6 +336,19 @@ def main(argv=None):
     dp.add_argument("--box", type=int, nargs=6, default=None, metavar=("Z0", "Y0", "X0", "Z", "Y", "X"),
                     help="only visit the blocks inside this box, given at RUNG 2 (a whole Paris 4 level "
                          "is 10^12 rung-2 voxels: the full pass is a region-by-region job)")
+    dp.add_argument("--jobs", type=int, default=1, metavar="N", help="compute N output SHARDS "
+                    "(~1024^3 each) at a time in worker PROCESSES; one worker owns a shard, so no two "
+                    "ever write the same file and the output is byte-identical to --jobs 1. The cost is "
+                    "two scipy EDTs per block and those hold the GIL, so this is the only way to use "
+                    "more than one core")
+    dp.add_argument("--tile", type=int, default=512, help="read the mask one TILE^3 window at a time "
+                    "instead of once per block: every block wants its core plus a --halo, so per-block "
+                    "reads decode each voxel ~5x over. A tile whose mask chunks are all absent from disk "
+                    "is air and is skipped without decoding anything")
+    dp.add_argument("--resume", action="store_true", help="keep the existing levels and skip every shard "
+                    "a previous run finished (a per-shard marker written .part-then-renamed, never the "
+                    "shard file itself, which zarr fills chunk by chunk). A shard --box only partly "
+                    "covers is never marked, so z-slab boxes can be split across hosts and rerun")
     dp.add_argument("--dry-run", action="store_true", help="print what would be written and stop")
     xt = sub.add_parser("export-tracer", help="write the tracer contract (docs/research/"
                         "synthesis_v2_with_literature.md section 2) over a box from a --sdist checkpoint: "
@@ -623,6 +636,7 @@ def main(argv=None):
                         rungs=(range(0, TG.MAX_RUNG + 1) if rs is True else sorted(rs)),
                         volume=a.volume, umbilicus=a.umbilicus, block=a.block, halo=a.halo,
                         box=((a.box[:3], a.box[3:]) if a.box else None), dry_run=a.dry_run,
+                        jobs=a.jobs, resume=a.resume, tile=a.tile,
                         **{k: v for k, v in dict(axis_r_um=a.axis_r_um, tmin=a.tmin,
                                                  max_rung=a.max_rung).items() if v is not None})
     elif a.cmd == "export-tracer":

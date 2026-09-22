@@ -1865,6 +1865,45 @@ job is done region by region and the held-out box can be done on its own to chec
 This is CPU work -- two `scipy` EDTs per block per rung. It must not be run on a card a training job is
 using; it does not touch one.
 
+**`--jobs N`, and why a single core was never going to finish.** Rung 2 of Paris 4 is 75784 x 32693 x
+32693, which is 593 x 256 x 256 = **38.9 million** 128^3 blocks, and rungs 3 and 4 add another 14%. The
+first single-core pass measured ~85k blocks/hour, i.e. ~19 days per kind. Three things fix it, and none of
+them changes a single byte of the output:
+
+- **`--jobs N` runs N worker PROCESSES**, one per output SHARD (`predict.shard_shape`, ~1024^3, one file).
+  A shard is owned by exactly one worker for the whole of its life, so no two processes ever write the
+  same file -- which is the only sharing hazard, because zarr rewrites a whole shard file per chunk put.
+  Processes, not threads: the cost is `scipy.ndimage.distance_transform_edt`, which holds the GIL for the
+  whole transform. (The volcomp encoder under the store DOES release it -- it is a `ctypes.CDLL` call into
+  `libvolcomp` -- but it is a few percent of the work, so threads would scale to about one core.)
+- **`--tile T` (default 512) reads the mask one T^3 window at a time**, not once per block. Every block
+  wants its core plus a 48-voxel halo, so per-block reads decode each voxel (128 + 96)^3 / 128^3 = **5.4x
+  over**; a 512 tile decodes it 1.5x and does it as one sequential pass over a few shard files instead of
+  64 scattered ones.
+- **a tile with no mask chunk on disk is skipped without decoding anything** (`targets._any_present`).
+  The published mask is sparse: **31.5%** of its 1024^3 shards have a file, and a missing chunk reads back
+  as the fill value, 0. The serial loop already skipped every block of such a window ("the block's mask is
+  all background"); asking the chunk index instead of decoding ~10 MB per block is the same answer for
+  free. Note this is the OPPOSITE question to `data.covered`, which asks whether EVERY chunk is there so
+  that a partial CT mirror is not sampled through a hole; here a hole is air and the answer is to skip it.
+
+Together that is ~17x less decoding and then N-fold parallelism: at `--jobs 12` the scroll is hours, not
+weeks. Because the partition is by shard and the blocks, halos and destinations are unchanged, the output
+is **byte-identical to `--jobs 1`** -- `tests/test_phase_bc.py` asserts exactly that, file by file, for
+every kind and with a verso source.
+
+**`--resume`** skips a shard a previous run finished and keeps the levels it wrote (`predict.out_array` is
+`overwrite=True`; without this a restart would delete everything it meant to keep). Completion is a
+per-shard MARKER under `<out>/.shards/<um>/<z>_<y>_<x>.done` -- a hidden directory, so `data.rungs`, which
+takes only numeric level names, never mistakes it for a level. The marker is written as `.part` and
+RENAMED, because rename is atomic on POSIX: a run killed mid-shard leaves the old state or nothing, never a
+half-written marker. The shard's own zarr file cannot be the signal -- zarr fills a shard chunk by chunk,
+so the file exists and reads back fine from the shard's first block onwards, long before the shard is done.
+A shard that `--box` only partly covers is never marked, so a build really can be split into z-slabs across
+hosts and finished later without any slab trusting a neighbour's half-written shard. A marker is per output
+group, and a shard counts as done only when every `--kind` of the run has one, since the kinds come out of
+one shared EDT pass.
+
 ### 29.2 The output heads (`--sdist`, `--thickness`, `--normals`, `--sdist-hetero`)
 
 The head layout, in one 1x1x1 convolution as always:
@@ -2148,10 +2187,16 @@ usrm2 --umbilicus $U dist-pyramid $M --kind face midline thickness \
 # 2. the HELD-OUT BOX first, to check the numbers before committing the scroll (minutes)
 usrm2 --umbilicus $U dist-pyramid $M --kind face --box 34816 14336 17408 1024 1024 1024
 
-# 3. the scroll, one 4096^3 rung-2 region at a time, nice'd so it never competes with the
-#    teacher processes for CPU (a whole level is ~10^12 rung-2 voxels)
+# 3. the scroll, 12 worker processes over the output shards, nice'd so it never competes with
+#    the teacher processes for CPU. --resume makes a restart (or a reboot) cost only the shards
+#    that were in flight; a single core would need ~19 days for this, 12 need hours
 nice -n 19 usrm2 --umbilicus $U dist-pyramid $M --kind face midline thickness \
-      --verso /vesuvius/usrm2/teacher_regions --rungs 2-4 --box $Z $Y $X 4096 4096 4096
+      --verso /vesuvius/usrm2/teacher_regions --rungs 2-4 --jobs 12 --resume
+
+# 3b. or split it by z-slab across hosts: a shard a --box only half covers is never marked done,
+#     so no slab ever trusts a neighbour's half-written shard
+nice -n 19 usrm2 --umbilicus $U dist-pyramid $M --kind face --rungs 2-4 --jobs 12 --resume \
+      --box $Z 0 0 8192 32768 32768
 ```
 
 It writes `<M>_sdist.zarr`, `<M>_midline.zarr` and `<M>_thick.zarr` beside the mask, each with the levels

@@ -219,7 +219,7 @@ def pad128(shape):
 def dist_pyramid(mask, out=None, verso=None, kinds=("face",), rungs=range(0, MAX_RUNG + 1),
                  volume=None, umbilicus=None, axis_r_um=AXIS_R_UM, tmin=TMIN, cap=CAP, thr=0.5,
                  block=128, halo=48, max_rung=MAX_RUNG, native_plus=1, box=None, dry_run=False,
-                 log=print):
+                 jobs=1, resume=False, tile=512, log=print):
     """Write the distance pyramid(s) of a mask pyramid. Returns {kind: path}.
 
     One pass per rung per kind. A rung is written only when the MASK ITSELF has a level there (never a
@@ -237,13 +237,27 @@ def dist_pyramid(mask, out=None, verso=None, kinds=("face",), rungs=range(0, MAX
     `box` ((z, y, x), (Z, Y, X)) at RUNG 2, as every box in this codebase is: only the blocks inside it
     are visited. A whole Paris 4 level is 10^12 rung-2 voxels, so the full pass is a region-by-region
     job; this is also how the held-out box alone is done, to check the numbers before committing a scroll.
+
+    `jobs` > 1 runs the blocks in worker PROCESSES, grouped so that one worker owns a whole output SHARD
+    (`predict.shard_shape`, one ~1024^3 file) and no two workers ever write the same file. Processes, not
+    threads: the cost here is two scipy EDTs per block, and `scipy.ndimage.distance_transform_edt` holds
+    the GIL for the whole transform. (The volcomp encoder underneath does release it -- it is a ctypes
+    `CDLL` call into libvolcomp -- but it is a few percent of the work, so threads would scale to about
+    one core anyway.) The work is partitioned by shard, so the blocks are the same blocks with the same
+    halos and each lands in the same place: the output is byte-identical to the serial pass.
+
+    `resume` skips a shard that a previous run finished, so a killed run restarts where it stopped and a
+    build can be split across hosts by `--box` z-slabs. Completion is a per-shard MARKER (see
+    `_mark_shard`), not the presence of the shard's zarr file -- zarr fills a shard chunk by chunk, so
+    the file appears with the first block of the shard. A shard the `box` only partly covers is never
+    marked, so a boxed run cannot make a later full run skip work it never did. `resume` also keeps the
+    existing levels instead of re-creating them (`predict.out_array` is `overwrite=True`).
     """
     kinds = tuple(kinds)
     assert set(kinds) <= set(SUFFIX), f"kinds {kinds}: a subset of {sorted(SUFFIX)}"
     assert halo >= cap + 8, f"--halo {halo} is below the clamp {cap} + the band half-width"
     pyr = data.rungs(mask)
     nat = min(pyr)
-    vs = None if not verso else VersoSource(verso)
     ax0 = data.axis(umbilicus or data.group_attrs(mask).get("umbilicus") or None)
     outs = {k: (out if out and len(kinds) == 1 else out_name(mask, k)) for k in kinds}
     ks = sorted(k for k in rungs if k in pyr and k <= max_rung and k <= nat + native_plus)
@@ -251,39 +265,49 @@ def dist_pyramid(mask, out=None, verso=None, kinds=("face",), rungs=range(0, MAX
         + ", ".join(f"{k}:{v}" for k, v in outs.items()))
     if dry_run:
         return outs
+    from usrm2 import predict as P
     made = {k: [] for k in kinds}
+    cfg = dict(mask=str(mask), verso=(str(verso) if verso else None), kinds=kinds, outs=dict(outs),
+               ax0=ax0, axis_r_um=float(axis_r_um), tmin=float(tmin), cap=float(cap), thr=float(thr),
+               block=int(block), halo=int(halo), tile=int(tile or block))
     for k in ks:
         shape = tuple(int(v) for v in data.rung_shape(pyr, k))
         um = data.rung_um(k)
-        ax = data.axis_at(ax0, k)
-        rmin = float(axis_r_um) / um
-        arrs = {}
         for kd in kinds:
-            p = f"{outs[kd]}/{um:g}"
-            arrs[kd] = _level(p, pad128(shape), um, k, volume, umbilicus)
+            _level(f"{outs[kd]}/{um:g}", pad128(shape), um, k, volume, umbilicus, resume=resume)
             made[kd].append(f"{um:g}")
-        nb = nw = 0
-        for lo in _blocks(shape, block, _box_at(box, k)):
-            olo = np.maximum(np.asarray(lo, np.int64) - halo, -halo)
-            osh = tuple(int(min(block, shape[i] - lo[i])) + 2 * halo for i in range(3))
-            rec = data.read_rung(pyr, k, olo, osh, dtype=np.uint8)
-            nb += 1
-            if not (rec >= int(round(thr * 255))).any():
-                continue
-            nw += 1
-            ver = None if vs is None else vs.read(k, olo, osh)
-            dy, dx, r = axis_offsets(ax, olo, osh)
-            dr, m, t, okt = block_fields(rec, ver, dy, dx, thr=thr, cap=cap, tmin=tmin)
-            ok = r >= rmin
-            sl = tuple(slice(halo, halo + int(min(block, shape[i] - lo[i]))) for i in range(3))
-            for kd in kinds:
-                u = (encode_signed(dr, ok, cap) if kd == "face" else
-                     encode_signed(m, ok, cap) if kd == "midline" else
-                     encode_unsigned(t, ok & okt))
-                _put(arrs[kd], u[sl], *lo)
-            if nw % 200 == 0:
-                log(f"  rung {k} ({um:g} um): {nw} blocks written / {nb} visited", flush=True)
-        log(f"  rung {k} ({um:g} um) {shape}: {nw} blocks written / {nb} visited")
+        sh = P.shard_shape(pad128(shape))
+        g0, g1 = _visited(shape, block, _box_at(box, k))
+        data.chunk_index(pyr[k])   # scanned ONCE here, so every forked worker inherits it for free
+        keys = [key for key in _shard_keys(sh, g0, g1)]
+        todo = [(key, _shard_full(key, sh, shape, g0, g1)) for key in keys]
+        if resume:
+            todo = [t for t in todo if not _shard_done(outs, kinds, um, t[0])]
+        log(f"  rung {k} ({um:g} um) {shape}: {len(keys)} shards, {len(keys) - len(todo)} already "
+            f"done, {len(todo)} to do on {max(1, int(jobs))} job(s)", flush=True)
+        nb = nw = ns = nsk = 0
+
+        def done(r):
+            nonlocal nb, nw, ns, nsk
+            nb, nw, ns, nsk = nb + r[0], nw + r[1], ns + 1, nsk + r[2]
+            if ns % 200 == 0 or ns == len(todo):
+                log(f"  rung {k} ({um:g} um): {ns}/{len(todo)} shards ({nsk} with no mask on disk), "
+                    f"{nw} blocks written / {nb} visited", flush=True)
+
+        args = (k, um, shape, sh, g0, g1)
+        if max(1, int(jobs)) == 1 or not todo:
+            _ctx_init(cfg)
+            for key, full in todo:
+                done(_shard(*args, key, full))
+        else:
+            import concurrent.futures as cf
+            import multiprocessing as mp
+            with cf.ProcessPoolExecutor(max_workers=int(jobs), mp_context=mp.get_context("fork"),
+                                        initializer=_ctx_init, initargs=(cfg,)) as ex:
+                for f in cf.as_completed([ex.submit(_shard, *args, key, full) for key, full in todo]):
+                    done(f.result())
+        log(f"  rung {k} ({um:g} um) {shape}: {nw} blocks written / {nb} visited in {ns} shards "
+            f"({nsk} skipped whole: no mask chunk on disk)")
     for kd in kinds:
         # a second run of this tool in the same process must not read the previous run's array handles
         # NOR its decoded levels (`data.full_level` caches whole small levels by "<dir>#<rung>")
@@ -305,6 +329,198 @@ def dist_pyramid(mask, out=None, verso=None, kinds=("face",), rungs=range(0, MAX
             "volcomp": {"rung_voxel_size_um": data.rung_um(nat)},
         })
     return outs
+
+
+# ----------------------------------------------------------------------------- shards, resume, jobs
+
+def _visited(shape, block, box):
+    """(start, stop) of the region `_blocks` walks: the box snapped DOWN to a block boundary and clipped
+    to the level, or the whole level. Every block origin is a multiple of `block`, box or no box."""
+    shape = np.asarray(shape, np.int64)
+    if box is None:
+        return np.zeros(3, np.int64), shape
+    lo = np.maximum(np.asarray(box[0], np.int64) // block * block, 0)
+    return lo, np.minimum(np.asarray(box[0], np.int64) + np.asarray(box[1], np.int64), shape)
+
+
+def _shard_keys(sh, g0, g1):
+    """The output shards that the visited region touches, in z, y, x order."""
+    sh = np.asarray(sh, np.int64)
+    a, b = g0 // sh, -(-g1 // sh)
+    for z in range(int(a[0]), int(max(b[0], a[0]))):
+        for y in range(int(a[1]), int(max(b[1], a[1]))):
+            for x in range(int(a[2]), int(max(b[2], a[2]))):
+                yield (z, y, x)
+
+
+def _shard_blocks(key, sh, g0, g1, block):
+    """The block origins of one shard, in the same order and on the same grid as `_blocks`."""
+    sh = np.asarray(sh, np.int64)
+    a = np.maximum(np.asarray(key, np.int64) * sh, g0)
+    b = np.minimum((np.asarray(key, np.int64) + 1) * sh, g1)
+    a = -(-a // block) * block
+    for z in range(int(a[0]), int(b[0]), block):
+        for y in range(int(a[1]), int(b[1]), block):
+            for x in range(int(a[2]), int(b[2]), block):
+                yield (z, y, x)
+
+
+def _shard_full(key, sh, shape, g0, g1):
+    """Does this shard lie entirely inside the region `_blocks` visits? Only then may it be marked done.
+
+    A shard the `box` cuts in half is still computed -- the blocks inside the box are written -- but it
+    is not recorded, so the run that covers the rest of it does the whole shard again rather than
+    trusting a partial one."""
+    sh = np.asarray(sh, np.int64)
+    lo = np.asarray(key, np.int64) * sh
+    hi = np.minimum(lo + sh, np.asarray(shape, np.int64))
+    return bool((lo >= np.asarray(g0)).all() and (hi <= np.asarray(g1)).all())
+
+
+def _any_present(arr, lo, n):
+    """Is ANY write-chunk of `arr` overlapping [lo, lo+n) on disk?
+
+    The published mask is a sparse store: 68% of its 1024^3 shards have no file at all, and a missing
+    chunk reads back as the fill value, 0. So a window with no chunk on disk is all air, and the serial
+    loop's own rule ("a block whose mask is entirely background is skipped") already skips every block in
+    it -- testing the index instead of decoding ~10 MB per block is the same answer for free.
+
+    `data.covered` asks the opposite question (is EVERY chunk there), for a partial CT mirror where a
+    hole must not be sampled; here a hole is air and the answer is to skip it."""
+    g, pres = data.chunk_index(arr)
+    if pres is None:
+        return True
+    lo, n = np.asarray(lo, np.int64), np.asarray(n, np.int64)
+    S = np.array(arr.shape[-3:], np.int64)
+    a = np.maximum(lo, 0) // g
+    b = -(-np.minimum(lo + n, S) // g)
+    if (b <= a).any():
+        return False
+    return bool(pres[a[0]:b[0], a[1]:b[1], a[2]:b[2]].any())
+
+
+def _state_dir(outp, um):
+    """Where the per-shard done markers live: a HIDDEN directory in the output group, so `data.rungs`
+    (which takes only numeric level names) never mistakes it for a level."""
+    return os.path.join(str(outp), ".shards", f"{um:g}")
+
+
+def _shard_marker(outp, um, key):
+    return os.path.join(_state_dir(outp, um), "%d_%d_%d.done" % tuple(int(q) for q in key))
+
+
+def _mark_shard(outp, um, key):
+    """Record that every block of one output shard has been written.
+
+    Written as `<marker>.part` and RENAMED, because rename is atomic on a POSIX filesystem: a run killed
+    mid-write leaves either the old state or nothing, never a half-written marker that `--resume` would
+    read as done. The shard's own zarr file cannot serve as the signal -- zarr fills a shard chunk by
+    chunk, so the file exists and reads back fine from the first block of the shard onwards."""
+    p = _shard_marker(outp, um, key)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p + ".part", "w") as f:
+        f.write("done\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(p + ".part", p)
+
+
+def _shard_done(outs, kinds, um, key):
+    """A shard is done only when EVERY kind of this run has its marker: the kinds are computed together
+    from one EDT pass, so a shard half of whose kinds are written has to be redone."""
+    return all(os.path.exists(_shard_marker(outs[kd], um, key)) for kd in kinds)
+
+
+_CTX = {}
+
+
+def _ctx_init(cfg):
+    """Per-process state of a `--jobs` worker. Nothing is inherited across the fork: the caches are
+    cleared and every handle is opened again in the child, so a worker cannot read a parent's array
+    whose metadata predates the level this run just created."""
+    data.CTX_CACHE.clear()
+    _CTX.clear()
+    _CTX.update(cfg=cfg, pyr=data.rungs(cfg["mask"]),
+                vs=(None if not cfg["verso"] else VersoSource(cfg["verso"])), arr={}, ax={})
+
+
+def _open_rw(path):
+    import zarr
+    try:
+        import volcomp_zarr  # noqa: F401  (registers the "volcomp" codec)
+    except Exception:  # noqa: BLE001
+        pass
+    return zarr.open(str(path), mode="r+")
+
+
+def _shard(k, um, shape, sh, g0, g1, key, full):
+    """Compute and write every block of ONE output shard. Returns (visited, written, tiles skipped whole).
+
+    This is the body of the serial loop moved behind a shard boundary. No two tasks share a shard, and
+    within a shard each `block`^3 core is exactly one zarr chunk, so the writes are disjoint files and
+    the result does not depend on how the shards were handed out.
+
+    Two things make it far faster than the per-block loop it replaces, and neither changes a byte:
+
+      * the mask is read one TILE at a time (`cfg["tile"]`, default 512) instead of once per block. Every
+        block needs its core plus a `halo` of context, so per-block reads decode each voxel (256/128)^3 =
+        5.4 times over; a tile read decodes it 1.5 times, and a tile is one sequential pass over a few
+        shard files rather than 64 scattered ones.
+      * a tile none of whose mask chunks exist on disk is air (`_any_present`), and the serial loop
+        skipped every one of its blocks anyway, so it is skipped without decoding anything.
+
+    The VERSO source is still read per block: it returns None for a block that straddles two region
+    stores, which is a per-block decision, and only the ~2% of blocks with a recto band ever ask for it.
+    """
+    cfg, pyr, vs = _CTX["cfg"], _CTX["pyr"], _CTX["vs"]
+    block, halo, thr, cap = cfg["block"], cfg["halo"], cfg["thr"], cfg["cap"]
+    tile = max(int(cfg["tile"]), block)
+    if k not in _CTX["ax"]:
+        _CTX["ax"][k] = data.axis_at(cfg["ax0"], k)
+    ax, rmin = _CTX["ax"][k], cfg["axis_r_um"] / um
+    arrs = {}
+    for kd in cfg["kinds"]:
+        p = f'{cfg["outs"][kd]}/{um:g}'
+        if p not in _CTX["arr"]:
+            _CTX["arr"][p] = _open_rw(p)
+        arrs[kd] = _CTX["arr"][p]
+    tiles = {}
+    for lo in _shard_blocks(key, sh, g0, g1, block):
+        tiles.setdefault(tuple(int(lo[i]) // tile for i in range(3)), []).append(lo)
+    nb = nw = nsk = 0
+    for tk in sorted(tiles):
+        los = tiles[tk]
+        tlo = np.asarray(los[0], np.int64) // tile * tile
+        thi = np.minimum(tlo + tile, np.asarray(shape, np.int64))
+        rlo, rsh = tlo - halo, tuple(int(q) for q in (thi - tlo) + 2 * halo)
+        if not _any_present(pyr[k], rlo, rsh):
+            nb += len(los)
+            nsk += 1
+            continue
+        buf = data.read_rung(pyr, k, rlo, rsh, dtype=np.uint8)
+        for lo in los:
+            olo = np.maximum(np.asarray(lo, np.int64) - halo, -halo)
+            osh = tuple(int(min(block, shape[i] - lo[i])) + 2 * halo for i in range(3))
+            o = olo - rlo
+            rec = buf[o[0]:o[0] + osh[0], o[1]:o[1] + osh[1], o[2]:o[2] + osh[2]]
+            nb += 1
+            if not (rec >= int(round(thr * 255))).any():
+                continue
+            nw += 1
+            ver = None if vs is None else vs.read(k, olo, osh)
+            dy, dx, r = axis_offsets(ax, olo, osh)
+            dr, m, t, okt = block_fields(rec, ver, dy, dx, thr=thr, cap=cap, tmin=cfg["tmin"])
+            ok = r >= rmin
+            sl = tuple(slice(halo, halo + int(min(block, shape[i] - lo[i]))) for i in range(3))
+            for kd in cfg["kinds"]:
+                u = (encode_signed(dr, ok, cap) if kd == "face" else
+                     encode_signed(m, ok, cap) if kd == "midline" else
+                     encode_unsigned(t, ok & okt))
+                _put(arrs[kd], u[sl], *lo)
+    if full:
+        for kd in cfg["kinds"]:
+            _mark_shard(cfg["outs"][kd], um, key)
+    return nb, nw, nsk
 
 
 def _box_at(box, k):
@@ -330,8 +546,15 @@ def _put(arr, u8, z, y, x):
     P.put(arr, u8, z, y, x)
 
 
-def _level(path, shape, um, k, volume, umbilicus):
+def _level(path, shape, um, k, volume, umbilicus, resume=False):
     from usrm2 import predict as P
+    if resume and os.path.isdir(path):
+        # `P.out_array` is overwrite=True: creating the level again would throw away every shard a
+        # previous run wrote, which is the one thing --resume exists to prevent.
+        a = _open_rw(path)
+        assert tuple(int(v) for v in a.shape[-3:]) == tuple(int(v) for v in shape), \
+            f"{path}: --resume found a level of shape {tuple(a.shape)}, expected {tuple(shape)}"
+        return a
     # q=0, LOSSLESS. volcomp q8 -- the probability stores' setting -- rounds: a stored 0 can read back
     # as a 6, which would silently turn the no-data marker into a -30.5-voxel distance, and it compounds
     # under the partial-chunk writes a block smaller than 128 makes. A distance field is smooth, so the

@@ -116,7 +116,8 @@ input is a z-scored CT patch, output is one recto-probability logit per voxel.
     usrm2 calibrate RUN/ckpt.pt                   # one temperature per rung, written into the checkpoint
     usrm2 glc-weights mask=/vesuvius/usrm2/teacher/eval.zarr store=REG.zarr   # suggested --source-w
     usrm2 ablate /vesuvius/usrm2/runs/ablate1 --presets geo,all --steps 3000 --patch 96 --batch 4
-    usrm2 dist-pyramid MASK.zarr --kind face midline thickness --verso ~/teacher_regions   # section 29.1
+    usrm2 dist-pyramid MASK.zarr --kind face midline thickness --verso ~/teacher_regions \
+          --jobs 12 --resume                                  # section 29.1 (one worker per output shard)
     usrm2 export-tracer RUN/ckpt.pt OUT --origin ... --size ...   # the tracer contract, ONE pass
     usrm2 ladder ~/runs/ladder --queue ~/queue --stores-file ~/stores.txt --base "..."   # experiment 12
     usrm2 ladder-report ~/runs/ladder/{15m,30m6,60m}   # 1 - dice vs log(params), per rung
