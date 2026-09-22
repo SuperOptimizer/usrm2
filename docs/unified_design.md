@@ -1042,3 +1042,129 @@ opened array when it fails with something that looks like a decode error (`data.
 re-opened handle, so the retry costs one open, not one per read). `tests/test_verso_out.py` reproduces the
 A100 failure exactly -- open a store, strip it underneath, watch the raw read raise -- and checks the
 recovery, and that a non-decode error is still raised rather than retried.
+
+## 27. Physics augmentation v2 (`full2`, implemented 2026-09-21)
+
+Phase D / experiment 10 of `docs/research/synthesis_v2_with_literature.md` (R9), from
+`docs/research/lit_ct_physics_augmentation.md` sections 1, 4, 5 and 9. Three changes, all behind the preset
+mechanism: **`full` is untouched**, and `full2` = `full` + the two new keys (`paganin`, `shuffle`).
+
+### 27.1 `_paganin_jitter`: re-filtering the cube at a different delta/beta
+
+nabu's phase step is a Fourier-domain low-pass (Paganin 2002) followed by an unsharp mask, both applied to
+the projections before reconstruction. Their net effect on the reconstructed volume is close to isotropic,
+so we model the pair as one 3D transfer function. With `f` the spatial frequency in cycles/um:
+
+```
+H(f; db)    = 1 / (1 + pi * db * lambda * D * f^2)        Paganin: a Lorentzian low-pass
+U(f; a, s)  = 1 + a * (1 - exp(-2 pi^2 s^2 f^2))          nabu's unsharp, I' = (1+a) I - a G_s * I
+```
+
+with `db = delta/beta`, `lambda = 1.2398e-3 / E[keV]` um, `D = sampleDetectorDistance` (um), `s` the unsharp
+sigma in um. (Paganin's own form, `1 / (1 + db*lambda*D*|k|^2/(4 pi))` for the angular wavenumber
+`k = 2 pi f`, is the same thing.) A scan is reconstructed ONCE, with its own `(db0, a0, s0)`. To ask what
+the cube would have looked like had nabu been run with `(db', a', s')`, we apply the RATIO of the two
+transfer functions to the reconstructed cube:
+
+```
+T(f) = H(f; db') U(f; a', s') / ( H(f; db0) U(f; a0, s0) )
+     = (1 + L0^2 f^2) / (1 + L1^2 f^2) * U(f; a', s') / U(f; a0, s0),    L^2 = pi * db * lambda * D
+```
+
+so the scan's own parameters give `T == 1` exactly: **the identity is inside the sampled range**, which is
+what makes the op safe to switch on for a scan whose metadata we have (tested to <= 1/255). One
+`rfftn`/`irfftn` per batch, cost comparable to `_spectral`.
+
+Everything enters as `L/vox` and `s/vox`, so the frequency grid is in cycles per VOXEL and the op is
+**scale-aware for free**: the same physics at a coarser rung is a proportionally smaller filter in voxels.
+`vox_um` is set by `for_rung` and may be per sample.
+
+Two guards: `T` is clamped to `[1/gmax, gmax]` (`gmax=4`) because a smaller `db'` is a deconvolution and
+would otherwise amplify the noise floor without bound, and the output is kept inside the sample's own tone
+range widened by `keep` (0.25 of the range) because a Lorentzian ratio overshoots at sheet edges.
+
+Sampling (`aug.PAGANIN`): `db'` log-uniform, `a'` uniform, `s'` log-uniform. The defaults are the corpus
+span widened 2x each way (`scanmeta.WIDEN`):
+
+| parameter | corpus (the two inspected scans) | sampled default |
+|---|---|---|
+| delta/beta | 1000 (2.4 um Paris 4) / 500 (1.1 um mosaic) | 250 - 2000, log-uniform |
+| unsharp coeff | 4.0 / 4.0 | 2.0 - 8.0 |
+| unsharp sigma | 1.2 px @ 2.4 um = 2.88 um / 2.5 px @ 1.1 um = 2.75 um | 1.375 - 5.76 um, log-uniform |
+
+The unsharp sigma is very nearly CONSTANT IN MICRONS across the fleet (2.75-2.88 um) while it is 2x apart in
+pixels. That is the whole argument for 27.2.
+
+### 27.2 Sigmas in microns, not voxels
+
+The PSF-type ops take a Gaussian sigma whose ranges were calibrated on 2.4 um data, i.e. their numbers are
+`sigma_um / 2.4`. `aug.for_rung(cfg, k)` rewrites them for another rung as
+
+```
+sigma_vox(k) = sigma_um / rung_um(k) = sigma_vox(rung 2) * 2.4 / rung_um(k) = sigma_vox(2) * 2^(2-k)
+```
+
+so one rung coarser is exactly half the voxel sigma, and **rung 2 is bit-identical to today** (tested).
+Converted (`aug.SIGMA_KEYS`): `blur.lo/hi`, `sharpen.sigma`, `unsharp.s_lo/s_hi`,
+`aniso_blur.z_lo/z_hi/yx_lo/yx_hi`, `haze.s_lo/s_hi`. NOT converted, deliberately: `ring`/`stripe` widths (a
+detector line is a fixed number of DETECTOR pixels, not a fixed length in the sample), `elastic.sigma` and
+`sheetcomp.smooth` (geometry, not a PSF), `haze.r_*` (a blob-count divisor), and `paganin.s_lo/s_hi`
+(already microns).
+
+`aug.apply(x, tg, cfg, rung=k)` is the hook: `rung` is an int, or one per sample (then the scalar-sigma ops
+use the batch's median rung -- they draw one sigma for the whole batch anyway -- and `paganin` gets the true
+per-sample pitch). `rung=None` keeps rung-2 behaviour, so a caller that does not pass it loses nothing.
+**Left to the train.py owner**: passing the sampled rung of the batch through to `apply`.
+
+### 27.3 Shuffled artefact order
+
+SinoSynth (arXiv:2409.18355) randomises the COMPOSITION ORDER of its degradation chain per sample, not just
+each step's occurrence: a fixed order lets the network learn order-specific correlations that no real
+acquisition chain guarantees. `cfg["shuffle"]` replaces the fixed `INTENS` order with a per-sample
+permutation; the geometric ops (`spatial`) and `_cor` (which needs the radial channels) keep their place.
+
+Batched implementation: draw `slot[b, t]` = the op sample `b` applies `t`-th, then walk the slots and run op
+`i` only on the samples that both drew it and put it in this slot. An op that no selected sample placed in
+slot `t` costs nothing, so the extra work is bounded by the number of distinct (op, slot) pairs actually
+used -- about `B x (active ops per sample)` instead of `(active ops per batch)`.
+
+### 27.4 `usrm2/scanmeta.py` and the `--scan-meta` hook
+
+`scanmeta.load(path_or_url)` reads the upstream `metadata.json` next to a volume
+(`<bucket>/<scroll>/volumes/<vol>.zarr/metadata.json`, local path or https URL; a directory or a `.zarr`
+path gets `/metadata.json` appended) and returns a FLAT dict. It never raises: a missing, unreadable or
+partial file falls back to the documented `scanmeta.DEFAULTS` (the 2.4 um 78 keV PHerc-Paris4 B_HA scan, the
+one the pipeline is calibrated on) and reports `missing` / `defaulted`.
+
+| key | source in metadata.json | note |
+|---|---|---|
+| `energy_kev` | `scan.tomo.acquisition.energy` | 74 / 78 / 137 across Paris 4 |
+| `pixel_um`, `detector_pixel_um` | `detector.samplePixelSize`, `sensorPixelSize` | upstream is mm; x1000 |
+| `distance_mm`, `source_distance_mm` | `sampleDetectorDistance`, `sourceSampleDistance` | propagation distance |
+| `delta_beta`, `unsharp_coeff`, `unsharp_sigma_px` | `processing.preprocessing.phase.*` | nabu's phase step |
+| `unsharp_sigma_um` | derived: `unsharp_sigma_px * pixel_um` | the pitch-free PSF |
+| `hist_min/max`, `hist_p002`, `hist_p998` | `processing.32bitsData.histogram.*` | percentiles |
+| `used_min`, `used_max` | `postprocessing.32BitsConversion.dataset_used_*` | |
+| `win_f32_lo/hi`, `win_u16_lo/hi` | `zarr_export.target_window_f32_*`, `window_u16_*` | the f32 -> uint8 window |
+| `mosaic`, `mosaic_tiles` | `mosaic.*` | the 1.1 um Paris 4 volume is a 19-tile fusion |
+| `helical`, `half_acquisition`, `expo_time`, `tomo_n`, `scintillator`, `phase_method` | `acquisition.*` | |
+| `rung` | derived: `round(log2(pixel_um / 0.6))` | 2.4 um -> 2 |
+
+`scanmeta.ranges_for(meta)` turns that into augmentation overrides centred on the scan: the `paganin` block
+(the scan's own `db/a/s_um` as the filter reference, plus sampled ranges that are the corpus span union the
+scan's own value, so the identity is always reachable) and `bias.max` scaled by `78 / energy_kev` clamped to
+0.5-2x (cupping is a low-energy effect; lit section 2). `aug.get(name, meta=..., rung=...)` merges it PER
+OP, so a preset that does not configure an op does not grow one -- `get("full", meta=...)` still has no
+`paganin`.
+
+Scan-metadata planes as INPUT channels (section 21.3) are a separate change; this section only exposes the
+dict and the ranges. A `--scan-meta PATH` CLI flag threading `scanmeta.load(PATH)` into `A.get` is the
+remaining wiring, and belongs to the `cli.py`/`train.py` owner.
+
+### 27.5 Presets and cost
+
+`full2` = `full` + `paganin` + `shuffle`; ablations: `geo+paganin`, `geo+shuffle`. Measured on CPU (8
+threads, B=2, 14 channels, 128^3, median of 10): see the commit message / README -- the jitter is one FFT
+pair and the shuffle adds only the (op, slot) pairs actually used, so `full2` is a small constant factor
+over `full` and negligible next to the GPU step it overlaps with.
+

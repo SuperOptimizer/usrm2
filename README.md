@@ -24,6 +24,15 @@ input is a z-scored CT patch, output is one recto-probability logit per voxel.
   `all2` is `all` + the cross-scroll families: the scan-domain set ported from tsm (`scan`, ranges
   calibrated on PHercParis4 vs PHerc1667), `tone`, `thick`, `volcomp`, `blank` and the ESRF/nabu
   recon set (`haze`, `unsharp`, `quant`, `cor`); `all2_light` halves every `p`.
+  `full2` is `full` + physics augmentation v2 (`docs/unified_design.md` section 27): `paganin`, an FFT
+  op that re-filters the cube as if nabu's Paganin delta/beta and unsharp `(coeff, sigma)` had been
+  different (the RATIO of the two transfer functions, so the scan's own parameters are the exact
+  identity), and `shuffle`, a per-sample order for the intensity/artefact ops (SinoSynth). Sigmas are
+  defined in MICRONS: `aug.apply(..., rung=k)` converts them to voxels for the rung
+  (`sigma_vox = sigma_um / rung_um(k)`), and rung 2 is bit-identical to the old voxel numbers.
+  `usrm2/scanmeta.py` loads the upstream `metadata.json` next to a volume (local path or bucket URL)
+  into a flat dict with documented defaults, and `scanmeta.ranges_for(meta)` centres the ranges on that
+  scan: `aug.get("full2", meta=scanmeta.load(vol), rung=k)`.
 
 ## The rung ladder (unified multi-resolution model, `docs/unified_design.md`)
 - Rung `k` has voxel size `0.6 * 2^k` um: 2.4 um is rung 2, 1228.8 um rung 11 (12 rungs). Level `l` of a
