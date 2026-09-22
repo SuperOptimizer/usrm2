@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-timeout>=2.3"]
+dev = ["pytest>=8", "pytest-timeout>=2.3", "scikit-image>=0.24"]  # skimage: `export-tracer --marching-cubes`
 teacher = ["vesuvius", "einops", "timm"]  # villa network builder for the upstream teacher
 
 [project.scripts]

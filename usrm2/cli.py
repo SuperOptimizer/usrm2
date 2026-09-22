@@ -118,6 +118,59 @@ def main(argv=None):
                    "loss weight is the sources' agreement (usrm2/data.py fuse_agreement)")
     t.add_argument("--source-w", nargs="*", default=(), metavar="SRC=W", help="per-source loss weights, e.g. "
                    "'mask=1 store=1'; `usrm2 glc-weights` suggests them from the published meshes")
+    # ---- Phase B / C: distance, normals, pairing, planes (docs/unified_design.md section 29).
+    # Every one is OFF by default and is recorded in the checkpoint args only when it is on.
+    t.add_argument("--sdist", default=None, choices=["face", "midline"], help="add ONE regression "
+                   "output channel holding the signed distance (voxels at the sample's rung, + on the "
+                   "recto side) to the recto FACE or to the sheet MIDLINE. Its target is a distance "
+                   "pyramid from `usrm2 dist-pyramid`, added to the source line like any other target "
+                   "group (channel 'sdist' / 'midline'); it is never pooled, so a rung the store has no "
+                   "level for has weight 0")
+    t.add_argument("--thickness", action="store_true", help="--sdist: one more regression channel, the "
+                   "recto-to-verso separation along the normal, read as TMIN + softplus(raw) so it can "
+                   "never fall below the minimum physical sheet thickness")
+    t.add_argument("--normals", default="off", choices=["off", "derive", "head"], help="--sdist: "
+                   "'derive' = normals are the normalised gradient of the PREDICTED distance field (no "
+                   "extra channels), 'head' = three explicit channels distilled from that gradient")
+    t.add_argument("--sdist-hetero", action="store_true", help="--sdist: one more head channel holding "
+                   "the LOG-VARIANCE of the distance regression (heteroscedastic Huber), which doubles "
+                   "as the tracer contract's `conf` channel")
+    t.add_argument("--loss-sdist", type=float, default=1.0, metavar="W", help="weight of the distance Huber")
+    t.add_argument("--loss-eikonal", type=float, default=0.0, metavar="W", help="L5: weight of "
+                   "(|grad d| - 1)^2 in the band -- the regulariser that makes a regressed field an "
+                   "actual distance function between the voxels that pin it down")
+    t.add_argument("--loss-normals", type=float, default=0.0, metavar="W", help="--normals head: weight "
+                   "of the normal-head distillation")
+    t.add_argument("--sdist-delta", type=float, default=2.0, help="Huber delta, in voxels")
+    t.add_argument("--sdist-band", type=float, default=8.0, help="voxels around the surface the Eikonal "
+                   "and normal terms are evaluated in")
+    t.add_argument("--pair", default="off", choices=["off", "construct", "construct-only"],
+                   help="PHASE C: with --sdist midline --thickness, derive p_recto / p_verso from the "
+                   "midline distance m and the thickness t as soft bands at m = +- t/2, so they cannot "
+                   "cross BY CONSTRUCTION, and score those. 'construct' keeps the learned recto/verso "
+                   "channels as an auxiliary; 'construct-only' drops their loss term (the rows stay in "
+                   "the head and keep their weights). --loss-excl remains as a backstop")
+    t.add_argument("--pair-band", type=float, default=1.5, help="--pair: half-width of the soft band, in "
+                   "voxels (the thickness floor is 2x this, which is what makes the two bands disjoint)")
+    t.add_argument("--pair-tau", type=float, default=0.5, help="--pair: softness of the band edge, in voxels")
+    t.add_argument("--loss-ect", type=float, default=0.0, metavar="W", help="L7: the fast "
+                   "Euler-characteristic-transform topology loss on INTERIOR sub-blocks of the samples "
+                   "at --ect-rung. May be changed on a resume (it touches no weight)")
+    t.add_argument("--ect-dirs", type=int, default=8, help="--loss-ect: directions of the ECT sweep")
+    t.add_argument("--ect-res", type=int, default=16, help="--loss-ect: filtration heights per direction")
+    t.add_argument("--ect-margin", type=int, default=8, help="--loss-ect: voxels cropped off every patch "
+                   "face before the sub-blocks are taken (a topology loss on a cropped patch sees every "
+                   "sheet truncated at the face)")
+    t.add_argument("--ect-block", type=int, default=32, help="--loss-ect: sub-block edge")
+    t.add_argument("--ect-n", type=int, default=4, help="--loss-ect: sub-blocks per sample")
+    t.add_argument("--ect-rung", type=int, default=2, help="--loss-ect: the ONE rung it is computed at")
+    t.add_argument("--planes", default=None, metavar="LIST", help="extra constant input planes between "
+                   "the cascade channel and the scale plane (section 21 items 2 and 3): 'radius' = "
+                   "r / r_max from the umbilicus, 'meta' = five scan planes from the volume's own "
+                   "metadata.json (energy, log delta/beta, unsharp sigma in um, sample-detector "
+                   "distance, pixel pitch), each min-max normalised over a documented corpus range and "
+                   "ZERO where the file does not say. e.g. --planes meta,radius. They grow `cin`, so "
+                   "they must match on a resume; a warm start zero-fills them")
     sp = sub.add_parser("stream-plan", help="plan and stream the training windows into a rolling disk buffer "
                         "(usrm2/stream.py): the planner IS the sampler")
     sp.add_argument("stores_file")
@@ -163,6 +216,11 @@ def main(argv=None):
                     "region (0 = 8 x --windows-per-region)")
     sp.add_argument("--cascade", default="off", choices=["off", "mask", "self", "mix"], help="must match the "
                     "training run's --cascade: the planner fetches the coarse target block and the tenth context cube")
+    sp.add_argument("--planes", default=None, metavar="LIST", help="must match the training run's "
+                    "--planes: the plane set is recorded in the queue's meta.json and a queue can only "
+                    "be replayed by a run that builds the same stem")
+    sp.add_argument("--scan-meta", default=None, help="see `train --scan-meta`; with --planes meta it "
+                    "also fixes the five scan planes for every source")
     sp.add_argument("--val-rungs", default="2,3,4,6", help="rungs the held-out box is scored at (prefetched and pinned)")
     sp.add_argument("--val-patches", type=int, default=32)
     sp.add_argument("--limit", type=int, default=0, help="stop after this many queued windows (0 = forever)")
@@ -206,6 +264,56 @@ def main(argv=None):
     p.add_argument("--cascade-depth", type=int, default=3, help="rungs above k predicted top-down to fill the cascade channel")
     p.add_argument("--no-calib", action="store_true", help="do NOT apply the checkpoint's per-rung "
                    "temperature (`usrm2 calibrate`); a checkpoint with none is unaffected either way")
+    dp = sub.add_parser("dist-pyramid", help="PHASE B (docs/unified_design.md section 29): turn an "
+                        "exported MASK pyramid into a signed-distance / midline / thickness pyramid, one "
+                        "level per rung, each computed from THAT rung's own mask (a distance is never "
+                        "pooled). CPU only -- do not run it on a card a training job is using")
+    dp.add_argument("mask", help="the mask pyramid group (levels named by voxel size in um)")
+    dp.add_argument("--out", default=None, help="output group (default: <mask>_sdist.zarr / "
+                    "_midline.zarr / _thick.zarr beside it); only honoured with a single --kind")
+    dp.add_argument("--kind", nargs="+", default=["face"], choices=["face", "midline", "thickness"],
+                    help="face = signed distance to the RECTO FACE; midline = to the sheet MIDLINE "
+                         "(needs --verso); thickness = the recto-to-verso separation (needs --verso)")
+    dp.add_argument("--verso", default=None, help="the paired verso source: a verso pyramid group, or the "
+                    "root of the published verso REGION stores (<root>/verso/region_<z>_<y>_<x>.zarr, "
+                    "rung 2 and its 2x pool). Without it the midline falls back to the recto band's own "
+                    "medial surface and the thickness is not measurable (weight 0)")
+    dp.add_argument("--rungs", default="0-4", help="rungs to write; a rung with no level in the mask "
+                    "pyramid, above --max-rung, or above the mask's native rung + 1 is skipped")
+    dp.add_argument("--max-rung", type=int, default=None, help="default 4: above it an exported 'mask' is "
+                    "a pooled area FRACTION, and its 0.5 level set is not a surface")
+    dp.add_argument("--axis-r-um", type=float, default=None, metavar="R", help="microns around the "
+                    "umbilicus axis that are marked no-data (default 400 um: the core is crushed and the "
+                    "published masks put recto_is_in near 0.5 there)")
+    dp.add_argument("--tmin", type=float, default=None, help="floor on the stored thickness, in voxels "
+                    "(default 3.0 = 2 x the default --pair-band)")
+    dp.add_argument("--block", type=int, default=128, help="core block edge")
+    dp.add_argument("--halo", type=int, default=48, help="context around each block, >= the +-32 clamp")
+    dp.add_argument("--volume", default=None)
+    dp.add_argument("--box", type=int, nargs=6, default=None, metavar=("Z0", "Y0", "X0", "Z", "Y", "X"),
+                    help="only visit the blocks inside this box, given at RUNG 2 (a whole Paris 4 level "
+                         "is 10^12 rung-2 voxels: the full pass is a region-by-region job)")
+    dp.add_argument("--dry-run", action="store_true", help="print what would be written and stop")
+    xt = sub.add_parser("export-tracer", help="write the tracer contract (docs/research/"
+                        "synthesis_v2_with_literature.md section 2) over a box from a --sdist checkpoint: "
+                        "recto/verso, surf_sdist, nz/ny/nx, gmag and conf as sharded volcomp stores")
+    xt.add_argument("ckpt")
+    xt.add_argument("out", help="output DIRECTORY; one store per field goes inside it")
+    xt.add_argument("--volume", default=None)
+    xt.add_argument("--origin", type=int, nargs=3, required=True, metavar=("Z0", "Y0", "X0"))
+    xt.add_argument("--size", type=int, nargs=3, required=True, metavar=("Z", "Y", "X"))
+    xt.add_argument("--rung", type=int, default=None, help="predict at rung k (--origin/--size are then rung-k voxels)")
+    xt.add_argument("--window", type=int, default=128)
+    xt.add_argument("--halo", type=int, default=16)
+    xt.add_argument("--tta", type=int, default=0)
+    xt.add_argument("--cascade", default="auto", choices=["auto", "on", "off"])
+    xt.add_argument("--cascade-depth", type=int, default=3)
+    xt.add_argument("--device", default=None)
+    xt.add_argument("--plain", action="store_true", help="plain zarr instead of volcomp")
+    xt.add_argument("--marching-cubes", action="store_true", help="also run marching cubes (skimage) per "
+                    "SHARD on the zero level of the distance field and write one .obj per shard under "
+                    "<out>/mesh/ (vertices in GLOBAL ZYX voxels of this rung)")
+    xt.add_argument("--mc-level", type=float, default=0.0, help="the level set to extract, in voxels")
     cb = sub.add_parser("calibrate", help="fit one TEMPERATURE per rung on the checkpoint's own held-out "
                         "grid and store them in its args (docs/unified_design.md section 26); "
                         "`predict`/`evalsurf` then divide the logits by it unless --no-calib")
@@ -433,6 +541,12 @@ def main(argv=None):
                 sched=a.sched, stable_until=a.stable_until, cooldown=a.cooldown,
                 rewarm=a.rewarm, new_param_lr_mult=a.new_param_lr_mult, ema_k=ema_k,
                 fuse=a.fuse, source_w=parse_kv(a.source_w), scan_meta=a.scan_meta,
+                sdist=a.sdist, thickness=a.thickness, normals=a.normals, sdist_hetero=a.sdist_hetero,
+                loss_sdist=a.loss_sdist, loss_eikonal=a.loss_eikonal, loss_normals=a.loss_normals,
+                sdist_delta=a.sdist_delta, sdist_band=a.sdist_band,
+                pair=a.pair, pair_band=a.pair_band, pair_tau=a.pair_tau,
+                loss_ect=a.loss_ect, ect_dirs=a.ect_dirs, ect_res=a.ect_res, ect_margin=a.ect_margin,
+                ect_block=a.ect_block, ect_n=a.ect_n, ect_rung=a.ect_rung, planes=a.planes,
                 **({"rungs": parse_rungs(a.rungs), "rung_boost": parse_boost(a.rung_boost),
                     "val_rungs": [int(q) for q in a.val_rungs.split(",")], "require_targets": a.require_targets,
                     "region": a.region, "windows_per_region": a.windows_per_region,
@@ -452,6 +566,20 @@ def main(argv=None):
                     mask_ctx=not a.no_mask_ctx, loss=a.loss, cascade_slot=not a.no_cascade_slot,
                     rung_aux=a.rung_aux, rung_aux_p=a.rung_aux_p, fg_min=a.fg_min, air_keep=a.air_keep,
                     **{k: v for k, v in dict(stores=a.stores, stores_file=a.stores_file, val=a.val).items() if v})
+    elif a.cmd == "dist-pyramid":
+        from usrm2 import targets as TG
+        rs = parse_rungs(a.rungs)
+        TG.dist_pyramid(a.mask, out=a.out, verso=a.verso, kinds=tuple(a.kind),
+                        rungs=(range(0, TG.MAX_RUNG + 1) if rs is True else sorted(rs)),
+                        volume=a.volume, umbilicus=a.umbilicus, block=a.block, halo=a.halo,
+                        box=((a.box[:3], a.box[3:]) if a.box else None), dry_run=a.dry_run,
+                        **{k: v for k, v in dict(axis_r_um=a.axis_r_um, tmin=a.tmin,
+                                                 max_rung=a.max_rung).items() if v is not None})
+    elif a.cmd == "export-tracer":
+        P.export_tracer(a.ckpt, a.volume or data.CT, *a.origin, *a.size, a.out, window=a.window,
+                        halo=a.halo, device=a.device, rung=a.rung, tta=a.tta,
+                        cascade=parse_cascade(a.cascade), cascade_depth=a.cascade_depth,
+                        marching_cubes=a.marching_cubes, mc_level=a.mc_level, volcomp=not a.plain)
     elif a.cmd == "calibrate":
         from usrm2 import calib
         calib.main(a.ckpt, val=a.val, val_rungs=(None if a.val_rungs is None else
@@ -482,7 +610,8 @@ def main(argv=None):
                region=a.region, windows_per_region=a.windows_per_region, walk=a.walk,
                active_regions=a.active_regions, epochs=a.epochs, region_fails=a.region_fails,
                teacher_regions=a.teacher_regions, visits_max=a.visits_max, cascade=a.cascade,
-               verso=a.verso, verso_regions=a.verso_regions, verso_url=a.verso_regions_url)
+               verso=a.verso, verso_regions=a.verso_regions, verso_url=a.verso_regions_url,
+               planes=a.planes, scan_meta=a.scan_meta)
     elif a.cmd == "ablate":
         from usrm2 import ablate
         ablate.sweep(a.out_dir, a.presets.split(","), size=a.size, steps=a.steps, patch=a.patch,

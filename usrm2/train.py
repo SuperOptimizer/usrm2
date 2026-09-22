@@ -168,7 +168,7 @@ def autocast(dev):
 
 
 @torch.no_grad()
-def evaluate(net, grid, dev, wtgt=(), norad=False, cascade=None, channels=None, cout_t=None):
+def evaluate(net, grid, dev, wtgt=(), norad=False, cascade=None, channels=None, cout_t=None, dist=None):
     """bce / dice / mae over the val patches. A grid entry is (x, tgt) -- the old convention, optionally with
     `wtgt` weight channels -- or a compact rung sample (data.rung_item), whose input is built on the device
     by `prep.prepare`; its weights then scale every metric and each rung is also scored on its own
@@ -198,8 +198,18 @@ def evaluate(net, grid, dev, wtgt=(), norad=False, cascade=None, channels=None, 
             ww = torch.ones_like(tg)
         with autocast(dev):
             logit = net(ct).float()
+        if dist is not None:  # section 29: the DISTANCE channels are a regression, scored in voxels
+            i0, dn = dist
+            for j, nm in enumerate(dn):
+                wc = L.dist_weight(ww[:, i0 + j])
+                if float(wc.sum()) > 0:
+                    dec = L.decode_unsigned if nm == "thickness" else L.decode_signed
+                    pv = (L.soft_thickness(logit[:, i0 + j]) if nm == "thickness" else logit[:, i0 + j])
+                    pch.setdefault(f"mae_{nm}", []).append(
+                        float((pv - dec(tg[:, i0 + j])).abs().mul(wc).sum() / wc.sum()))
         if cout_t is not None:  # the AFFINITY channels are a training-only head: never scored, never shown
             logit = logit[:, :int(cout_t)]
+            tg, ww = tg[:, :int(cout_t)], ww[:, :int(cout_t)]
         p = torch.sigmoid(logit)
         h, t = (p >= 0.5).float(), (tg >= 0.5).float()
         C = p.shape[1]
@@ -222,8 +232,11 @@ def evaluate(net, grid, dev, wtgt=(), norad=False, cascade=None, channels=None, 
         for k in sorted(per):
             out[f"dice_r{k}"] = float(np.mean(per[k]))
         out["dice"] = float(np.mean([out[f"dice_r{k}"] for k in sorted(per)]))  # every rung counts the same
-    for c in sorted(pch):
-        out[f"dice_{(list(channels)[c] if channels and c < len(channels) else f'c{c}')}"] = float(np.mean(pch[c]))
+    for c in sorted(pch, key=str):
+        if isinstance(c, str):
+            out[c] = float(np.mean(pch[c]))
+        else:
+            out[f"dice_{(list(channels)[c] if channels and c < len(channels) else f'c{c}')}"] = float(np.mean(pch[c]))
     if grid and grid_cout(grid[0]) >= 2 and grid_cout(grid[0]) % 2 == 0:
         out["overlap"] = m[3].item()
     return out
@@ -277,7 +290,48 @@ def val_png(path, net, grid, dev, norad=False, cascade=None, cout_t=None):
     Image.fromarray(np.concatenate(rows, 0).astype(np.uint8)).save(path)
 
 
-def warm_start(src, cin, cout, cascade=False, src_scale=False, ncopy=None):
+def stem_map(n, cin, cascade=False, src_scale=False, src_cascade=False, planes=0, src_planes=0):
+    """[(src channel, dst channel), ...] for a stem that has PLANE channels on either side.
+
+    The stem layout is, in order, `[image cubes..., CASCADE?, PLANES..., scale?, radial(3)]`
+    (docs/unified_design.md section 22 for the cascade slot, section 29 for the planes). Once a variable
+    number of planes sits between the cascade channel and the scale plane, "image channels first, radial
+    last" no longer places anything in the middle: the source's scale weights would slide into a plane
+    slot, which changes the output at every rung but 2, exactly the failure the `cascade`/`src_scale`
+    pair was added to avoid. So the slots are named on both sides and matched by NAME.
+
+    Only the slots the SOURCE has are copied; every slot it does not (a new plane, the cascade channel)
+    stays zero, so the step-0 output is the source's to a float32 ulp. `warm_start` reaches this only
+    when `planes` or `src_planes` is non-zero: with no planes it takes the two legacy branches, byte for
+    byte."""
+    a = n - 3 - int(src_planes) - (1 if src_scale else 0) - (1 if src_cascade else 0)
+    assert a > 0, f"warm start: a {n}-channel source cannot hold {src_planes} planes"
+    b = cin - 3 - int(planes) - 1 - (1 if cascade else 0)
+    assert b == a, (f"warm start: the source has {a} image channels and the destination {b}; "
+                    "--ctx must match")
+    m, si, di = [], 0, 0
+    for _ in range(a):
+        m.append((si, di))          # image cubes, 1:1
+        si, di = si + 1, di + 1
+    if src_cascade and cascade:
+        m.append((si, di))
+    si += int(src_cascade)
+    di += int(cascade)
+    for j in range(min(int(src_planes), int(planes))):   # planes are in the canonical order, so a prefix
+        m.append((si + j, di + j))
+    si += int(src_planes)
+    di += int(planes)
+    if src_scale:
+        m.append((si, di))
+    si += int(src_scale)
+    di += 1
+    for j in range(3):
+        m.append((si + j, di + j))
+    return m
+
+
+def warm_start(src, cin, cout, cascade=False, src_scale=False, ncopy=None, planes=0, src_planes=0,
+               src_cascade=None):
     """Adapt another run's weights to (cin, cout). Extra input channels get zero weights, so the net starts
     with the same output: the image channels stay first and the radial vector stays last, which is what
     zero-fills the scale plane of the unified model (13 -> 14 channels). Heads: more heads are copies of the
@@ -292,6 +346,11 @@ def warm_start(src, cin, cout, cascade=False, src_scale=False, ncopy=None):
     are zero, so it contributes nothing whatever the channel holds, and the outputs agree with the source's
     to a float32 ulp (the stem convolution accumulates 15 products instead of 14).
 
+    `planes` / `src_planes`: how many METADATA / RADIUS planes (section 29) the destination and the
+    source carry. When either is non-zero the stem slots are matched by NAME (`stem_map`) instead of by
+    the front/back rule, because a variable-width slot in the middle breaks the front/back rule. With
+    both zero -- every run so far -- nothing about this function changes.
+
     `ncopy`: how many of the `cout` head rows follow the copy rule. The rows at and above it are NEW and
     are zero-initialised (weight and bias both 0, i.e. p = 0.5) instead of copying a probability filter
     -- that is the per-channel policy the AFFINITY channels need (`--affinity`, section 26): they are not
@@ -303,7 +362,12 @@ def warm_start(src, cin, cout, cascade=False, src_scale=False, ncopy=None):
         assert w.shape[1] < cin, "cannot drop input channels on a warm start"
         n = w.shape[1]
         w2 = torch.zeros(w.shape[0], cin, *w.shape[2:], device=w.device, dtype=w.dtype)
-        if cascade and src_scale:  # [img..., scale, radial] -> [img..., CASCADE(0), scale, radial]
+        if planes or src_planes:   # section 29: the plane slot sits between CASCADE and the scale plane
+            for si, di in stem_map(n, cin, cascade, src_scale,
+                                   (cascade if src_cascade is None else src_cascade),
+                                   planes, src_planes):
+                w2[:, di] = w[:, si]
+        elif cascade and src_scale:  # [img..., scale, radial] -> [img..., CASCADE(0), scale, radial]
             w2[:, :n - 4], w2[:, cin - 4], w2[:, cin - 3:] = w[:, :n - 4], w[:, n - 4], w[:, n - 3:]
         else:
             w2[:, :n - 3], w2[:, cin - 3:] = w[:, :n - 3], w[:, n - 3:]  # image chans first, radial last
@@ -331,7 +395,12 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
           loss_excl=0.0, loss_selfcons=0.0, loss_skel=0.0, loss_affinity=0.0, affinity=None,
           skel_iters=4, affinity_all=False, cascade_self_p_anneal=None,
           sched="cosine", stable_until=None, cooldown=0, ema_k=None, rewarm=0, new_param_lr_mult=1.0,
-          fuse="off", source_w=None, scan_meta=None, **kw):
+          fuse="off", source_w=None, scan_meta=None,
+          sdist=None, thickness=False, normals="off", sdist_hetero=False, loss_sdist=1.0,
+          loss_eikonal=0.0, loss_normals=0.0, sdist_delta=2.0, sdist_band=8.0,
+          pair="off", pair_band=1.5, pair_tau=0.5,
+          loss_ect=0.0, ect_dirs=8, ect_res=16, ect_margin=8, ect_block=32, ect_n=4, ect_rung=2,
+          planes=(), **kw):
     """accum: gradient accumulation (micro-batches per optimizer step), for big models on small cards.
     lr_floor: the cosine decays to lr_floor * lr instead of 0. norm: "patch" (per-patch z-score) or "global"
     (fixed scan mean/std, stored in the checkpoint). dense_pow / ridge_w: see data.Patches / losses.
@@ -376,6 +445,28 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
     rewarm: on a warm start (`init_from`) warm the LR up over this many steps instead of `warmup`.
     new_param_lr_mult: LR multiplier of a second AdamW param group holding the tensors a warm start grew.
     fuse / source_w: teacher fusion and per-source loss weights (usrm2/data.py, `usrm2 glc-weights`).
+
+    PHASE B / C (docs/unified_design.md section 29). Every one of these also defaults to OFF.
+    sdist: "face" or "midline" -- add ONE regression output channel holding the signed distance (in
+    voxels at the sample's rung) to the recto face, or to the sheet midline. Its target is a distance
+    pyramid written by `usrm2 dist-pyramid` and added to the source line like any other target group;
+    the channel name is "sdist" / "midline" and `data.DIST_CHANNELS` is what gives it the never-pooled
+    rule and the code-0 no-data rule.
+    thickness: one more regression channel, the recto-to-verso separation along the normal, read as
+    `targets.TMIN + softplus(raw)` so it can never fall below the minimum physical sheet thickness.
+    normals: "off", "derive" (normals are the normalised gradient of the PREDICTED sdist -- no extra
+    channels) or "head" (three explicit channels, distilled from that gradient).
+    sdist_hetero: one more head channel holding the LOG-VARIANCE of the distance regression, which makes
+    the Huber a Gaussian likelihood and doubles as the tracer contract's `conf` channel.
+    loss_sdist / loss_eikonal / loss_normals: the weights of the Huber, of `(|grad d| - 1)^2` in the band
+    and of the normal-head distillation.
+    pair: "construct" derives p_recto / p_verso from the midline distance and the thickness as bands at
+    m = +- t/2, so they cannot cross BY CONSTRUCTION (usrm2/losses.py `pair_bands`), and scores those;
+    the learned recto/verso channels stay in the head and keep their own loss as an auxiliary.
+    "construct-only" drops the learned term. Needs `--sdist midline --thickness`.
+    loss_ect: the fast-ECT topology pilot, on interior sub-blocks of the samples at rung `ect_rung`.
+    planes: "radius" and/or "meta" -- extra constant input planes between the cascade channel and the
+    scale plane (section 21 items 2 and 3). They grow `cin`, so they must match on a resume.
 
     stream: a queue directory filled by `usrm2 stream-plan` (usrm2/stream.py). The loader then replays that
     queue out of a rolling local buffer instead of sampling, and every 20 steps `train.jsonl` carries
@@ -454,7 +545,57 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         phase_a["fuse"] = str(fuse)
     if source_w:
         phase_a["source_w"] = dict(source_w)
-    args.update(phase_a)
+    # ---- Phase B / C (section 29). Same contract: recorded only when ON.
+    sdist = None if sdist in (None, "", "off") else str(sdist)
+    assert sdist in (None, "face", "midline"), f"--sdist {sdist}: 'face' or 'midline'"
+    normals = str(normals or "off")
+    assert normals in ("off", "derive", "head"), f"--normals {normals}: off | derive | head"
+    pair = str(pair or "off")
+    assert pair in ("off", "construct", "construct-only"), f"--pair {pair}: off | construct | construct-only"
+    thickness = bool(thickness)
+    planes = data.parse_planes(planes)
+    npl = data.n_planes(planes)
+    assert not planes or rungs is not None, "--planes needs the rung ladder (--rungs)"
+    assert sdist or not thickness, "--thickness needs --sdist (the thickness rides beside the distance)"
+    assert sdist or normals == "off", "--normals needs --sdist: a normal is the gradient of the distance"
+    assert sdist or not sdist_hetero, "--sdist-hetero needs --sdist"
+    assert sdist or loss_eikonal <= 0, "--loss-eikonal needs --sdist"
+    if pair != "off":
+        assert sdist == "midline" and thickness, \
+            "--pair construct needs --sdist midline --thickness: the bands are built at m = +- t/2"
+        assert verso, "--pair construct builds a recto/verso PAIR: it needs --verso"
+    phase_b = {}
+    if sdist:
+        phase_b.update(sdist=sdist, loss_sdist=float(loss_sdist), sdist_delta=float(sdist_delta),
+                       sdist_band=float(sdist_band))
+        if thickness:
+            phase_b["thickness"] = True
+        if normals != "off":
+            phase_b.update(normals=normals, loss_normals=float(loss_normals))
+        if sdist_hetero:
+            phase_b["sdist_hetero"] = True
+        if loss_eikonal:
+            phase_b["loss_eikonal"] = float(loss_eikonal)
+    if pair != "off":
+        phase_b.update(pair=pair, pair_band=float(pair_band), pair_tau=float(pair_tau))
+    if loss_ect:
+        phase_b.update(loss_ect=float(loss_ect), ect_dirs=int(ect_dirs), ect_res=int(ect_res),
+                       ect_margin=int(ect_margin), ect_block=int(ect_block), ect_n=int(ect_n),
+                       ect_rung=int(ect_rung))
+    if planes:
+        phase_b["planes"] = list(planes)
+    args.update(phase_a, **phase_b)
+    # A distance is an ISOMETRY-only target: a rotation or a flip carries its value unchanged, a SCALE,
+    # a SHEAR, an elastic warp or a sheet compression does not (they change the metric the distance is
+    # measured in). Those augs are therefore switched off for the run, loudly, rather than silently
+    # training on wrong numbers. The cube symmetries and every intensity aug are unaffected.
+    if sdist:
+        off = [q for q in ("scale", "shear", "elastic", "sheetcomp") if cfg.get(q)]
+        if off:
+            for q in off:
+                cfg.pop(q, None)
+            main and print(f"--sdist: dropping the non-isometric spatial augs {off} from --aug {aug} "
+                           "(they do not carry a distance target)", flush=True)
     if loss_excl and not verso:
         main and print("--loss-excl needs two probability channels (--verso); it will be inactive", flush=True)
     if norm == "global":
@@ -468,13 +609,23 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         args["rungs"], args["rung_boost"], args["val_rungs"] = rungs if rungs is True else list(rungs), dict(rung_boost or {}), list(val_rungs)
         args["scale_plane"] = True
         chans = list(dict.fromkeys(c for s in data.source_groups(lines) for c in s["targets"]))
+        # the DISTANCE channels are ordered by this function, not by the order the stores happen to be
+        # listed in: the head is [probabilities..., sdist, thickness, ...] and everything downstream
+        # (the loss split, `cout_p`, the warm start's `ncopy`, `predict`) slices on that boundary
+        chans = [c for c in chans if c not in data.DIST_CHANNELS]
         if verso and data.VERSO not in chans:  # channel 1 of the same head, not a second branch
             chans.append(data.VERSO)
+        nprob = len(chans)               # the PROBABILITY channels: everything the loss BCEs and dices
+        if sdist:
+            chans.append("sdist" if sdist == "face" else "midline")
+            if thickness:
+                chans.append("thickness")
         args["channels"] = chans
         grid = data.val_grid_rungs(patch, lines, kw.get("val", data.VAL), rungs=val_rungs, limit=val_patches,
                                    ctx=ctx, cascade=cascade, channels=chans, verso=verso,
-                                   verso_regions=verso_regions)
+                                   verso_regions=verso_regions, planes=planes, scan_meta=scan_meta)
     else:
+        nprob = None
         grid = data.val_grid(patch=patch, ct=kw.get("ct", data.CT), store=kw.get("val", data.VAL), limit=val_patches, ctx=ctx)
     assert grid, f"validation store {kw.get('val', data.VAL)} is smaller than the patch ({patch})"
     # CT + context cubes (+ scale plane) + radial vector; one output channel per target channel (+ verso)
@@ -484,18 +635,36 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         "--verso is what adds the verso output channel"
     # the AFFINITY channels sit AFTER the target channels in the same 1x1x1 head; `cout_t` is what the
     # loader, the loss, the evaluation and inference see, `cout` is the head width
-    cout = cout_t + naff
-    if naff:
-        args["cout_t"], args["channels"] = cout_t, list(args.get("channels") or []) + L.affinity_names(offsets)
+    nprob = cout_t if nprob is None else int(nprob)
+    ndist = cout_t - nprob                      # the sdist [+ thickness] channels, inside cout_t
+    nnrm = 3 if normals == "head" else 0
+    nlog = 1 if sdist_hetero else 0
+    # head layout: [probabilities][sdist, thickness][normals][log-variance][affinity]
+    #              <------------ cout_t (the loader has a target) -------->
+    inrm, ilog, iaff = cout_t, cout_t + nnrm, cout_t + nnrm + nlog
+    cout = cout_t + nnrm + nlog + naff
+    extra = ([f"n{a}" for a in "zyx"] if nnrm else []) + (["logvar"] if nlog else []) + \
+            L.affinity_names(offsets)
+    if cout != cout_t:
+        args["cout_t"], args["channels"] = cout_t, list(args.get("channels") or []) + extra
+    if ndist:
+        args["cout_p"] = nprob   # what `predict` may sigmoid: a distance channel is not a probability
     args["cin"], args["cout"] = cin, cout
     net = M.build(size, cout=cout, cin=cin, ckpt_act=ckpt_act, add_skip=add_skip, deep=deep).to(dev)
     args["ckpt_act"], args["add_skip"], args["deep"] = ckpt_act, add_skip, deep
     newp = set()
     if init_from:  # warm start from another run's EMA weights; extra input channels get zero weights (same output at step 0)
         sst = torch.load(init_from, map_location=dev)
+        sa0 = sst.get("args", {})
+        # `copy mod n` is right for a probability row and WRONG for a distance one (it would copy a
+        # probability filter into a distance slot), so ncopy stops at the probability channels: every
+        # regression, normal, log-variance and affinity row is zero-initialised, i.e. it starts at
+        # distance 0 / p = 0.5, which is the encoding's own zero (code 128).
         src = warm_start(sst["ema"], cin, cout, cascade=cascade != "off",
-                         src_scale=bool(sst.get("args", {}).get("scale_plane")),
-                         ncopy=cout_t if naff else None)
+                         src_scale=bool(sa0.get("scale_plane")),
+                         ncopy=(nprob if (naff or cout != cout_t or ndist) else None),
+                         planes=npl, src_planes=data.n_planes(sa0.get("planes") or ()),
+                         src_cascade=str(sa0.get("cascade", "off") or "off") != "off")
         own = net.state_dict()
         skipped = [k for k, v in src.items() if k in own and tuple(own[k].shape) != tuple(v.shape)]
         src = {k: v for k, v in src.items() if k not in skipped}  # e.g. dec.0 under --add-skip, new deeper levels
@@ -531,7 +700,11 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
                 "verso_regions", "verso_regions_url",
                 # WSD's whole point is that the budget is NOT committed at run start: the plateau may be
                 # extended and the cooldown moved on a resume, because neither is part of the weights.
-                "sched", "stable_until", "cooldown") + \
+                "sched", "stable_until", "cooldown",
+                # the fast-ECT pilot (section 29) is a pure loss term with no parameters and no loader
+                # channel, and its whole point is to be switched on and tuned mid-run on an existing
+                # checkpoint; every other Phase B/C flag changes a head or a stem and must match.
+                "loss_ect", "ect_dirs", "ect_res", "ect_margin", "ect_block", "ect_n", "ect_rung") + \
                (("ema_decay",) if (ema_k or st["args"].get("ema_k")) else ())
         # a continued run may train longer, on more data, with other bookkeeping -- and from another queue
         diff = {k: (st["args"][k], args.get(k)) for k in st["args"] if k not in grow and k != "aug_cfg" and st["args"][k] != args.get(k)}
@@ -569,7 +742,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
                              channels=(args.get("channels") or [])[:cout_t] or None,
                              require_targets=require_targets, cascade=cascade,
                              verso=verso, verso_regions=verso_regions,
-                             fuse=fuse, source_w=source_w,
+                             fuse=fuse, source_w=source_w, planes=planes, scan_meta=scan_meta,
                              **{q: kw[q] for q in ("region", "windows_per_region", "region_fails",
                                                    "teacher_regions") if kw.get(q)}) if rungs is not None else {}),
                      **(dict(stream=stream) if stream else {}))
@@ -593,9 +766,12 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         print(name, rec, flush=True)
 
     log("train.jsonl", {"step": step, "aug": aug, "cfg": cfg, "size": size, "patch": patch, "batch": batch})
-    t0, micro, rung_n = time.time(), 0, {}
+    t0, micro, rung_n, reg_log = time.time(), 0, {}, {}
     wait_ms, stream_idx = 0.0, -1
     aux_on = bool(loss_excl or loss_selfcons or loss_skel or loss_affinity)
+    dist_names = list((args.get("channels") or [])[nprob:cout_t])
+    ev = dict(channels=args.get("channels"), cout_t=nprob,
+              **({"dist": (nprob, dist_names)} if ndist else {}))
     aux_dt = torch.bfloat16 if dev.type == "cuda" else torch.float32
     aux_log = {}
     # the planner may evict a chunk once every worker is past it; the DataLoader is up to this many entries
@@ -631,9 +807,52 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         with autocast(dev):
             pred = model(ct)
             outs = [o.float() for o in pred] if isinstance(pred, (list, tuple)) else [pred.float()]
-            bce, dice = deep_losses([o[:, :cout_t] for o in outs] if len(outs) > 1 else outs[0][:, :cout_t],
-                                    tg, ridge_w, wtgt, wt)
-        loss = bce + dice
+            bce, dice = deep_losses([o[:, :nprob] for o in outs] if len(outs) > 1 else outs[0][:, :nprob],
+                                    tg[:, :nprob], ridge_w, wtgt,
+                                    None if wt is None else wt[:, :nprob])
+        # `--pair construct-only`: the DERIVED pair carries the whole probability loss and the learned
+        # recto/verso rows keep their weights (they stay in the head, so inference and a later warm start
+        # are unchanged) but get no gradient. `construct` keeps both, the learned one as an auxiliary.
+        loss = (bce + dice) if pair != "construct-only" else bce * 0.0
+        reg_log = {}
+        if ndist:  # ---- PHASE B: the distance / thickness / normal regression (section 29)
+            y0 = outs[0]
+            d = y0[:, nprob:nprob + 1]                                    # the signed distance, in voxels
+            td, wd = tg[:, nprob:nprob + 1], L.dist_weight(wt[:, nprob:nprob + 1])
+            lv = y0[:, ilog:ilog + 1] if nlog else None
+            r = {"sdist": loss_sdist * L.sdist_loss(d, td, wd, delta=sdist_delta, logvar=lv)}
+            if loss_eikonal:
+                r["eikonal"] = loss_eikonal * L.eikonal(d, wd, band=sdist_band, tgt=td)
+            th = None
+            if thickness:
+                th = L.soft_thickness(y0[:, nprob + 1:nprob + 2], L.TMIN)
+                r["thick"] = loss_sdist * L.thickness_loss(
+                    th, tg[:, nprob + 1:nprob + 2], L.dist_weight(wt[:, nprob + 1:nprob + 2]),
+                    delta=sdist_delta)
+            if nnrm and loss_normals:
+                r["nrm"] = loss_normals * L.normal_head_loss(y0[:, inrm:inrm + 3], d, wd,
+                                                             band=sdist_band, tgt=td)
+            if pair != "off":  # ---- PHASE C: the pair is BUILT from (midline, thickness), never crossed
+                lr_, lv_ = L.pair_logits(d, th, half=pair_band, tau=pair_tau)
+                tp, wp = weighted(tg[:, :nprob], wtgt)
+                wp = wt[:, :nprob] if wp is None else wp * wt[:, :nprob]
+                r["pair_bce"], r["pair_dice"] = losses_tw(torch.cat([lr_, lv_], 1), tp[:, :2],
+                                                         wp[:, :2], ridge_w)
+            for k_, v_ in r.items():
+                loss = loss + v_
+            reg_log = {k_: float(v_.detach()) for k_, v_ in r.items()}
+        if loss_ect:  # ---- the topology pilot, at ONE rung, on interior sub-blocks only
+            rg = item["rung"].reshape(-1) if isinstance(item, dict) else None
+            sel = None if rg is None else (rg == int(ect_rung)).nonzero().reshape(-1)
+            if sel is None or len(sel):
+                pr = torch.sigmoid(outs[0][:, :1]) if pair == "off" else \
+                    torch.sigmoid(L.pair_logits(outs[0][:, nprob:nprob + 1], th, pair_band, pair_tau)[0])
+                pr = pr if sel is None else pr[sel]
+                tt = tg[:, :1] if sel is None else tg[sel, :1]
+                e = L.ect_loss(pr, tt, dirs=ect_dirs, res=ect_res, margin=ect_margin,
+                               block=ect_block, nblocks=ect_n)
+                loss = loss + loss_ect * e
+                reg_log["ect"] = float(e.detach())
         if aux_on:  # Phase A: every term is computed from tensors this step already holds
             t_a, w_a = weighted(tg, wtgt)
             w_a = wt if w_a is None else (w_a if wt is None else w_a * wt)
@@ -662,7 +881,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
         if step % 20 == 0:
             dt = time.time() - t0
             log("train.jsonl", {"step": step, "loss": loss.item(), "bce": bce.item(), "dice": dice.item(),
-                                **aux_log,
+                                **aux_log, **reg_log,
                                 "lr": sched.get_last_lr()[0], "vox_s": round(20 * accum * batch * world * int(np.prod(data.shape3(patch))) / dt),
                                 "vram_MiB": round(torch.cuda.max_memory_allocated() / 2 ** 20) if dev.type == "cuda" else 0,
                                 **({"rung": {str(k): rung_n[k] for k in sorted(rung_n)}} if rung_n else {}),
@@ -676,10 +895,9 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
             t0 = time.time()
         if (step % eval_every == 0 or step == steps) and main:
             evnet.load_state_dict(ema)
-            log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev, wtgt, norad=no_radial, cascade=casval,
-                                            channels=args.get("channels"), cout_t=cout_t)})
+            log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev, wtgt, norad=no_radial, cascade=casval, **ev)})
             try:
-                val_png(out / f"val_{step:06d}.png", evnet, grid, dev, norad=no_radial, cascade=casval, cout_t=cout_t)
+                val_png(out / f"val_{step:06d}.png", evnet, grid, dev, norad=no_radial, cascade=casval, cout_t=nprob)
             except Exception as e:  # a missing PIL must not stop training
                 print("val_png:", repr(e))
             save()
@@ -691,8 +909,7 @@ def train(out_dir, size="1m", steps=20000, patch=128, batch=1, lr=3e-4, workers=
                                    if os.path.exists(os.path.join(str(stream), "epoch_done")) else {})})
             if main:
                 evnet.load_state_dict(ema)
-                log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev, wtgt, norad=no_radial, cascade=casval,
-                                            channels=args.get("channels"), cout_t=cout_t)})
+                log("eval.jsonl", {"step": step, **evaluate(evnet, grid, dev, wtgt, norad=no_radial, cascade=casval, **ev)})
     save()
     if world > 1:
         dist.barrier()

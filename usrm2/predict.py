@@ -179,7 +179,36 @@ def flips_vec(fn, n=8):
 
 HEADS = {"mean": lambda p: p.mean(1), "prod": lambda p: p.prod(1) ** (1 / p.shape[1]), "max": lambda p: p.max(1).values}
 
+# PHASE B (docs/unified_design.md section 29). Fields a checkpoint trained with `--sdist` can emit that
+# are NOT probabilities, so they never see a sigmoid and are not in the checkpoint's channel list under
+# these names: `--head sdist` (the signed distance, in voxels at the rung), `--head thickness` (voxels),
+# `--head normals` ((3,Z,Y,X), ZYX, unit, sign verso -> recto), `--head conf` (0..1 from the
+# heteroscedastic log-variance). `--head sdist` is also spelled by the store's channel name, which for a
+# midline run is "midline"; both resolve here.
+FIELDS = ("sdist", "midline", "thickness", "normals", "conf")   # "midline" is an alias of "sdist":
+# a midline checkpoint's distance channel is NAMED midline, and both spellings return that field
+
 CHANNEL_DEFAULT = ("recto", "verso")  # the unified model's output channel order (section 23)
+
+
+def field_head(head, args):
+    """`--head sdist|thickness|normals|conf` -> (kind, head-channel index) for a Phase-B checkpoint,
+    or None when `head` names an ordinary probability channel."""
+    h = str(head).strip()
+    if h not in FIELDS:
+        return None
+    ch = [str(c) for c in ((args or {}).get("channels") or ())]
+    np_ = int((args or {}).get("cout_p", 0) or 0)
+    kind = "sdist" if h in ("sdist", "midline", "normals") else h
+    if h == "conf":
+        assert "logvar" in ch, "--head conf: this checkpoint was not trained with --sdist-hetero"
+        return h, ch.index("logvar")
+    if h == "thickness":
+        assert "thickness" in ch, "--head thickness: this checkpoint was not trained with --thickness"
+        return h, ch.index("thickness")
+    assert np_ and np_ < len(ch) and ch[np_] in ("sdist", "midline"), \
+        f"--head {h}: this checkpoint has no distance channel (channels {ch})"
+    return h, np_
 
 
 def resolve_head(head, args=None):
@@ -197,6 +226,8 @@ def resolve_head(head, args=None):
         return h
     if h.lstrip("+-").isdigit():
         return int(h)
+    if h in FIELDS:
+        return h
     ch = [str(c) for c in ((args or {}).get("channels") or CHANNEL_DEFAULT)]
     i = ch.index(h) if h in ch else (CHANNEL_DEFAULT.index(h) if h in CHANNEL_DEFAULT else None)
     assert i is not None, f"--head {head}: an output channel of {ch}, an index, 'all', or one of {sorted(HEADS)}"
@@ -268,17 +299,55 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
     use_cas = cmode != "off"                       # the checkpoint HAS the channel: it must always be fed
     off = cascade is not None and (cascade is False or str(cascade) == "off")
     depth0 = 0 if (off or not use_cas) else max(int(cascade_depth), 0)  # 0 = the channel is fed as zeros
-    head = resolve_head(head, st["args"])
+    fld = field_head(head, st["args"])
+    head = 0 if fld is not None else resolve_head(head, st["args"])
     pick = (lambda p: p) if head == "all" else HEADS[head] if isinstance(head, str) else (lambda p: p[:, int(head)])
     # A run with `--affinity` carries extra output channels that exist only for the training loss
     # (docs/unified_design.md section 26): inference never reads them, so the head is cut to `cout_t`
     # before anything selects or reduces over channels.
-    ct_n = int(st["args"].get("cout_t", st["args"].get("cout", 1)))
+    ct_n = int(st["args"].get("cout_p", st["args"].get("cout_t", st["args"].get("cout", 1))))
+    # the METADATA / RADIUS planes (section 29): built here exactly as `prep.fill_planes_` builds them
+    # while training -- the radius from this volume's own axis and r_max, the five scan values from the
+    # volume's own metadata.json (or `args["scan_meta"]`), zero for anything it does not say.
+    pls = data.parse_planes(st["args"].get("planes") or ())
+    pmeta = data.scan_planes(__import__("usrm2.scanmeta", fromlist=["load"]).load(
+        st["args"].get("scan_meta") or data.pyramid_base(volume))) if "meta" in pls else None
+    prmax = {}
+
+    def planes_at(kk_, o, shape):
+        if not pls:
+            return None
+        parts = []
+        if "radius" in pls:
+            if kk_ not in prmax:
+                pyr = data.rungs(volume)
+                kn = min(pyr)
+                prmax[kk_] = data.rmax_vox(data.axis_at(ax0, kn), data.rung_shape(pyr, kn)) / (2.0 ** (kk_ - kn))
+            parts.append(data.radius(data.axis_at(ax0, kk_), o, shape, prmax[kk_]))
+        if pmeta is not None:
+            parts.append(np.broadcast_to(pmeta[:, None, None, None], (len(pmeta),) + tuple(shape)))
+        return np.concatenate(parts)
     # PER-RUNG TEMPERATURE (usrm2/calib.py): a no-op unless `usrm2 calibrate` has written `args["temps"]`
     from usrm2 import calib as CAL
     temp = lambda kk_: CAL.temp_for(st["args"], kk_, use=calib)  # noqa: E731
+    raw = lambda t: net(t)  # noqa: E731
     logits = lambda t, kk_: net(t)[:, :ct_n] / temp(kk_)  # noqa: E731
     fn = lambda t: pick(torch.sigmoid(logits(t, k)))  # (B,C,...) -> (B,...)  (or (B,C,...) for "all")
+    if fld is not None:   # a FIELD, not a probability: no sigmoid, no temperature
+        kind, ci = fld
+        from usrm2 import losses as L
+        if kind == "sdist":
+            fn = lambda t: raw(t)[:, ci].float()
+        elif kind == "thickness":
+            fn = lambda t: L.soft_thickness(raw(t)[:, ci].float(), L.TMIN)
+        elif kind == "conf":
+            fn = lambda t: 1.0 / (1.0 + torch.exp(0.5 * raw(t)[:, ci].float().clamp(-8, 8)))
+        else:  # normals: (B,3,w,w,w), ZYX, unit, sign verso -> recto (dot(n, radial) > 0)
+            nh = [j for j, c in enumerate(st["args"].get("channels") or []) if c in ("nz", "ny", "nx")]
+            fn = ((lambda t: L.normals_from(raw(t)[:, ci:ci + 1].float()))
+                  if len(nh) != 3 else
+                  (lambda t: (lambda v: v / v.norm(dim=1, keepdim=True).clamp_min(1e-4))(
+                      raw(t)[:, nh[0]:nh[0] + 3].float())))
     if tta > 1:
         assert head != "all", "tta and head=all do not combine"
         fn = flips_vec(fn, tta)
@@ -304,7 +373,7 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
             cc = crop_pad(casc, off, c.shape) if use_cas else None
             cxs = data.context(volume, g, c.shape, ctx, rung=kk_) if ctx else ()
             return data.inputs(c if lut is None else lut[c], data.radial(axk, g, c.shape) * r, cxs,
-                               rung=(kk_ if scale else None), cascade=cc)
+                               rung=(kk_ if scale else None), cascade=cc, planes=planes_at(kk_, g, c.shape))
         return pr
 
     def at_rung(kk_, o, s, depth):
@@ -317,10 +386,12 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
     rad = lambda c, o: data.radial(ax, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape) * r
     cx = (lambda c, o: data.context(volume, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape, ctx, rung=kr)) if ctx else (lambda c, o: ())
     cas_at = (lambda c, o: crop_pad(casc, o, c.shape)) if use_cas else (lambda c, o: None)
-    preps = [lambda c, o: data.inputs(c, rad(c, o), cx(c, o), rung=kk, cascade=cas_at(c, o))] + \
-            [(lambda c, o, l=l: data.inputs(l[c], rad(c, o), cx(c, o), rung=kk, cascade=cas_at(c, o))) for l in luts]
+    pl = lambda c, o: planes_at(k, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape)  # noqa: E731
+    preps = [lambda c, o: data.inputs(c, rad(c, o), cx(c, o), rung=kk, cascade=cas_at(c, o), planes=pl(c, o))] + \
+            [(lambda c, o, l=l: data.inputs(l[c], rad(c, o), cx(c, o), rung=kk, cascade=cas_at(c, o), planes=pl(c, o))) for l in luts]
     if batch > 1:
         assert not ctx and not luts and tta <= 1, "batched inference: CT + radial inputs only"
+        assert fld is None, "batched inference (--batch > 1) does not serve the Phase B field heads"
         R = torch.from_numpy(data.radial(ax, (z0, y0, x0), roi.shape) * r).to(dev)
         C = None if casc is None else torch.from_numpy(casc).to(dev)
         norm = data.NORM
@@ -333,6 +404,9 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
             parts = [x[None]]
             if use_cas:  # the cascade channel sits before the scale plane; the compiled net never sees the recursion
                 parts.append((torch.zeros_like(x) if C is None else C[sl]).float()[None])
+            if pls:
+                parts.append(torch.from_numpy(np.ascontiguousarray(
+                    planes_at(k, (z + z0, y + y0, xx + x0), tuple(x.shape)))).to(x.device).float())
             if scale:
                 parts.append(torch.full_like(x, (k - 2) / 9.0)[None])
             parts.append(R[(slice(None),) + sl])
@@ -355,3 +429,195 @@ def predict(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=
     write(out, prob, (z0, y0, x0), volcomp=volcomp, volume=volume, rung=2 if rung is None else int(rung),
           channels=names)
     return out
+
+
+# =========================================================== the tracer contract (section 29)
+# docs/research/synthesis_v2_with_literature.md section 2. The consumer (`fit_spiral.py` via
+# `lasagna_data.py`) reads dense fields on the shard grid, in ZYX, in WORKING VOXELS of the store's own
+# rung -- so `voxel_um` is recorded on every store and no field is ever pooled across rungs.
+#
+#     recto / verso   uint8   probability * 255                              (as today)
+#     surf_sdist      uint8   d = (v - 128) * 0.25 voxels, cap +-31.75, v=0 = NO DATA,
+#                             POSITIVE on the recto side (radially outward), i.e. outside the sheet body
+#     nz / ny / nx    uint8   component = (v - 128) / 127, ZYX, unit vector, sign VERSO -> RECTO
+#                             (equivalently dot(n, radial) > 0); v=0 = no data
+#     gmag            uint8   |grad d| * 127, so 127 is the Eikonal ideal |grad d| = 1
+#     conf            uint8   confidence * 255, from the heteroscedastic log-variance
+#
+# A `midline` checkpoint stores the RECTO-FACE convention: the export is the subtraction m - t/2, done
+# here, so the training-time representation (which is what buys non-crossing) never reaches the tracer.
+
+TRACER_UNIT = 0.25
+TRACER_OFF = 128
+TRACER_CAP = 31.75
+NORMAL_SCALE = 127.0
+
+
+def enc_signed(d, valid):
+    """voxels -> uint8, code 0 = no data (`usrm2.targets.encode_signed`, in numpy here)."""
+    c = np.rint(np.clip(d, -TRACER_CAP, TRACER_CAP) / TRACER_UNIT) + TRACER_OFF
+    return np.where(valid, np.clip(c, 1, 255), 0).astype(np.uint8)
+
+
+def enc_normal(n, valid):
+    """a normal COMPONENT in -1..1 -> uint8, code 0 = no data."""
+    c = np.rint(np.clip(n, -1.0, 1.0) * NORMAL_SCALE) + TRACER_OFF
+    return np.where(valid, np.clip(c, 1, 255), 0).astype(np.uint8)
+
+
+def dec_normal(u):
+    return (np.asarray(u, np.float32) - TRACER_OFF) / NORMAL_SCALE
+
+
+def scharr3(d):
+    """Scharr gradient of a (Z,Y,X) field, (3,Z,Y,X) in ZYX order.
+
+    The contract is explicit that the normal is derived from the STORED distance field, never from the
+    decoder's own autograd gradient: a ReLU/SiLU conv decoder has piecewise-constant gradients, so its
+    analytic gradient is noisier than a finite difference of its output
+    (`lit_implicit_surfaces_manifold.md`, the SIREN pitfall). Scharr is the rotationally best-behaved
+    3x3 first derivative; the 3D kernel is the 1D derivative [-1, 0, 1] along the axis times the 1D
+    smoother [3, 10, 3] on the other two, normalised so a unit ramp gives 1."""
+    import scipy.ndimage as ndi
+    sm = np.array([3.0, 10.0, 3.0]) / 16.0
+    dv = np.array([-1.0, 0.0, 1.0]) / 2.0
+    out = []
+    for a in range(3):
+        g = np.asarray(d, np.float32)
+        for b in range(3):
+            g = ndi.correlate1d(g, dv if b == a else sm, axis=b, mode="nearest")
+        out.append(g)
+    return np.stack(out)
+
+
+def tracer_fields(sd, thick=None, conf=None, valid=None):
+    """(recto-face sdist, normals, |grad|, valid) from a predicted distance field.
+
+    `sd` is the model's distance field in voxels. With `thick` it is a MIDLINE distance and the
+    recto-face field is `m - t/2` -- the subtraction the contract asks for, so a midline-trained model
+    and a face-trained one export byte-comparable stores. The normal is the Scharr gradient of the
+    EXPORTED field, normalised; because d grows outward the normal points verso -> recto."""
+    d = np.asarray(sd, np.float32)
+    if thick is not None:
+        d = d - 0.5 * np.asarray(thick, np.float32)
+    g = scharr3(d)
+    mag = np.linalg.norm(g, axis=0)
+    n = g / np.maximum(mag, 1e-4)
+    v = np.ones(d.shape, bool) if valid is None else np.asarray(valid, bool)
+    return d, n, mag, v
+
+
+def export_tracer(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=None, rung=None,
+                  cascade=None, cascade_depth=3, tta=0, marching_cubes=False, mc_level=0.0,
+                  volcomp=True, log=print):
+    """Write the tracer contract's stores over a box. Returns {name: path}.
+
+    One `probs` pass per field the checkpoint can produce: recto, verso (when it has one), the distance,
+    the thickness (when it has one) and the confidence (when it was trained `--sdist-hetero`). The
+    normal field and the gradient magnitude are derived HERE, from the exported distance field, with a
+    Scharr kernel -- not read out of the net -- so what the tracer reads is exactly the gradient of what
+    it reads.
+
+    Every store is zarr v3 sharded, 128^3 inner chunks, volcomp q8, `compressors=None`
+    (docs/unified_design.md 18.1b and 24), with `origin_zyx`, `voxel_um`, `rung`, `volume`, `umbilicus`
+    and the encoding written into its attrs.
+
+    `marching_cubes`: also run skimage's marching cubes on the ZERO LEVEL of the distance field, one
+    SHARD at a time with a one-voxel halo for stitching, and write `<out>/mesh/shard_<z>_<y>_<x>.obj`
+    with vertices in GLOBAL ZYX voxels of this rung. This is the step that replaces `make_surf_sdt.py`'s
+    threshold-and-EDT round trip."""
+    import os
+    import torch
+    st = torch.load(ckpt, map_location="cpu")
+    ch = [str(c) for c in (st["args"].get("channels") or CHANNEL_DEFAULT)]
+    npb = int(st["args"].get("cout_p", st["args"].get("cout_t", st["args"].get("cout", 1))))
+    dch = next((c for c in ("sdist", "midline") if c in ch), None)
+    assert dch is not None, f"{ckpt}: no distance channel (channels {ch}); train it with --sdist"
+    k = int(rung) if rung is not None else 2
+    kw = dict(window=window, halo=halo, device=device, rung=rung, cascade=cascade,
+              cascade_depth=cascade_depth, tta=tta)
+    os.makedirs(out, exist_ok=True)
+    got = {}
+
+    def field(hd):
+        return probs(ckpt, volume, z0, y0, x0, Z, Y, X, head=hd, **kw)[0]
+
+    log(f"export-tracer {out}: rung {k}, channels {ch}")
+    rec = field("recto" if "recto" in ch else 0)
+    sd = field("sdist")          # the FIELD, whatever the channel is called in this checkpoint
+    th = field("thickness") if "thickness" in ch else None
+    cf = field("conf") if "logvar" in ch else None
+    ver = field("verso") if ("verso" in ch and npb >= 2) else None
+    d, n, mag, valid = tracer_fields(sd, th)
+    valid = valid & (rec > 0)     # CT==0 is masked by both sides: `slide` already zeroes it
+
+    def w(name, u8, enc):
+        p = os.path.join(str(out), f"{name}.zarr")
+        a = out_array(p, u8.shape, (z0, y0, x0), volcomp=volcomp,
+                      volume=volume, rung=k, channels=(name,))
+        a.attrs.update({"encoding": enc, "unit": "voxels_of_this_rung", "no_data": 0,
+                        "axis_order": "ZYX", "sign_convention":
+                        "d > 0 and n pointing from the VERSO face towards the RECTO face, i.e. "
+                        "radially OUTWARD from the scroll axis (dot(n, radial) > 0)"})
+        a[:] = u8[None] if a.ndim == 4 else u8
+        got[name] = p
+        return p
+
+    w("recto", u8(rec), "prob_u8")
+    if ver is not None:
+        w("verso", u8(ver), "prob_u8")
+    w("surf_sdist", enc_signed(d, valid), "signed_u8_off128_q0.25")
+    for j, nm in enumerate(("nz", "ny", "nx")):
+        w(nm, enc_normal(n[j], valid & (mag > 1e-3)), "normal_u8_off128_div127")
+    w("gmag", np.clip(np.rint(mag * NORMAL_SCALE), 0, 255).astype(np.uint8), "gradmag_u8_x127")
+    if cf is not None:
+        w("conf", u8(cf), "conf_u8")
+    if th is not None:
+        w("thickness", np.clip(np.rint(th / TRACER_UNIT), 0, 255).astype(np.uint8), "unsigned_u8_q0.25")
+    if marching_cubes:
+        got["mesh"] = mesh_shards(d, valid, (z0, y0, x0), os.path.join(str(out), "mesh"),
+                                  level=mc_level, log=log)
+    log(f"export-tracer {out}: wrote {sorted(got)}")
+    return got
+
+
+def mesh_shards(d, valid, origin, out, level=0.0, shard=1024, log=print):
+    """Marching cubes on the ZERO LEVEL of a distance field, one shard at a time, one .obj per shard.
+
+    The shard grid is the store's own (`shard_shape`), and each shard is extracted with a ONE-VOXEL halo
+    on its high faces so neighbouring shards' triangles meet: skimage's marching cubes places a vertex
+    between two samples, so without that overlap there is a missing cell between shards. Vertices are
+    written in GLOBAL ZYX voxels of this rung, which is the frame the rest of the contract uses (`v z y x`
+    in the .obj, so an .obj reader's x is our z -- stated here and in the store attrs rather than silently
+    swapped, because a swap is exactly the bug this contract exists to prevent).
+
+    Invalid voxels are pushed to +cap, so the surface never closes over a no-data region.
+    """
+    import os
+    from skimage import measure
+    os.makedirs(out, exist_ok=True)
+    f = np.where(valid, np.asarray(d, np.float32), TRACER_CAP)
+    Z, Y, X = f.shape
+    paths = []
+    for z in range(0, Z, shard):
+        for y in range(0, Y, shard):
+            for x in range(0, X, shard):
+                blk = f[z:min(z + shard + 1, Z), y:min(y + shard + 1, Y), x:min(x + shard + 1, X)]
+                if blk.min() > level or blk.max() < level or min(blk.shape) < 2:
+                    continue
+                try:
+                    v, tri, _, _ = measure.marching_cubes(blk, level=float(level))
+                except (ValueError, RuntimeError) as e:
+                    log(f"  shard {z},{y},{x}: marching cubes failed ({e!r})")
+                    continue
+                v = v + np.array([z + origin[0], y + origin[1], x + origin[2]], np.float32)
+                p = os.path.join(out, f"shard_{z + origin[0]}_{y + origin[1]}_{x + origin[2]}.obj")
+                with open(p, "w") as fh:
+                    fh.write("# usrm2 export-tracer: vertices are GLOBAL ZYX voxels of this rung\n")
+                    for q in v:
+                        fh.write(f"v {q[0]:.4f} {q[1]:.4f} {q[2]:.4f}\n")
+                    for q in tri:
+                        fh.write(f"f {q[0] + 1} {q[1] + 1} {q[2] + 1}\n")
+                paths.append(p)
+                log(f"  shard {z},{y},{x}: {len(v)} vertices, {len(tri)} triangles -> {os.path.basename(p)}")
+    return out if paths else None
