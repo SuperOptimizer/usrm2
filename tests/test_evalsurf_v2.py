@@ -186,8 +186,10 @@ def test_curve_fitter_on_a_flat_curve_says_there_is_nothing_left():
     rng = np.random.default_rng(0)
     vals = 0.9 - 1e-5 * rng.standard_normal(20)
     f = E.fit_curve(steps, vals)
-    assert f["asymptote"] == pytest.approx(0.9, abs=2e-3)
-    assert abs(f["slope_per_10k"]) < 1e-2 and f["remaining"] < 5e-3
+    # A flat noise curve does not pin an asymptote (any c above the data fits, with a slope of ~0), so the
+    # decision rule in section 25.5 is the SLOPE against the bootstrap CI, never the asymptote alone.
+    assert f["last_value"] == pytest.approx(0.9, abs=2e-3)
+    assert abs(f["slope_per_10k"]) < 1e-2
 
 
 def test_curve_reads_eval_jsonl(tmp_path):

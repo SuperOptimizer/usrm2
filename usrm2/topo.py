@@ -99,16 +99,23 @@ def betti_error(pred, ref, margin=8, band=6, chunk=CHUNK):
     # implementation; the efficient one is C++/CUDA and is not a dependency we carry today.
 
 
-def rasterize(grids, shape, origin, step=0.7):
+def rasterize(grids, shape, origin, step=0.7, pad=64.0):
     """Bool volume of the published surfaces: every mesh quad whose four corners are finite is sampled on a
     regular (u x u) lattice dense enough that consecutive samples are `step` voxels apart, and the samples
     are rounded into the box. The tifxyz grid is many voxels coarse, so the quads MUST be filled in or the
-    reference would be a cloud of disconnected specks with a meaningless b0."""
+    reference would be a cloud of disconnected specks with a meaningless b0.
+
+    A published surface spans the whole scroll and the box is one 256x1024x1024 window of it, so quads
+    with no corner within `pad` voxels of the box are dropped BEFORE sampling -- otherwise almost all the
+    work goes into samples that are then clipped away."""
     out = np.zeros(shape, bool)
     o = np.asarray(origin, np.float32)
+    lo, hi = o - pad, o + np.asarray(shape, np.float32) + pad
     for g in grids:
         v = np.isfinite(g).all(-1)
+        near = v & ((g >= lo) & (g < hi)).all(-1)
         q = v[:-1, :-1] & v[1:, :-1] & v[:-1, 1:] & v[1:, 1:]
+        q &= near[:-1, :-1] | near[1:, :-1] | near[:-1, 1:] | near[1:, 1:]
         if not q.any():
             continue
         C = np.stack([g[:-1, :-1][q], g[1:, :-1][q], g[:-1, 1:][q], g[1:, 1:][q]]).astype(np.float32)  # (4,M,3)

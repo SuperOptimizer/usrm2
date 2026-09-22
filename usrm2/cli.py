@@ -49,6 +49,9 @@ def main(argv=None):
     t.add_argument("--val-rungs", default="2,3,4,6", help="rungs the held-out box is scored at")
     t.add_argument("--require-targets", action="store_true", help="only draw windows whose target chunks are on disk (a partially pulled export)")
     t.add_argument("--aug", default="geo", help="augmentation preset (see aug.PRESETS)")
+    t.add_argument("--scan-meta", default=None, metavar="PATH", help="recentre the scan-domain "
+                   "augmentation ranges on this scan's recorded metadata (usrm2/scanmeta.py); a path or "
+                   "URL to the metadata json. Without it the preset's own ranges are used, as before")
     t.add_argument("--no-radial", action="store_true", help="zero the radial channels 1..3")
     t.add_argument("--region", type=int, default=0, help="region mode: visit one REGION^3 region of one "
                    "source at one rung, take --windows-per-region windows inside it, then move on")
@@ -100,7 +103,7 @@ def main(argv=None):
                    "then cosine over --cooldown). WSD's plateau and cooldown MAY be changed on a resume")
     t.add_argument("--stable-until", type=int, default=None, help="--sched wsd: step the plateau ends "
                    "(default: --steps minus --cooldown)")
-    t.add_argument("--cooldown", type=int, default=0, help="--sched wsd: cooldown length (default 10% of --steps)")
+    t.add_argument("--cooldown", type=int, default=0, help="--sched wsd: cooldown length (default 10%% of --steps)")
     t.add_argument("--ema-k", type=float, default=None, metavar="K", help="ema_decay = 1 - K / --steps "
                    "(an averaging window of steps/K; K=50 is 2%%, the middle of the literature's 1-3%%). "
                    "Overrides --ema")
@@ -201,6 +204,28 @@ def main(argv=None):
     p.add_argument("--cascade", default="auto", choices=["auto", "on", "off"], help="top-down cascade inference: "
                    "'auto' follows the checkpoint's own --cascade, 'off' feeds a zero cascade channel")
     p.add_argument("--cascade-depth", type=int, default=3, help="rungs above k predicted top-down to fill the cascade channel")
+    p.add_argument("--no-calib", action="store_true", help="do NOT apply the checkpoint's per-rung "
+                   "temperature (`usrm2 calibrate`); a checkpoint with none is unaffected either way")
+    cb = sub.add_parser("calibrate", help="fit one TEMPERATURE per rung on the checkpoint's own held-out "
+                        "grid and store them in its args (docs/unified_design.md section 26); "
+                        "`predict`/`evalsurf` then divide the logits by it unless --no-calib")
+    cb.add_argument("ckpt")
+    cb.add_argument("--val", nargs="+", default=None, help="validation box(es) (default: the checkpoint's own)")
+    cb.add_argument("--val-rungs", default=None, help="rungs to fit at (default: the checkpoint's own)")
+    cb.add_argument("--val-patches", type=int, default=None)
+    cb.add_argument("--device", default=None)
+    cb.add_argument("--all-rungs", action="store_true", help="also fit the rungs whose target is a pooled "
+                    "FRACTION rather than a binary band (a temperature there is not a calibration)")
+    cb.add_argument("--dry-run", action="store_true", help="print the fit but do not write the checkpoint")
+    gw = sub.add_parser("glc-weights", help="GLC-style per-source loss weights: score each teacher source "
+                        "against the published meshes on the val box and print a --source-w line")
+    gw.add_argument("sources", nargs="+", metavar="NAME=STORE", help="e.g. mask=/vesuvius/usrm2/teacher/eval.zarr "
+                    "store=/vesuvius/usrm2/teacher_regions/recto/region_34816_14336_17408.zarr")
+    gw.add_argument("--box", type=int, nargs=6, default=None, metavar=("Z0", "Y0", "X0", "Z", "Y", "X"))
+    gw.add_argument("--tifxyz", default=None)
+    gw.add_argument("--volume", default=None)
+    gw.add_argument("--r", type=float, default=4.0, help="voxels along the normal that count as a hit")
+    gw.add_argument("--thr", type=float, default=0.5)
     ub = sub.add_parser("umbilicus", help="put a scroll's axis where the loader looks for it "
                         "(a published file if there is one, otherwise derived from the scroll's own CT)")
     ub.add_argument("ct_base", nargs="+", help="CT pyramid group(s), or a stores file with --stores-file")
@@ -246,6 +271,8 @@ def main(argv=None):
     sc.add_argument("run_dir")
     sc.add_argument("--metric", default="dice", help="a key of eval.jsonl (dice, dice_r2, bce, ...) or of an evalsurf json")
     sc.add_argument("--unbounded", action="store_true", help="the metric is not confined to [0,1]")
+    sc.add_argument("--smooth", type=int, default=5, help="width of the running median applied before fitting (1 = off)")
+    sc.add_argument("--tail", type=float, default=1.0, help="fit only the last fraction of the checkpoints")
     sc.add_argument("--json", dest="json_out", default=None)
     t = sub.add_parser("teacher", help="run the upstream teacher over a box")
     t.add_argument("out")
@@ -375,6 +402,10 @@ def main(argv=None):
         """'mask=1 store=0.7' -> {"mask": 1.0, "store": 0.7}."""
         return {q.split("=")[0]: float(q.split("=")[1]) for q in vs}
 
+    def parse_kv_str(vs):
+        """'mask=/a.zarr store=/b.zarr' -> {"mask": "/a.zarr", "store": "/b.zarr"}."""
+        return {q.split("=", 1)[0]: q.split("=", 1)[1] for q in vs}
+
     def parse_cascade(v):
         """`--cascade auto|on|off` at INFERENCE -> what predict.probs wants: None = follow the checkpoint."""
         return None if str(v) == "auto" else (str(v) != "off")
@@ -399,7 +430,7 @@ def main(argv=None):
                 affinity_all=a.affinity_all, cascade_self_p_anneal=a.cascade_self_p_anneal,
                 sched=a.sched, stable_until=a.stable_until, cooldown=a.cooldown,
                 rewarm=a.rewarm, new_param_lr_mult=a.new_param_lr_mult, ema_k=ema_k,
-                fuse=a.fuse, source_w=parse_kv(a.source_w),
+                fuse=a.fuse, source_w=parse_kv(a.source_w), scan_meta=a.scan_meta,
                 **({"rungs": parse_rungs(a.rungs), "rung_boost": parse_boost(a.rung_boost),
                     "val_rungs": [int(q) for q in a.val_rungs.split(",")], "require_targets": a.require_targets,
                     "region": a.region, "windows_per_region": a.windows_per_region,
@@ -419,6 +450,16 @@ def main(argv=None):
                     mask_ctx=not a.no_mask_ctx, loss=a.loss, cascade_slot=not a.no_cascade_slot,
                     rung_aux=a.rung_aux, rung_aux_p=a.rung_aux_p, fg_min=a.fg_min, air_keep=a.air_keep,
                     **{k: v for k, v in dict(stores=a.stores, stores_file=a.stores_file, val=a.val).items() if v})
+    elif a.cmd == "calibrate":
+        from usrm2 import calib
+        calib.main(a.ckpt, val=a.val, val_rungs=(None if a.val_rungs is None else
+                                                 [int(q) for q in str(a.val_rungs).split(",")]),
+                   val_patches=a.val_patches, device=a.device, all_rungs=a.all_rungs, write=not a.dry_run)
+    elif a.cmd == "glc-weights":
+        from usrm2 import glc
+        b = a.box
+        glc.main(parse_kv_str(a.sources), origin=(b[:3] if b else None), size=(b[3:] if b else None),
+                 tifxyz=a.tifxyz, volume=a.volume, r=a.r, thr=a.thr)
     elif a.cmd == "umbilicus":
         from usrm2 import umbilicus as U
         bases = []
@@ -473,7 +514,7 @@ def main(argv=None):
               betti_margin=a.betti_margin, betti_band=a.betti_band, no_ceiling_cache=a.no_ceiling_cache)
     elif a.cmd == "evalsurf-curve":
         from usrm2 import evalsurf as E
-        E.curve(a.run_dir, metric=a.metric, bounded=not a.unbounded, out=a.json_out)
+        E.curve(a.run_dir, metric=a.metric, bounded=not a.unbounded, out=a.json_out, smooth=a.smooth, tail=a.tail)
     elif a.cmd == "refine":
         from usrm2 import refine
         outs = refine.run(a.surfaces, a.store, a.out, eval_store=a.eval_store, far=a.far, sigma=a.sigma, iters=a.iters, thr=a.thr,
@@ -530,7 +571,8 @@ def main(argv=None):
         vol = a.volume or data.CT
         P.predict(a.ckpt, vol, *a.origin, *a.size, a.out, window=a.window, halo=a.halo, volcomp=not a.plain, rung=a.rung,
                   tta=a.tta, luts=[teacher.lut_to(vol, r) for r in a.lut_to], head=a.head,
-                  radial_sign=a.radial_sign, cascade=parse_cascade(a.cascade), cascade_depth=a.cascade_depth)
+                  radial_sign=a.radial_sign, cascade=parse_cascade(a.cascade), cascade_depth=a.cascade_depth,
+                  calib=not a.no_calib)
 
 
 if __name__ == "__main__":

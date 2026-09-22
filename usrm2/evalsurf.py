@@ -527,43 +527,60 @@ def ceiling(origin, size, store=None, cache=True, **kw):
 # Plateau fitting (`usrm2 evalsurf-curve`): is this metric still moving, or is it done?
 # ---------------------------------------------------------------------------------------------------
 
-def fit_curve(steps, vals, bounded=True, gain95=0.95):
+def fit_curve(steps, vals, bounded=True, gain95=0.95, smooth=1, tail=1.0):
     """Fit a saturating curve to (step, metric) and say whether the run is done.
 
     Two forms are tried and the lower-RMSE one wins (Hestness et al. 2017 for the power law; the
     literature's own caveat is that a power law does not saturate below 1, so for a [0,1] metric a
-    logistic in log-step is usually the honest fit):
-        power     y = c - a * step^-alpha
-        logistic  y = c / (1 + exp(-k * (log10 step - m)))
+    logistic in log-step is usually the honest fit -- but it needs a FLOOR, since a val dice starts near
+    0.3, not 0, and a floorless logistic just pins its asymptote to the upper bound):
+        power      y = c - a * step^-alpha
+        logistic4  y = y0 + (c - y0) / (1 + exp(-k * (log10 step - m)))
+    `smooth` is the width of a centred running median applied first (raw per-checkpoint numbers are not
+    monotone and an unsmoothed fit is unstable); `tail` keeps only the last fraction of the points, which
+    is what the scaling-law literature fits when only the plateau matters.
+
     Returns the fitted asymptote `c`, `step95` (where 95% of the gain still outstanding at the LAST
     measured step has been collected) and `slope_per_10k` (dy/dstep * 1e4 at the last step). Do not trust
     a saturation call from fewer than ~10-15 points, and never without the Phase-A0 bootstrap CI to
-    compare the slope against."""
+    compare the slope against. `asymptote_at_bound` means the fit ran into the ceiling of the parameter
+    range and the asymptote is not to be believed."""
     s = np.asarray(steps, float)
     y = np.asarray(vals, float)
     k = np.isfinite(s) & np.isfinite(y) & (s > 0)
     s, y = s[k], y[k]
     o = np.argsort(s)
     s, y = s[o], y[o]
+    if int(smooth) > 1 and len(y) > int(smooth):
+        w, z = int(smooth) | 1, y.copy()          # FULL windows only: a truncated window at the end drags
+        h = w // 2                                 # a rising curve down and fakes a plateau
+        for i in range(h, len(y) - h):
+            z[i] = np.median(y[i - h:i + h + 1])
+        y = z
+    if 0 < tail < 1:
+        s, y = s[int(len(s) * (1 - tail)):], y[int(len(y) * (1 - tail)):]
     if len(s) < 4:
         return {"model": None, "n": int(len(s)), "error": "need at least 4 points"}
     hi = 1.0 if bounded else float(y.max() * 4 + 1)
+    ymax, ymin = float(y.max()), float(y.min())
     from scipy.optimize import curve_fit
 
     def power(x, c, a, al):
         return c - a * x ** (-al)
 
-    def logis(x, c, kk, m):
-        return c / (1.0 + np.exp(-kk * (np.log10(x) - m)))
+    def logis(x, c, kk, m, y0):
+        return y0 + (c - y0) / (1.0 + np.exp(-kk * (np.log10(x) - m)))
 
     fits = []
     for f, p0, bnd in (
-            (power, [min(max(y.max() * 1.05, y.max() + 1e-3), hi), max(y.max() - y.min(), 1e-3) * s[0] ** 0.5, 0.5],
-             ([y.max(), 0.0, 1e-3], [hi, np.inf, 5.0])),
-            (logis, [min(max(y.max() * 1.05, y.max() + 1e-3), hi), 2.0, float(np.log10(s.mean()))],
-             ([y.max(), 1e-3, -10.0], [hi, 100.0, 12.0]))):
+            (power, [min(ymax * 1.05, hi), max(ymax - ymin, 1e-3) * s[0] ** 0.5, 0.5],
+             ([ymax, 0.0, 1e-3], [hi, np.inf, 5.0])),
+            (logis, [min(ymax * 1.05, hi), 2.0, float(np.log10(s.mean())), ymin],
+             ([ymax, 0.05, -10.0, ymin - 1.0], [hi, 10.0, 12.0, ymax]))):  # k <= 10: a steeper
+             # logistic in log-step is a STEP function, which fits any finished run with zero residual
+             # slope and would declare every run saturated
         try:
-            p, _ = curve_fit(f, s, y, p0=p0, bounds=bnd, maxfev=40000)
+            p, _ = curve_fit(f, s, y, p0=p0, bounds=bnd, maxfev=60000)
             fits.append((float(np.sqrt(np.mean((f(s, *p) - y) ** 2))), f.__name__, p))
         except Exception:
             pass
@@ -576,19 +593,24 @@ def fit_curve(steps, vals, bounded=True, gain95=0.95):
     if name == "power":
         _, a, al = p
         slope = float(a * al * last ** (-al - 1) * 1e4)
-        s95 = float((a / max((1 - gain95) * rem, 1e-12)) ** (1.0 / al)) if rem > 1e-9 else last
+        s95 = float(np.exp(min(np.log(a / max((1 - gain95) * rem, 1e-12)) / al, 700.0))) if rem > 1e-9 else last
     else:
-        _, kk, m = p
+        _, kk, m, y0 = p
         e = np.exp(-kk * (np.log10(last) - m))
-        slope = float(c * kk * e / (1 + e) ** 2 / (last * np.log(10)) * 1e4)
-        t = (1 - gain95) * rem
-        s95 = float(10 ** (m + np.log(max(c / max(c - t, 1e-12) - 1, 1e-12)) / -kk)) if rem > 1e-9 else last
+        slope = float((c - y0) * kk * e / (1 + e) ** 2 / (last * np.log(10)) * 1e4)
+        t = ylast + gain95 * rem                       # the value 95% of the way to the asymptote
+        z = (c - y0) / max(t - y0, 1e-12) - 1
+        s95 = float(10 ** min(m - np.log(max(z, 1e-12)) / kk, 300.0)) if rem > 1e-9 and z > 0 else last
+    at_bound = [bool(abs(float(v) - b) < 1e-6 * max(abs(b), 1.0)) for v, b in
+                zip(p, ([hi, np.inf, 5.0] if name == "power" else [hi, 10.0, 12.0, ymax]))]
     return {"model": name, "n": int(len(s)), "rmse": rmse, "params": [float(x) for x in p],
-            "asymptote": c, "last_step": last, "last_value": ylast, "remaining": float(rem),
+            "asymptote": c, "asymptote_at_bound": bool(c >= hi - 1e-6), "params_at_bound": at_bound,
+            "last_step": last,
+            "last_value": ylast, "remaining": float(rem), "smooth": int(smooth), "tail": float(tail),
             "step95": s95, "steps_to_95": float(max(s95 - last, 0.0)), "slope_per_10k": slope}
 
 
-def curve(run_dir, metric="dice", bounded=True, out=None):
+def curve(run_dir, metric="dice", bounded=True, out=None, smooth=5, tail=1.0):
     """Fit the plateau of one metric over a run: `run_dir/eval.jsonl` (val dice per step) when it exists,
     otherwise a directory of `evalsurf --json` dumps (each carrying `step` and its pooled metrics)."""
     pts = []
@@ -610,11 +632,12 @@ def curve(run_dir, metric="dice", bounded=True, out=None):
                 pts.append((float(d["step"]), float(d[metric])))
     pts = [p for p in pts if np.isfinite(p[1])]
     res = {"source": src, "metric": metric, "points": len(pts),
-           **(fit_curve([p[0] for p in pts], [p[1] for p in pts], bounded=bounded) if len(pts) >= 4
+           **(fit_curve([p[0] for p in pts], [p[1] for p in pts], bounded=bounded, smooth=smooth, tail=tail)
+              if len(pts) >= 4
               else {"model": None, "error": f"only {len(pts)} points"})}
     print(json.dumps(res))
     if res.get("model"):
-        print(f"{metric}: asymptote {res['asymptote']:.4f} ({res['model']} fit, rmse {res['rmse']:.4g}, "
+        print(f"{metric}: asymptote {res['asymptote']:.4f}{' AT THE BOUND -- do not believe it' if res['asymptote_at_bound'] else ''} ({res['model']} fit, rmse {res['rmse']:.4g}, "
               f"{res['points']} points)\n  at step {res['last_step']:.0f}: {res['last_value']:.4f}, "
               f"slope {res['slope_per_10k']:+.4f} / 10k steps\n  95% of the remaining "
               f"{res['remaining']:.4f} by step {res['step95']:.0f} ({res['steps_to_95']:.0f} more)")
