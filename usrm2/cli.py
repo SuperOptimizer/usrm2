@@ -76,6 +76,12 @@ def main(argv=None):
     t.add_argument("--no-cascade-noise", action="store_true", help="do NOT roughen the mask-derived cascade channel (it is then a blurred copy of the target: a leak)")
     t.add_argument("--stream", default=None, help="replay a `usrm2 stream-plan` queue directory instead of "
                    "sampling: the windows come from the rolling local buffer the planner fills")
+    t.add_argument("--stream-tag", default=None, metavar="NAME", help="this run's name on a SHARED stream "
+                   "queue (docs/unified_design.md section 30): its replay cursor becomes "
+                   "<queue>/progress.NAME/ and its eviction bound <queue>/consumed.NAME, so several runs "
+                   "(the size ladder's rungs) replay ONE plan -- the same windows, in the same order -- "
+                   "without consuming each other's entries. The planner evicts only what the SLOWEST of "
+                   "them has passed. Without it the paths are the unsuffixed ones every run has used")
     # ---- Phase A losses and training recipe (docs/unified_design.md section 26). Every one is OFF by
     # default and is recorded in the checkpoint args only when it is on, so a run without them is
     # byte-identical to one started before they existed.
@@ -223,7 +229,44 @@ def main(argv=None):
                     "also fixes the five scan planes for every source")
     sp.add_argument("--val-rungs", default="2,3,4,6", help="rungs the held-out box is scored at (prefetched and pinned)")
     sp.add_argument("--val-patches", type=int, default=32)
+    sp.add_argument("--label-free", action="store_true", help="plan windows anywhere the CT is NOT AIR "
+                    "instead of only inside the first target group's box, and apply no foreground / "
+                    "density rejection (docs/unified_design.md section 30). A source line may then be a "
+                    "bare `ct_base` with no target group. This is the sampling masked-cube pretraining "
+                    "wants (section 28, experiment 11); it contradicts --require-targets")
     sp.add_argument("--limit", type=int, default=0, help="stop after this many queued windows (0 = forever)")
+    # ------------------------------------------------------- the size ladder (experiment 12, section 30)
+    ld = sub.add_parser("ladder", help="EXPERIMENT 12, the size ladder: print the commands that run "
+                        "--size 15m / 30m6 / 60m at MATCHED STEPS on the SAME windows in the SAME order "
+                        "(one shared stream queue, one --stream-tag per rung), differing only in --size")
+    ld.add_argument("out_root", help="the runs go in <out_root>/<size>")
+    ld.add_argument("--sizes", nargs="+", default=list(__import__('usrm2.ladder', fromlist=['L']).SIZES))
+    ld.add_argument("--base", default="", help="the rest of the `usrm2 train` flag line, quoted: it is "
+                    "copied VERBATIM to every rung (that is the experiment)")
+    ld.add_argument("--stores-file", default=None, help="also print the matching `stream-plan` command")
+    ld.add_argument("--queue", default=None, help="the stream queue (one, shared, by default)")
+    ld.add_argument("--queues", default="shared", choices=["shared", "per-run"], help="'shared' = one "
+                    "queue.jsonl replayed by every rung under its own --stream-tag (the planner evicts "
+                    "only what the SLOWEST rung has passed); 'per-run' = one queue per rung planned with "
+                    "the same seed, which holds the same windows at 3x the bandwidth and disk")
+    ld.add_argument("--lr", type=float, default=3e-4)
+    ld.add_argument("--lr-scale", default="same", choices=["same", "mup"], help="'same' (the default and "
+                    "the experiment's own control) or 'mup' = lr * sqrt(w_base / w), the one width rule "
+                    "docs/research/lit_optimisation_schedules.md endorses; it also says to prefer a short "
+                    "per-rung LR sweep to any rule, so treat 'mup' as an arm, not a fix")
+    ld.add_argument("--base-size", default="30m6", help="the rung --lr refers to")
+    ld.add_argument("--tag-prefix", default="", help="prefix of the run directory name and --stream-tag")
+    lr_ = sub.add_parser("ladder-report", help="read a ladder's runs and fit 1 - metric against "
+                         "log(params) PER RUNG, with the train/val gap trend and a plateau fit per run")
+    lr_.add_argument("runs", nargs="+", help="run directories (each with eval.jsonl and ckpt.pt)")
+    lr_.add_argument("--metric", default="dice", help="the eval.jsonl / evalsurf key whose 1 - value is "
+                     "the loss that is fitted (dice, recall@4, dice_verso, ...)")
+    lr_.add_argument("--step", type=int, default=None, help="the matched step (default: the largest step "
+                     "EVERY run reached, which is the only honest comparison)")
+    lr_.add_argument("--rungs", nargs="*", type=int, default=None, help="the CT rungs to fit per (default: "
+                     "every dice_rK the runs logged)")
+    lr_.add_argument("--smooth", type=int, default=5, help="running median before the per-run plateau fit")
+    lr_.add_argument("--json", dest="json_out", default=None)
     b = sub.add_parser("ablate", help="train one run per augmentation preset, sequentially")
     b.add_argument("out_dir")
     b.add_argument("--presets", default="geo,all")
@@ -482,6 +525,11 @@ def main(argv=None):
     pt.add_argument("--rung-aux-p", type=float, default=0.5, help="fraction of steps that hide the scale plane and score the aux head")
     pt.add_argument("--fg-min", type=float, default=0.0, help="foreground rejection threshold (0 = take every non-air window: pretraining wants texture, not labels)")
     pt.add_argument("--air-keep", type=float, default=0.1, help="probability an all-air window is kept")
+    pt.add_argument("--label-free", action="store_true", help="sample anywhere the CT is not air instead "
+                    "of inside the first target group's box, and take a bare `ct_base` line with no "
+                    "target group at all (docs/unified_design.md section 30)")
+    pt.add_argument("--stream", default=None, help="replay a `usrm2 stream-plan` queue directory")
+    pt.add_argument("--stream-tag", default=None, help="see `train --stream-tag`")
     a = ap.parse_args(argv)
     from usrm2 import data, model, predict as P, train as T
 
@@ -547,6 +595,7 @@ def main(argv=None):
                 pair=a.pair, pair_band=a.pair_band, pair_tau=a.pair_tau,
                 loss_ect=a.loss_ect, ect_dirs=a.ect_dirs, ect_res=a.ect_res, ect_margin=a.ect_margin,
                 ect_block=a.ect_block, ect_n=a.ect_n, ect_rung=a.ect_rung, planes=a.planes,
+                stream_tag=a.stream_tag,
                 **({"rungs": parse_rungs(a.rungs), "rung_boost": parse_boost(a.rung_boost),
                     "val_rungs": [int(q) for q in a.val_rungs.split(",")], "require_targets": a.require_targets,
                     "region": a.region, "windows_per_region": a.windows_per_region,
@@ -565,6 +614,7 @@ def main(argv=None):
                     mask_hi=a.mask_hi, sheet_p=a.sheet_p, sheet_pct=a.sheet_pct,
                     mask_ctx=not a.no_mask_ctx, loss=a.loss, cascade_slot=not a.no_cascade_slot,
                     rung_aux=a.rung_aux, rung_aux_p=a.rung_aux_p, fg_min=a.fg_min, air_keep=a.air_keep,
+                    label_free=a.label_free, stream=a.stream, stream_tag=a.stream_tag,
                     **{k: v for k, v in dict(stores=a.stores, stores_file=a.stores_file, val=a.val).items() if v})
     elif a.cmd == "dist-pyramid":
         from usrm2 import targets as TG
@@ -611,7 +661,15 @@ def main(argv=None):
                active_regions=a.active_regions, epochs=a.epochs, region_fails=a.region_fails,
                teacher_regions=a.teacher_regions, visits_max=a.visits_max, cascade=a.cascade,
                verso=a.verso, verso_regions=a.verso_regions, verso_url=a.verso_regions_url,
-               planes=a.planes, scan_meta=a.scan_meta)
+               planes=a.planes, scan_meta=a.scan_meta, label_free=a.label_free)
+    elif a.cmd == "ladder":
+        from usrm2 import ladder as LD
+        LD.launch(a.base, a.out_root, sizes=tuple(a.sizes), queue=a.queue, stores_file=a.stores_file,
+                  lr=a.lr, lr_scale=a.lr_scale, base_size=a.base_size, queues=a.queues,
+                  tag_prefix=a.tag_prefix)
+    elif a.cmd == "ladder-report":
+        from usrm2 import ladder as LD
+        LD.report(a.runs, metric=a.metric, step=a.step, rungs=a.rungs, out=a.json_out, smooth=a.smooth)
     elif a.cmd == "ablate":
         from usrm2 import ablate
         ablate.sweep(a.out_dir, a.presets.split(","), size=a.size, steps=a.steps, patch=a.patch,
