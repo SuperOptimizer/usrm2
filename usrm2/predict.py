@@ -185,6 +185,33 @@ def flips_vec(fn, n=8):
     return go
 
 
+def flips_chan(fn, n=8, vec=()):
+    """`flips_vec` for a function whose output KEEPS a channel axis, (B, C, Z, Y, X).
+
+    The input side is identical (flipping spatial axis d negates radial component d). The output side
+    differs twice: the spatial axes are 2 + d, not 1 + d, and a VECTOR output has to be flipped as a
+    vector -- flipping the world along axis d negates component d of every normal. `vec` lists the
+    (cz, cy, cx) output-plane triples that are ZYX vectors; every other plane is a scalar field and is
+    only reordered. Without this a `--head normals` TTA average silently cancels the normal field.
+    """
+    fl = [(), (0,), (1,), (2,), (0, 1), (0, 2), (1, 2), (0, 1, 2)][:n]
+
+    def go(t):
+        out = 0
+        for f in fl:
+            x = torch.flip(t, [2 + d for d in f]).clone()
+            ni = x.shape[1] - 3
+            for d in f:
+                x[:, ni + d] = -x[:, ni + d]
+            y = torch.flip(fn(x), [2 + d for d in f]).clone()
+            for tri in vec:
+                for d in f:
+                    y[:, tri[d]] = -y[:, tri[d]]
+            out = out + y
+        return out / len(fl)
+    return go
+
+
 HEADS = {"mean": lambda p: p.mean(1), "prod": lambda p: p.prod(1) ** (1 / p.shape[1]), "max": lambda p: p.max(1).values}
 
 # PHASE B (docs/unified_design.md section 29). Fields a checkpoint trained with `--sdist` can emit that
@@ -198,6 +225,32 @@ FIELDS = ("sdist", "midline", "thickness", "normals", "conf")   # "midline" is a
 
 CHANNEL_DEFAULT = ("recto", "verso")  # the unified model's output channel order (section 23)
 
+def head_names(args):
+    """Every head a checkpoint can serve, in the canonical order the multi-head pass stacks them in:
+
+        recto, verso, ...        the probability channels (`cout_p` of them, by their own names)
+        sdist | midline          the distance channel, if it has one
+        thickness                if it has one
+        normals                  if it has a distance channel (from the normals head, else derived)
+        conf                     if it was trained --sdist-hetero
+
+    This is what `probs(head=head_names(args))` and `export-tracer` walk, so ONE sliding-window pass
+    produces every field the tracer contract asks for instead of five or six passes over the same box
+    (docs/unified_design.md section 30)."""
+    a = args or {}
+    ch = [str(c) for c in (a.get("channels") or CHANNEL_DEFAULT)]
+    np_ = int(a.get("cout_p", a.get("cout_t", a.get("cout", 1))) or 1)
+    out = list(ch[:np_])
+    dch = next((c for c in ("sdist", "midline") if c in ch), None)
+    if dch is not None:
+        out.append(dch)
+        if "thickness" in ch:
+            out.append("thickness")
+        out.append("normals")
+        if "logvar" in ch:
+            out.append("conf")
+    return out
+
 
 def field_head(head, args):
     """`--head sdist|thickness|normals|conf` -> (kind, head-channel index) for a Phase-B checkpoint,
@@ -207,7 +260,6 @@ def field_head(head, args):
         return None
     ch = [str(c) for c in ((args or {}).get("channels") or ())]
     np_ = int((args or {}).get("cout_p", 0) or 0)
-    kind = "sdist" if h in ("sdist", "midline", "normals") else h
     if h == "conf":
         assert "logvar" in ch, "--head conf: this checkpoint was not trained with --sdist-hetero"
         return h, ch.index("logvar")
@@ -276,6 +328,12 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
     other face of the sheet (the verso; see verso.py) -- the old flip trick, still the only way to get a
     verso band out of a cout=1 checkpoint, and unrelated to `--head verso`. batch > 1: windows batched on the GPU
     (slide_gpu; CT + radial inputs only, no context channels / luts / tta).
+
+    head may also be a LIST of head names (`head_names(args)` is every one the checkpoint can serve): the
+    result is then one array with a leading plane axis holding them in that order -- ONE sliding-window
+    pass, one forward per window, for every field. `probs_multi` splits it into a dict. The arithmetic per
+    plane is exactly what the single-head pass computes, because every head is a pointwise function of the
+    SAME raw net output and the Gaussian blend is linear in it.
     cascade: None = whatever the checkpoint was trained with (`args["cascade"]`), False / "off" = force the
     channel to zero. cascade_depth: how many rungs above k are predicted top-down to fill it (default 3;
     the cost is geometric, 1/8 per level, so three levels add ~14 %). A checkpoint trained without the
@@ -307,9 +365,13 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
     use_cas = cmode != "off"                       # the checkpoint HAS the channel: it must always be fed
     off = cascade is not None and (cascade is False or str(cascade) == "off")
     depth0 = 0 if (off or not use_cas) else max(int(cascade_depth), 0)  # 0 = the channel is fed as zeros
-    fld = field_head(head, st["args"])
-    head = 0 if fld is not None else resolve_head(head, st["args"])
-    pick = (lambda p: p) if head == "all" else HEADS[head] if isinstance(head, str) else (lambda p: p[:, int(head)])
+    multi = isinstance(head, (list, tuple))
+    heads = [str(q) for q in head] if multi else [head]
+    assert not multi or heads, "probs(head=[]): name at least one head"
+    fld = None if multi else field_head(head, st["args"])
+    if not multi:
+        head = 0 if fld is not None else resolve_head(head, st["args"])
+        pick = (lambda p: p) if head == "all" else HEADS[head] if isinstance(head, str) else (lambda p: p[:, int(head)])
     # A run with `--affinity` carries extra output channels that exist only for the training loss
     # (docs/unified_design.md section 26): inference never reads them, so the head is cut to `cout_t`
     # before anything selects or reduces over channels.
@@ -342,7 +404,11 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
     logits = lambda t, kk_: net(t)[:, :ct_n] / temp(kk_)  # noqa: E731
     fn = lambda t: pick(torch.sigmoid(logits(t, k)))  # (B,C,...) -> (B,...)  (or (B,C,...) for "all")
     if fld is not None:   # a FIELD, not a probability: no sigmoid, no temperature
-        kind, ci = fld
+        hname, ci = fld
+        # `field_head` returns the NAME asked for, and "midline" is the distance channel's own name in a
+        # midline checkpoint -- not a fourth kind. Mapping it here is what makes `--head midline` the
+        # distance and not (as the name test used to fall through to) the normals.
+        kind = "sdist" if hname in ("sdist", "midline") else hname
         from usrm2 import losses as L
         if kind == "sdist":
             fn = lambda t: raw(t)[:, ci].float()
@@ -356,9 +422,54 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
                   if len(nh) != 3 else
                   (lambda t: (lambda v: v / v.norm(dim=1, keepdim=True).clamp_min(1e-4))(
                       raw(t)[:, nh[0]:nh[0] + 3].float())))
+    plane_names, vec_tri = None, []
+    if multi:   # ---- THE MULTI-HEAD PASS (section 30): one forward per window, every head off that output
+        from usrm2 import losses as L
+        nh = [j for j, c in enumerate(st["args"].get("channels") or []) if c in ("nz", "ny", "nx")]
+
+        def piece(nm):
+            """`nm` -> (f(raw output, rung) -> (B, C, ...), the plane names it contributes)."""
+            f2 = field_head(nm, st["args"])
+            if f2 is None:
+                h2 = resolve_head(nm, st["args"])
+                assert not isinstance(h2, str) or h2 == "all", \
+                    f"probs(head=[...]): {nm!r} reduces over channels; name the channels instead"
+                if h2 == "all":
+                    return (lambda o, kk_: torch.sigmoid(o[:, :ct_n] / temp(kk_))), \
+                        [str(c) for c in (st["args"].get("channels") or CHANNEL_DEFAULT)][:ct_n]
+                return (lambda o, kk_, i=int(h2): torch.sigmoid(o[:, :ct_n] / temp(kk_))[:, i:i + 1]), [str(nm)]
+            hn2, ci = f2
+            kind = "sdist" if hn2 in ("sdist", "midline") else hn2
+            if kind == "sdist":
+                return (lambda o, kk_, i=ci: o[:, i:i + 1].float()), [str(nm)]
+            if kind == "thickness":
+                return (lambda o, kk_, i=ci: L.soft_thickness(o[:, i:i + 1].float(), L.TMIN)), ["thickness"]
+            if kind == "conf":
+                return (lambda o, kk_, i=ci: 1.0 / (1.0 + torch.exp(0.5 * o[:, i:i + 1].float().clamp(-8, 8)))), \
+                    ["conf"]
+            if len(nh) != 3:   # derived from the predicted distance field, exactly as the single pass does
+                return (lambda o, kk_, i=ci: L.normals_from(o[:, i:i + 1].float())), ["nz", "ny", "nx"]
+            return ((lambda o, kk_, i=nh[0]: (lambda v: v / v.norm(dim=1, keepdim=True).clamp_min(1e-4))(
+                o[:, i:i + 3].float())), ["nz", "ny", "nx"])
+        parts, plane_names = [], []
+        for nm in heads:
+            f2, nms = piece(nm)
+            if nm == "normals":
+                vec_tri.append(tuple(len(plane_names) + j for j in range(3)))
+            parts.append(f2)
+            plane_names += nms
+        def fn(t):   # one forward per window, every head read off that one output
+
+            o = net(t)
+            return torch.cat([f2(o, k) for f2 in parts], 1)
     if tta > 1:
         assert head != "all", "tta and head=all do not combine"
-        fn = flips_vec(fn, tta)
+        # A normal is a VECTOR: a flip of the world negates the component along the flipped axis, so the
+        # multi pass and `--head normals` must average with `flips_chan`, not `flips_vec` (which would
+        # flip the channel axis as if it were z and cancel the field).
+        fn = flips_chan(fn, tta, vec=vec_tri) if multi else \
+            (flips_chan(fn, tta, vec=[(0, 1, 2)]) if (fld is not None and fld[0] == "normals") else
+             flips_vec(fn, tta))
 
     def cascade_for(kk_, o, s, depth):
         """The rung-(kk_+1) prediction over the footprint of the box (o, s), upsampled 2x onto that box's
@@ -390,6 +501,8 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
         fn0 = lambda t: torch.sigmoid(logits(t, kk_))[:, 0]  # the coarse passes only ever need head 0
         return slide(fn0, sub, window, halo, dev, make_prep(kk_, o, cascade_for(kk_, o, s, depth)))
 
+    if multi:   # what the caller needs to split the result: the plane name of every output plane
+        st["head_planes"] = list(plane_names)
     casc = cascade_for(k, (z0, y0, x0), (Z, Y, X), depth0) if use_cas else None
     rad = lambda c, o: data.radial(ax, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape) * r
     cx = (lambda c, o: data.context(volume, (z0 + o[0], y0 + o[1], x0 + o[2]), c.shape, ctx, rung=kr)) if ctx else (lambda c, o: ())
@@ -400,6 +513,8 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
     if batch > 1:
         assert not ctx and not luts and tta <= 1, "batched inference: CT + radial inputs only"
         assert fld is None, "batched inference (--batch > 1) does not serve the Phase B field heads"
+        # the MULTI pass is fine batched: `slide_gpu` already accumulates a (B, C, w, w, w) output, and
+        # the ladder of fields (distances are +-32 voxels) fits its fp16 accumulators with room to spare
         R = torch.from_numpy(data.radial(ax, (z0, y0, x0), roi.shape) * r).to(dev)
         C = None if casc is None else torch.from_numpy(casc).to(dev)
         norm = data.NORM
@@ -421,6 +536,27 @@ def probs(ckpt, volume, z0, y0, x0, Z, Y, X, window=128, halo=16, device=None, t
             return torch.cat(parts)
         return slide_gpu(fn, roi, window, halo, dev, prep_t, batch=batch), st
     return sum(slide(fn, roi, window, halo, dev, pr) for pr in preps) / len(preps), st
+
+
+def probs_multi(ckpt, volume, z0, y0, x0, Z, Y, X, heads=None, **kw):
+    """Every head of a checkpoint from ONE sliding-window pass: ({name: (Z,Y,X) float32}, state).
+
+    `heads` defaults to `head_names(args)` -- the probability channels plus, when the checkpoint has a
+    distance channel, the distance, the thickness, the normals and the confidence. The normal head
+    contributes three planes, `nz`, `ny`, `nx`.
+
+    Why one pass is correct and not merely cheaper: every head is a POINTWISE function of the same raw
+    net output, and `slide`'s Gaussian blend is a per-voxel weighted mean of per-window values, so
+    stacking the heads and blending once gives exactly what blending each separately gives. What it
+    saves is the forward pass: `export-tracer` used to run five or six of them over the same box
+    (docs/unified_design.md section 30)."""
+    import torch as _t
+    st0 = _t.load(ckpt, map_location="cpu")
+    hs = list(heads) if heads else head_names(st0["args"])
+    v, st = probs(ckpt, volume, z0, y0, x0, Z, Y, X, head=hs, **kw)
+    names = st.get("head_planes") or hs
+    assert v.shape[0] == len(names), f"multi-head pass: {v.shape[0]} planes for {names}"
+    return {n: np.ascontiguousarray(v[i]) for i, n in enumerate(names)}, st
 
 
 def predict(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, device=None, volcomp=True, tta=0, luts=(), head=0, radial_sign=1.0, rung=None,
@@ -520,9 +656,12 @@ def export_tracer(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, d
                   volcomp=True, log=print):
     """Write the tracer contract's stores over a box. Returns {name: path}.
 
-    One `probs` pass per field the checkpoint can produce: recto, verso (when it has one), the distance,
-    the thickness (when it has one) and the confidence (when it was trained `--sdist-hetero`). The
-    normal field and the gradient magnitude are derived HERE, from the exported distance field, with a
+    ONE `probs` pass for every field the checkpoint can produce -- recto, verso (when it has one), the
+    distance, the thickness (when it has one) and the confidence (when it was trained `--sdist-hetero`)
+    -- through `probs_multi`: the heads are pointwise functions of the same net output, so stacking them
+    and blending once gives exactly what a pass each gives, at a fifth of the forward passes
+    (docs/unified_design.md section 30; wave 2 shipped it as 5-6 passes over the same box). The normal
+    field and the gradient magnitude are still derived HERE, from the exported distance field, with a
     Scharr kernel -- not read out of the net -- so what the tracer reads is exactly the gradient of what
     it reads.
 
@@ -547,15 +686,15 @@ def export_tracer(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, d
     os.makedirs(out, exist_ok=True)
     got = {}
 
-    def field(hd):
-        return probs(ckpt, volume, z0, y0, x0, Z, Y, X, head=hd, **kw)[0]
-
-    log(f"export-tracer {out}: rung {k}, channels {ch}")
-    rec = field("recto" if "recto" in ch else 0)
-    sd = field("sdist")          # the FIELD, whatever the channel is called in this checkpoint
-    th = field("thickness") if "thickness" in ch else None
-    cf = field("conf") if "logvar" in ch else None
-    ver = field("verso") if ("verso" in ch and npb >= 2) else None
+    want = [c for c in ch[:npb]] + [dch] + (["thickness"] if "thickness" in ch else []) \
+        + (["conf"] if "logvar" in ch else [])   # no "normals": the export derives them from the FIELD
+    log(f"export-tracer {out}: rung {k}, channels {ch}, one pass for {want}")
+    got_f, _ = probs_multi(ckpt, volume, z0, y0, x0, Z, Y, X, heads=want, **kw)
+    rec = got_f["recto"] if "recto" in got_f else got_f[ch[0]]
+    sd = got_f[dch]              # the FIELD, whatever the channel is called in this checkpoint
+    th = got_f.get("thickness")
+    cf = got_f.get("conf")
+    ver = got_f.get("verso") if npb >= 2 else None
     d, n, mag, valid = tracer_fields(sd, th)
     valid = valid & (rec > 0)     # CT==0 is masked by both sides: `slide` already zeroes it
 

@@ -7,6 +7,16 @@ PRESETS = {"1m": (16, 32, 64, 128), "3m": (24, 48, 96, 192), "5m": (32, 64, 128,
            # deeper nets for the 80 GB card and 256^3+ patches: one more level doubles the receptive field
            "12m": (32, 64, 128, 256, 384), "26m": (32, 64, 128, 256, 512), "45m": (48, 96, 192, 384, 640),
            "30m6": (32, 64, 128, 256, 384, 384),  # 6 levels: ~500-voxel theoretical receptive field
+           # THE SIZE LADDER (experiment 12, docs/unified_design.md section 30). The same six levels as
+           # `30m6`, the same depth, every width scaled by 1/sqrt(2) and by sqrt(2) and rounded to a
+           # multiple of 8 (GroupNorm takes min(8, c) groups, and a width off the 8-grid costs tensor-core
+           # alignment). Because a convolution's parameter count is quadratic in width, that is a clean
+           # FACTOR-2 ladder in parameters -- 22.67 M / 44.92 M / 89.95 M at the canonical cin=4, cout=1,
+           # deep=0 count -- which is what a log-log fit of val loss against log(params) needs: three
+           # points evenly spaced in log(params). The names follow `30m6`'s own loose convention (it is
+           # 44.9 M, not 30 M); `usrm2 ladder --print` reports the real counts for the run's own cin/cout.
+           "15m": (24, 48, 88, 184, 272, 272),
+           "60m": (48, 88, 184, 360, 544, 544),
            # narrow full-resolution level for 512^3 patches: the level-0 tensors (and the level-0 decoder cat)
            # are what does not fit in 80 GB; the depth and width live in the coarse levels
            "n16": (16, 32, 64, 128, 256, 512), "n24": (24, 48, 96, 192, 384, 512)}
@@ -113,6 +123,16 @@ CHANNELS_LAST = False
 
 def memfmt():
     return torch.channels_last_3d if CHANNELS_LAST else torch.contiguous_format
+
+
+def params(size="1m", cin=4, cout=1, add_skip=0, deep=0):
+    """Parameter count of a preset WITHOUT allocating it: the net is built on the `meta` device, so this
+    costs microseconds and no memory. The size ladder fits val loss against log(params), and the count
+    depends on `cin`, `cout`, `--add-skip` and `--deep`, so it is always taken from the run's own args
+    rather than from the preset name."""
+    with torch.device("meta"):
+        m = UNet(PRESETS[size], cin=int(cin), cout=int(cout), add_skip=int(add_skip), deep=int(deep))
+    return int(sum(p.numel() for p in m.parameters()))
 
 
 def build(size="1m", verbose=True, cout=1, cin=4, ckpt_act=0, add_skip=0, deep=0):
