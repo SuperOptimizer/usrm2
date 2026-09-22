@@ -116,3 +116,18 @@ input is a z-scored CT patch, output is one recto-probability logit per voxel.
     usrm2 calibrate RUN/ckpt.pt                   # one temperature per rung, written into the checkpoint
     usrm2 glc-weights mask=/vesuvius/usrm2/teacher/eval.zarr store=REG.zarr   # suggested --source-w
     usrm2 ablate /vesuvius/usrm2/runs/ablate1 --presets geo,all --steps 3000 --patch 96 --batch 4
+    usrm2 dist-pyramid MASK.zarr --kind face midline thickness --verso ~/teacher_regions   # section 29.1
+    usrm2 export-tracer RUN/ckpt.pt OUT --origin ... --size ...   # the tracer contract, ONE pass
+    usrm2 ladder ~/runs/ladder --queue ~/queue --stores-file ~/stores.txt --base "..."   # experiment 12
+    usrm2 ladder-report ~/runs/ladder/{15m,30m6,60m}   # 1 - dice vs log(params), per rung
+    usrm2 stream-plan stores.txt --queue Q --label-free    # windows anywhere the CT is not air
+    usrm2 pretrain PRE --label-free --stores ~/ct.zarr    # ... a bare CT line, no target group
+
+- **Wave 3** (`docs/unified_design.md` section 30): the **size ladder** (`15m` / `30m6` / `60m`, the same
+  six levels at a factor 2 in parameters; `cloud/ladder.sh` runs them concurrently on one shared stream
+  queue, one `--stream-tag` per rung, and the planner evicts only what the slowest rung has passed);
+  **one sliding-window pass for every head** (`predict.probs(head=[...])` / `probs_multi`, so
+  `export-tracer` makes one pass instead of five or six); the **label-free loader** (`--label-free`:
+  windows anywhere the CT is not air, and a bare `ct_base` source line, for masked-cube pretraining); and
+  the pod's **v2 region writer** (`cloud/verso_core_v2.py`, which also writes `region_<z>_<y>_<x>_<field>
+  .zarr` stores when the checkpoint has Phase-B heads, and is bit-identical to v1 when it does not).

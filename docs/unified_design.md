@@ -2225,3 +2225,239 @@ evidence once `--loss-excl` is on, and under `--pair construct` it is not eviden
 `merge_frac` and the pair-completeness metric. **Abort** the distance arm if `mae_midline` (in `eval.jsonl`,
 voxels) plateaus above ~2 voxels: a distance head that cannot beat the band's own half-thickness is not
 localising anything, and the Huber is then just a second copy of the segmentation loss.
+
+---
+
+## 30. Wave 3: ladder, multi-head export, label-free loader, dist targets in the stores line (implemented 2026-09-22)
+
+`docs/research/synthesis_v2_with_literature.md` Phase D, experiments 11 and 12, and the tracer contract's
+consumer side. Code: `usrm2/ladder.py` + `cloud/ladder.sh` (the size ladder and its report),
+`usrm2/predict.py` (the multi-head pass), `usrm2/data.py` + `usrm2/stream.py` + `usrm2/pretrain.py` (the
+label-free path and the shared-queue tags), `cloud/verso_core_v2.py` + `cloud/verso_run_v2.py` +
+`cloud/verso_switch_v2.sh` (the pod's v2 region writer), `tests/test_wave3.py`.
+
+Everything here is off by default. `--stream-tag`, `--label-free` and the `15m` / `60m` presets are new
+names; no existing run's behaviour, checkpoint args or store bytes change, which
+`test_the_tag_reaches_the_checkpoint_args_only_when_it_is_set` and the pod's own bit-identity run assert.
+
+### 30.1 The size ladder (`usrm2 ladder`, `usrm2 ladder-report`, `cloud/ladder.sh`)
+
+Experiment 12: *at rung 2 our unique-window supply means params, not data, are the constraint.* Three
+runs at MATCHED STEPS on the SAME windows in the SAME order, differing only in `--size`, then a log-log
+fit of `1 - dice` against `params` PER RUNG.
+
+**The presets.** `model.PRESETS` gains two, the same six levels as `30m6` with every width scaled by
+`1/sqrt(2)` and `sqrt(2)` and rounded onto the 8-grid (GroupNorm takes `min(8, c)` groups; a width off the
+8-grid also costs tensor-core alignment):
+
+| size | widths | params (cin 4, cout 1) | ratio |
+|---|---|---|---|
+| `15m` | 24, 48, 88, 184, 272, 272 | 22.67 M | -- |
+| `30m6` | 32, 64, 128, 256, 384, 384 | 44.92 M | 1.98 |
+| `60m` | 48, 88, 184, 360, 544, 544 | 89.95 M | 2.00 |
+
+A parameter count is quadratic in width, so scaling width by `sqrt(2)` is a clean FACTOR-2 ladder --
+three points evenly spaced in `log(params)`, which is what a two-parameter log-log fit needs and what
+three arbitrary sizes would not give. The names follow `30m6`'s own loose convention (it is 44.9 M, not
+30 M); `usrm2 ladder` prints the real counts, and `model.params(size, cin, cout, add_skip, deep)` computes
+them on the `meta` device, so the report always uses the run's OWN count rather than the preset's nominal
+one.
+
+**The same data, not merely the same distribution.** The fit compares three numbers a couple of points
+apart; three different window sequences move a number by more than that. Two ways to get one sequence
+into three trainers, and `cloud/ladder.sh` implements both:
+
+1. **One shared queue, one tag per rung** (`MODE=parallel`, the default). `stream-plan` writes
+   `queue.jsonl` once and every trainer replays it. A replay is not destructive -- the file is append-only
+   and worker `g` of `GW` reads entry `i` when `i % GW == g`. What IS per-trainer is the replay cursor
+   `<queue>/progress/w<g>` (where a restart resumes) and `<queue>/consumed` (the bound below which the
+   planner evicts buffered chunks). Shared, those two are exactly how two trainers eat each other's
+   entries: rung A's cursor makes rung B skip windows it never served, and rung A racing ahead lets the
+   planner delete shards rung B has not read. `--stream-tag NAME` moves both under the tag
+   (`progress.NAME/`, `consumed.NAME`) and **`stream.Planner.consumed()` takes the MINIMUM over the
+   tags**, so the buffer advances at the slowest rung's pace. A tag file untouched for `CONSUMED_STALE`
+   (1 h) is ignored, so a finished or dead rung cannot pin the buffer for ever. Constraints: the rungs
+   must share `--workers` (the queue's `meta.json` fixes the stream count) and `--cache-gb` must cover the
+   spread between fastest and slowest (the `60m` is ~2x the `15m`'s step time, so budget ~2x).
+   Untagged behaviour is byte-for-byte what every run so far did: one `consumed` file, one `progress/`.
+2. **One queue per rung, same seed** (`MODE=serial`, `--queues per-run`). The planner is deterministic in
+   `(stores, seed, patch, rungs, boost, region, walk, epochs)` -- that tuple is literally its
+   `fingerprint` -- so three queues planned with one seed hold the same windows in the same order, at 3x
+   the origin bandwidth and 3x the disk. This is also the ONLY option for rungs run one after another: a
+   shared queue's buffer is a rolling window, and by the time a second rung started at index 0 the early
+   chunks would be long evicted. **A shared queue means concurrent rungs, one card each.**
+
+**muP-lite: not adopted, and `lit_optimisation_schedules.md` section 4 is why.** Its recommendation is
+explicit -- do not take the muP reparametrisation here (the evidence is transformer-centric; GroupNorm
+already normalises per-layer activation scale, which is much of what muP's init/LR scaling buys in
+un-normalised nets; and our ladder elsewhere WARM-STARTS, which muP does not address at all). The one
+cheap rule it does endorse -- scale a widened layer's LR by ~`1/sqrt(width ratio)` and give it a short
+separate re-warmup -- is about warm starts, and these rungs are fresh inits. So **the ladder's default is
+the same LR at every rung**, which is also the experiment's own control. `--lr-scale mup` applies
+`lr_k = lr_base * sqrt(w_base / w_k)` as a separate ARM for anyone who wants it, and the honest
+alternative the literature actually asks for is a short per-rung LR sweep (3 points, e.g. 1.5e-4 / 3e-4 /
+6e-4 at 2k steps) rather than any rule at all. Treat a ladder run whose rungs were not LR-swept as
+measuring "params at a fixed LR", which is a weaker claim than "params".
+
+**`usrm2 ladder-report RUN...`** reads each run's `eval.jsonl` and any `evalsurf --json` dumps beside it
+(`<run>/evalsurf/*.json` or `<run>/*.json`, merged by step, so `recall@4` / `erl_*` / `betti0_err` sit
+next to `dice_rK`), takes the MATCHED step (the largest step EVERY run reached, unless `--step` says
+otherwise) and prints, per CT rung:
+
+* the per-size value and the least-squares slope `alpha` of `log(1 - metric)` against `log(params)` with
+  its `r2` -- `loss ~ params^-alpha`, so a flat alpha is "params are not the binding constraint";
+* the **train/val gap** at that step, `val bce - median(train bce over the last 10 records)`, and its
+  trend across the sizes;
+* per run, `evalsurf.fit_curve` on its own metric history, so a rung that has simply not converged cannot
+  be read as a plateau.
+
+Experiment 12's decision rule is reprinted by the command itself: **saturation is BOTH a slope that
+flattens across >= 3 sizes AND a train/val gap that grows.** A flat alpha with a flat gap means the
+ladder is not yet the binding constraint; a steep alpha with a growing gap means more params and more
+data.
+
+Cost, on the A100 anchors of the synthesis (`30m6` at 256^3 batch 2 with `--cascade mix` is ~4.5 GPU-h /
+10k steps): 20k steps is ~4.5 / 9 / 18 GPU-h for the three rungs, ~32 GPU-h in total, against the
+synthesis' own 35-50 estimate.
+
+### 30.2 One pass, every head (`predict.probs(head=[...])`, `predict.probs_multi`)
+
+Wave 2 shipped `export-tracer` as one `probs` pass PER FIELD -- recto, verso, the distance, the thickness,
+the confidence: five or six sliding-window passes over the same box, five or six forward passes per
+window. Every head is a POINTWISE function of the same raw net output, and `slide`'s Gaussian blend is a
+per-voxel weighted mean of per-window values, so stacking the heads and blending once gives EXACTLY what
+blending each separately gives. `test_one_multi_head_pass_is_bit_identical_to_one_pass_per_head` is that
+claim, with `np.array_equal`, not `allclose`.
+
+* `predict.head_names(args)` -> every head a checkpoint can serve, in the canonical order: the `cout_p`
+  probability channels by name, then `sdist`/`midline`, `thickness`, `normals`, `conf` when it has them.
+* `probs(head=[...])` takes a LIST and returns one array with a leading PLANE axis; `normals` contributes
+  three planes (`nz`, `ny`, `nx`). The plane names come back on the returned state as `head_planes`.
+* `probs_multi(...)` wraps that into `({name: (Z,Y,X) float32}, state)`, and `export-tracer` now makes
+  exactly one pass (the test counts `probs` calls).
+
+Two bugs fell out of the refactor and are fixed:
+
+* **`--head midline` returned the NORMALS.** `field_head` returns the NAME asked for, and a midline
+  checkpoint's distance channel is called `midline`; the single-head dispatch compared that name against
+  `"sdist"` and fell through to the normals branch. Both call sites now map `midline -> sdist`.
+* **TTA over the normal field cancelled it.** `flips_vec` flips the output's axes `1 + d`, which is right
+  for a `(B, Z, Y, X)` probability and wrong for a `(B, 3, Z, Y, X)` normal -- and a normal is a VECTOR,
+  so a flip of the world must also negate the component along the flipped axis. `flips_chan(fn, n, vec=)`
+  does both, and `probs` uses it for `--head normals` and for the multi pass.
+
+### 30.3 The 5090 pod's v2 region writer
+
+The pod's loop writes one store per region, the verso probability. `cloud/verso_core_v2.py` and
+`cloud/verso_run_v2.py` are its v2: one pass per region reading every head, and, **when the checkpoint has
+a distance channel (`cout_t > 2`)**, extra sharded volcomp stores beside the verso one, uploaded in the
+same sftp batch and published or not published with it:
+
+    region_<z>_<y>_<x>.zarr             the verso probability            q8   (unchanged)
+    region_<z>_<y>_<x>_recto.zarr       probability * 255                q8
+    region_<z>_<y>_<x>_surf_sdist.zarr  d = (v - 128) * 0.25 voxels      q0   LOSSLESS, 0 = NO DATA
+    region_<z>_<y>_<x>_nz|ny|nx.zarr    (v - 128) / 127, ZYX unit        q0
+    region_<z>_<y>_<x>_gmag.zarr        |grad d| * 127                   q0
+    region_<z>_<y>_<x>_thickness.zarr   t = v * 0.25 voxels              q0
+    region_<z>_<y>_<x>_conf.zarr        confidence * 255                 q0
+
+-- exactly section 29.6's encodings, attrs (`axis_order`, `encoding`, `no_data`, `sign_convention` in
+words) and `q`, so a tracer cannot tell a region store from an `export-tracer` box. The distance is
+converted to the RECTO-FACE convention here (`d = m - t/2`) and the normal and gradient magnitude are the
+Scharr gradient of THAT field, never the net's own normal head -- the same rule the export follows, so
+what a tracer reads is the gradient of what it reads.
+
+**v2 is a no-op for the checkpoint on the pod today** (u2, cout 2, no distance channel): `Net.planes` is
+empty and `Net.__call__` / `run_region` take v1's branch, statement for statement, so the bytes are
+identical rather than merely close. That matters because the memory note's measured bf16+cuDNN
+run-to-run floor is dice 0.994 -- a tolerant comparison on this path would prove nothing. Measured on the
+pod, 2026-09-22, region `4352 21760 15616` at `--region 256 --window 128`, both cores in one process:
+
+    {"compare": "v1_vs_v2", "windows_v1": 27, "windows_v2": 27,
+     "bit_identical": true, "max_abs_diff": 0, "n_differing": 0, "voxels": 16777216}
+
+(2.6 GiB peak, run beside the live loop, which kept its 10.8 s/region.) **v1 is still what runs.**
+`cloud/verso_switch_v2.sh` (installed as `/workspace/switch_v2.sh`) is the swap: it stops the loop through
+the pod's own `stop_everything.sh` -- kill patterns live in script files on the host, never on an ssh
+command line -- waits for any sftp session in flight, rewrites the one `python3` line of `verso_loop.sh`
+(keeping a timestamped backup) and restarts through `start_loop.sh`. The loop is resumable by
+construction, so a swap costs at most the region in flight.
+
+**Two deliberate constraints.** (a) v2 refuses to write field stores at a NEGATIVE `--sign`: v1's flip
+trick points a recto-trained student at the other face, and a distance field measured in a mirrored world
+has the opposite sign convention to the stores'. A Phase-B checkpoint has a real verso channel and runs at
+`+1`. (b) The pod runs a usrm2 SNAPSHOT from before Phase B (no `targets.py`, no `losses.py`, a 349-line
+`predict.py`), and refreshing that tree under a live 70-hour job is exactly the change that breaks it on
+the supervisor's next restart. So `verso_core_v2` imports each helper from usrm2 when it is there and
+defines it locally when it is not; `test_the_pod_v2_compat_shims_match_usrm2` compares the two copies in
+the repo, where both are importable.
+
+### 30.4 The label-free loader (`--label-free`)
+
+Experiment 11 (masked-cube pretraining, section 28) wants the CT, not the labelled part of the CT.
+`data.Patches(label_free=True)`:
+
+* a source line may be a bare `ct_base` with NO target group (`source_groups(label_free=True)`);
+* a window is drawn anywhere the CT is not air rather than inside the first target group's box. The
+  mechanism is one field: `source_groups` now always sets `src["bounds"]`, the pseudo-target that fixes
+  where a source may be sampled and how heavily -- the first target group normally, the CT pyramid under
+  `label_free`. Every place that used to read `next(iter(src["targets"].values()))` (`rung_probs`,
+  `region_tiles`, `region_list`'s occupancy, `new_region`, the corner draw, `rung_mix`) reads `bounds`,
+  so the region walk and the rung mix follow automatically;
+* the foreground / density / "no weighted voxel" rejections are skipped -- there is no gradient to
+  protect, and with no target channel at all `sel.any()` would reject every window;
+* target groups that ARE on the line are still opened and read, so the per-channel weights of a
+  label-free sample are what a labelled run would see. They simply do not decide whether the window is
+  kept.
+
+`stream-plan --label-free` plans such windows (the flag is recorded in `meta.json` and in the walk
+fingerprint, the occupancy prefetch pulls the CT's coarse level, and a replaying dataset adopts it); it
+contradicts `--require-targets` and says so. `usrm2 pretrain --label-free` is the consumer, and
+`--stream` / `--stream-tag` now reach `pretrain` too.
+
+### 30.5 The distance targets on the Paris 4 stores line
+
+Section 29.8 ends with "they join the stores file as extra target groups". They do, and nothing new was
+needed for it -- `source_groups` keys targets by the store's `channel` attr, so
+`<ct>,<recto mask>,<M>_sdist.zarr,<M>_midline.zarr,<M>_thick.zarr` opens as four channels -- but wave 3
+verifies the whole path on a synthetic three-level pyramid rather than on the single level wave 2 tested:
+
+* `test_the_dist_groups_join_the_stores_line_and_are_read_at_every_rung_they_hold` builds `_sdist`,
+  `_midline` and `_thick` groups with levels at rungs 2, 3 and 4 and checks that the loader gives each
+  channel weight > 0 at exactly those rungs and weight 0 at rung 5, with the VALUES being the store's own
+  codes (a pooled rung-5 value would be a distance in the wrong units, which is why `DIST_CHANNELS` exists);
+* `test_a_no_data_code_in_a_dist_store_is_weight_zero_not_a_distance` keeps code 0 meaning no data;
+* `test_a_dist_group_does_not_change_the_sampling_bounds` is the one that would have bitten: the groups
+  are appended AFTER the recto mask, so `bounds` is still the recto mask and the rung mix, the region walk
+  and the source draw weight are bit-for-bit what a run without them saw. Put a distance group FIRST on a
+  line and you would silently re-weight the whole run.
+
+The planner needs nothing new either: `fetch_data` already fetches every `s["targets"]` pyramid, so a
+distance group's shards are pulled with the mask's. (It does fetch the nearest level below a rung the
+store has no level for, which the loader then ignores; that is a few wasted shards per queue, not a
+correctness problem, and fixing it would mean teaching the planner the `DIST_CHANNELS` rule as well.)
+
+### 30.6 `--loss-warp` (homotopy warping) is still NOT implemented, and here is the assessment
+
+Section 29.4 left it as a TODO. Wave 3 was asked to build it if a pure-torch/GPU version fits in ~a day.
+It does not, and the blocker is not the distance transform:
+
+* **The EDT is the easy half.** An approximate GPU EDT at 256^3 is a day's careful work (jump flooding, or
+  Felzenszwalb's separable exact transform as three 1D lower-envelope passes), and for the CRITICAL-VOXEL
+  SELECTION ONLY a `scipy.ndimage.distance_transform_edt` on the CPU is acceptable -- the selection is
+  gradient-free by construction and the loss itself stays in torch.
+* **The simple-point test is the hard half.** Hu (NeurIPS 2022, arXiv:2112.07812) warps the ground truth
+  towards the binarised prediction along a distance-ordered sweep, deleting a voxel only when the deletion
+  is HOMOTOPY-PRESERVING; the voxels that cannot be deleted are the critical ones, and they are what the
+  loss penalises. "Homotopy-preserving" in 3D is the digital-topology simple-point test -- the topological
+  numbers `T26(x, X)` and `T6(x, X-bar)` over the 26-neighbourhood -- and it is (a) inherently sequential,
+  since deleting one voxel changes its neighbours' status, and (b) not vectorisable by any cheap trick we
+  found: the standard implementations either use a 2^26-entry lookup table (67 M entries, each needing a
+  connected-component count to build) or call a per-voxel component labeller, and a patch has thousands of
+  candidate voxels per step. Neither is a training-step-budget operation in Python, and neither is a day.
+
+So the flag stays unimplemented, deliberately, and the TODO in 29.4 stands with this paragraph attached.
+The survey ranks fast ECT ahead of warping anyway; **run experiment 7's ECT arm first**, and build warping
+only if a topology term moves `betti0_err` at all. If it does, the honest route is a small C++/CUDA
+extension for the simple-point sweep (a known, bounded piece of work) rather than a half-vectorised Python
+approximation that would penalise the wrong voxels and be indistinguishable from a bug.
