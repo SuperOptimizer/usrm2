@@ -471,3 +471,57 @@ def test_the_flags_off_leave_the_checkpoint_args_untouched(tmp_path, monkeypatch
               "loss_eikonal", "cout_t", "cout_p"):
         assert k not in a, f"{k} leaked into the args of a run that did not ask for it"
     assert a["cin"] == 1 + 1 + 1 + 3 and a["cout"] == 1
+
+
+def test_the_distance_stores_are_written_losslessly(tmp_path):
+    """volcomp q8 -- what every probability store uses -- ROUNDS. A rounded probability is harmless; a
+    rounded distance code is a wrong distance, and a rounded no-data 0 is a -32-voxel distance that
+    nothing downstream can tell from a real one. So every store of section 29 is written q=0."""
+    rng = np.random.default_rng(0)
+    u = np.zeros((128, 128, 128), np.uint8)
+    u[32:96, 32:96, 32:96] = rng.integers(1, 256, (64, 64, 64), dtype=np.uint8)
+    a = P.out_array(str(tmp_path / "q0.zarr"), u.shape, (0, 0, 0), q=0)
+    a[:64], a[64:] = u[:64], u[64:]            # two partial writes, as the block loop makes
+    assert np.array_equal(np.asarray(a[:]).reshape(u.shape), u)
+    assert a.attrs["volcomp_q"] == 0
+    b = P.out_array(str(tmp_path / "q8.zarr"), u.shape, (0, 0, 0), q=8)
+    b[:64], b[64:] = u[:64], u[64:]
+    assert not np.array_equal(np.asarray(b[:]).reshape(u.shape), u)   # ... which is why q0 is not optional
+    assert "volcomp_q" not in b.attrs                                 # q8 stays the unrecorded default
+
+
+def test_a_curved_sheet_gets_the_sign_of_its_own_radial_direction(tmp_path):
+    """The slab tests fix the sign on a plane. A scroll is a spiral, so the sign must follow the radial
+    direction voxel by voxel: stepping OUTWARD from a band voxel must raise the distance, everywhere."""
+    import zarr
+    N, pitch = 128, 16.0
+    cy = cx = N / 2
+    _, yy, xx = np.indices((N, N, N))
+    r = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+    th = np.arctan2(yy - cy, xx - cx)
+    band = ((((r - pitch * (th / (2 * np.pi))) % pitch) < 2.0) & (r > 12) & (r < 56)).astype(np.uint8) * 255
+    root = tmp_path / "spiral.zarr"
+    root.mkdir()
+    a = zarr.create_array(str(root / "2.4"), shape=(N,) * 3, chunks=(64,) * 3, dtype="uint8",
+                          fill_value=0, overwrite=True)
+    a[:] = band
+    (root / "zarr.json").write_text(json.dumps({"zarr_format": 3, "node_type": "group", "attributes": {
+        "volcomp": {"rung_voxel_size_um": 2.4}}}))
+    umb = tmp_path / "u.json"
+    umb.write_text(json.dumps({"control_points": [{"z": 0, "y": cy, "x": cx}, {"z": N, "y": cy, "x": cx}]}))
+    out = TG.dist_pyramid(str(root), kinds=("face",), rungs=(2,), umbilicus=str(umb), block=128,
+                          halo=48, axis_r_um=30.0, log=lambda *a, **k: None)["face"]
+    v = data.read_rung(data.rungs(out), 2, (0, 0, 0), (N,) * 3, dtype=np.uint8)
+    d = TG.decode_signed(v)
+    ok = v != 0
+    assert (v[r < 12] == 0).all()                       # 30 um / 2.4 um = 12.5 voxels around the axis
+    assert np.abs(d[(band > 0) & ok]).mean() < 1.5      # the band is 2 voxels thick: its medial surface
+    zs, ys, xs = np.where((band > 0) & ok & (r > 20) & (r < 50))
+    i = np.random.default_rng(0).choice(len(zs), 3000)
+    gz, gy, gx = zs[i], ys[i], xs[i]
+    ny = np.clip(gy + np.sign(gy - cy).astype(int) * 3, 0, N - 1)
+    nx = np.clip(gx + np.sign(gx - cx).astype(int) * 3, 0, N - 1)
+    sel = ok[gz, ny, nx]
+    step = d[gz, ny, nx][sel] - d[gz, gy, gx][sel]
+    assert (step > 0).mean() > 0.98                     # OUTWARD is +, on a curved sheet, everywhere
+    assert np.median(step) == pytest.approx(3.0, abs=1.0)   # ... and by the distance stepped

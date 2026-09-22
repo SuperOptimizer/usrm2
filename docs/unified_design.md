@@ -1786,7 +1786,14 @@ unchanged -- `test_the_flags_off_leave_the_checkpoint_args_untouched` is that cl
 ### 29.1 The distance stores (`usrm2 dist-pyramid`)
 
 A distance pyramid is an ordinary target pyramid: levels named by voxel size in microns, zarr v3 sharded,
-128^3 inner chunks, `VolcompCodec(q=8)`, `compressors=None` (18.1b and 24). It joins a source line like any
+128^3 inner chunks, `compressors=None` (18.1b and 24) -- but **`VolcompCodec(q=0)`, LOSSLESS**, not the
+q=8 of section 9's table. q8 rounds: writing a spiral test field and reading it back turned a stored 0 into
+a 6, which would silently become a -30.5-voxel distance that nothing downstream could tell from a real one,
+and the rounding compounds under the partial-chunk writes a block smaller than 128 makes (filling a 128^3
+chunk in pieces decodes and re-encodes it once per piece). A rounded probability is harmless; a rounded
+distance code is a wrong distance and a rounded no-data marker is a lie. `predict.out_array` therefore takes
+a `q`, records `volcomp_q` in the attrs when it is not 8, and every store of this section passes 0. A
+distance field is smooth, so the lossless codec still compresses it well. It joins a source line like any
 other target group, `ct_base,recto_mask,<name>_sdist.zarr`, and the loader reads it through the same
 `_rung_target` path the recto mask goes through.
 
@@ -2061,6 +2068,10 @@ contract of `synthesis_v2_with_literature.md` section 2 as sharded volcomp store
     gmag.zarr                uint8  |grad d| * 127, so 127 is the Eikonal ideal |grad d| = 1
     conf.zarr                uint8  confidence * 255          (only with --sdist-hetero)
     thickness.zarr           uint8  t = v * 0.25 voxels        (only with --thickness)
+
+The recto and verso stores keep `VolcompCodec(q=8)`, so they stay byte-comparable with every other
+prediction store; **every field store is q=0, lossless**, for the reason 29.1 gives -- their code 0 means
+no data and their other codes are a distance or a normal component, not a probability a codec may round.
 
 **Axis order is ZYX everywhere**, and every store says so in its attrs (`axis_order`, `encoding`,
 `no_data`, `sign_convention` in words). **The sign is verso -> recto**: d > 0 and n pointing from the verso

@@ -332,7 +332,11 @@ def _put(arr, u8, z, y, x):
 
 def _level(path, shape, um, k, volume, umbilicus):
     from usrm2 import predict as P
+    # q=0, LOSSLESS. volcomp q8 -- the probability stores' setting -- rounds: a stored 0 can read back
+    # as a 6, which would silently turn the no-data marker into a -30.5-voxel distance, and it compounds
+    # under the partial-chunk writes a block smaller than 128 makes. A distance field is smooth, so the
+    # lossless codec still compresses it well.
     a = P.out_array(path, shape, (0, 0, 0), volcomp=True, volume=volume, umbilicus=umbilicus,
-                    rung=k, channels=(CHANNELS["face"],))
+                    rung=k, channels=(CHANNELS["face"],), q=0)
     a.attrs.update({"voxel_um": float(um), "rung": int(k)})
     return a

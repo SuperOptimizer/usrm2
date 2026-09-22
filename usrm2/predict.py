@@ -118,7 +118,8 @@ def shard_shape(shape, chunk=128, cap=1024):
     return tuple(min(cap, -(-int(s) // chunk) * chunk) for s in shape)
 
 
-def out_array(path, shape, origin, volcomp=True, volume=None, umbilicus=None, rung=2, channels=("recto",)):
+def out_array(path, shape, origin, volcomp=True, volume=None, umbilicus=None, rung=2, channels=("recto",),
+              q=8):
     import zarr
     try:
         from volcomp_zarr import VolcompCodec
@@ -135,11 +136,18 @@ def out_array(path, shape, origin, volcomp=True, volume=None, umbilicus=None, ru
         # default zstd AFTER the serializer, and zstd on volcomp output is worthless -- measured 0.2% on a
         # real region store, for a decode step on every chunk read. The C-tool exports and the CT volumes
         # are volcomp-only, so this also makes our stores byte-comparable with theirs.
-        z = zarr.create_array(path, serializer=VolcompCodec(q=8), compressors=None, **kw)
+        # `q` is the codec's quantisation step. q=8 is the probability stores' setting (section 9's
+        # table by physical voxel size) and it is LOSSY: a stored 0 can read back as a small non-zero.
+        # That is harmless for a probability and FATAL for a field whose code 0 means "no data" and
+        # whose codes are a distance in 0.25-voxel steps, so every store of section 29 passes q=0
+        # (lossless). A lossy codec also compounds under partial-chunk writes, because filling a 128^3
+        # chunk in pieces decodes and re-encodes it once per piece.
+        z = zarr.create_array(path, serializer=VolcompCodec(q=int(q)), compressors=None, **kw)
     else:
         kw["shape"], kw["chunks"], kw["shards"] = (1,) + tuple(shape), (1, 128, 128, 128), (1,) + sh
         z = zarr.create_array(path, **kw)
     z.attrs.update({"channels": [str(c) for c in channels], "voxel_um": data.rung_um(rung), "rung": int(rung),
+                    **({"volcomp_q": int(q)} if int(q) != 8 else {}),
                     "origin_zyx": [int(v) for v in origin], "scale": 1.0,
                     "volume": volume or data.CT, "umbilicus": umbilicus or data.UMBILICUS})  # so loaders know the scroll
     return z
@@ -155,8 +163,8 @@ def u8(prob):
     return np.clip(np.rint(prob * 255), 0, 255).astype(np.uint8)
 
 
-def write(path, prob, origin, volcomp=True, volume=None, rung=2, channels=("recto",)):
-    a = out_array(path, prob.shape, origin, volcomp=volcomp, volume=volume, rung=rung, channels=channels)
+def write(path, prob, origin, volcomp=True, volume=None, rung=2, channels=("recto",), q=8):
+    a = out_array(path, prob.shape, origin, volcomp=volcomp, volume=volume, rung=rung, channels=channels, q=q)
     p = u8(prob)
     a[:] = p[None] if a.ndim == 4 else p
 
@@ -551,10 +559,13 @@ def export_tracer(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, d
     d, n, mag, valid = tracer_fields(sd, th)
     valid = valid & (rec > 0)     # CT==0 is masked by both sides: `slide` already zeroes it
 
-    def w(name, u8, enc):
+    def w(name, u8, enc, q=0):
         p = os.path.join(str(out), f"{name}.zarr")
+        # q=0 (lossless) for every field: their code 0 means NO DATA and their other codes are a
+        # distance or a normal component, not a probability the codec may round. The recto/verso
+        # probability stores keep q=8, so they stay byte-comparable with every other prediction store.
         a = out_array(p, u8.shape, (z0, y0, x0), volcomp=volcomp,
-                      volume=volume, rung=k, channels=(name,))
+                      volume=volume, rung=k, channels=(name,), q=q)
         a.attrs.update({"encoding": enc, "unit": "voxels_of_this_rung", "no_data": 0,
                         "axis_order": "ZYX", "sign_convention":
                         "d > 0 and n pointing from the VERSO face towards the RECTO face, i.e. "
@@ -563,9 +574,9 @@ def export_tracer(ckpt, volume, z0, y0, x0, Z, Y, X, out, window=128, halo=16, d
         got[name] = p
         return p
 
-    w("recto", u8(rec), "prob_u8")
+    w("recto", u8(rec), "prob_u8", q=8)
     if ver is not None:
-        w("verso", u8(ver), "prob_u8")
+        w("verso", u8(ver), "prob_u8", q=8)
     w("surf_sdist", enc_signed(d, valid), "signed_u8_off128_q0.25")
     for j, nm in enumerate(("nz", "ny", "nx")):
         w(nm, enc_normal(n[j], valid & (mag > 1e-3)), "normal_u8_off128_div127")
